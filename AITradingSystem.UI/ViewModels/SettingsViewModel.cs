@@ -112,7 +112,10 @@ public partial class SettingsViewModel : ObservableObject
         return new SymbolsRegistry
         {
             Symbols = _config.Trading.Symbols.Select(s => new SymbolConfig { Symbol = s, MaxPositionPercent = 5m }).ToList(),
-            WatchAssets = new(_config.Trading.WatchAssets), QuoteAssets = new(_config.Trading.QuoteAssets)
+            WatchAssets = new(_config.Trading.WatchAssets), QuoteAssets = new(_config.Trading.QuoteAssets),
+            VolatileSymbols = new(_config.Trading.VolatileSymbols),
+            StablecoinPairs = new(_config.Trading.StablecoinPairs),
+            BenchmarkSymbols = new(_config.Trading.BenchmarkSymbols)
         };
     }
     public void RefreshBackendInfo()
@@ -154,20 +157,42 @@ public partial class SettingsViewModel : ObservableObject
             var trading = new TradingConfig
             {
                 Symbols = registry.Symbols.Where(s => s.Enabled).Select(s => s.Symbol).ToList(),
+                VolatileSymbols = new(registry.VolatileSymbols),
+                StablecoinPairs = new(registry.StablecoinPairs),
+                BenchmarkSymbols = new(registry.BenchmarkSymbols),
                 WatchAssets = new(registry.WatchAssets), QuoteAssets = new(registry.QuoteAssets),
                 RiskPerTrade = RiskPerTrade / 100, MaxDrawdown = MaxDrawdown / 100,
                 PaperTradingMode = PaperTradingMode, AiCanClosePositions = AiCanClosePositions,
                 AccountRefreshIntervalSeconds = _config.Trading.AccountRefreshIntervalSeconds,
                 MinExchangePositionNotional = _config.Trading.MinExchangePositionNotional
             };
+            // Сначала проверяем классы, затем исключаем неторговые пары из fallback-списка.
+            SymbolUniversePolicy.ValidateLists(trading.VolatileSymbols, trading.StablecoinPairs, trading.BenchmarkSymbols);
+            trading.SymbolExclusions.Clear();
+            foreach (var symbol in trading.Symbols.ToList())
+            {
+                var reason = SymbolUniversePolicy.EntryExclusionReason(symbol,
+                    trading.VolatileSymbols, trading.StablecoinPairs, trading.BenchmarkSymbols);
+                if (reason != null)
+                {
+                    trading.SymbolExclusions[symbol] = reason;
+                    trading.Symbols.Remove(symbol);
+                }
+            }
+            foreach (var symbol in registry.Symbols.Where(s => !s.Enabled))
+                trading.SymbolExclusions[symbol.Symbol] = "registry_disabled";
             trading.Validate();
             var path = ConfigPath("appsettings.json");
             var root = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject() : new JsonObject();
             var section = root["Trading"]?.AsObject() ?? new JsonObject();
             section["Symbols"] = new JsonArray(trading.Symbols.Select(s => JsonValue.Create(s)).ToArray());
+            section["VolatileSymbols"] = new JsonArray(trading.VolatileSymbols.Select(s => JsonValue.Create(s)).ToArray());
+            section["StablecoinPairs"] = new JsonArray(trading.StablecoinPairs.Select(s => JsonValue.Create(s)).ToArray());
+            section["BenchmarkSymbols"] = new JsonArray(trading.BenchmarkSymbols.Select(s => JsonValue.Create(s)).ToArray());
+            section["SymbolExclusions"] = new JsonObject(trading.SymbolExclusions.Select(x => new KeyValuePair<string, JsonNode?>(x.Key, JsonValue.Create(x.Value))));
             section["WatchAssets"] = new JsonArray(registry.WatchAssets.Select(s => JsonValue.Create(s)).ToArray());
             section["QuoteAssets"] = new JsonArray(registry.QuoteAssets.Select(s => JsonValue.Create(s)).ToArray());
-            section["SymbolPositionLimits"] = new JsonObject(registry.Symbols.Where(s => s.Enabled).Select(s => new KeyValuePair<string, JsonNode?>(s.Symbol, JsonValue.Create(s.MaxPositionPercent))));
+            section["SymbolPositionLimits"] = new JsonObject(registry.Symbols.Where(s => s.Enabled && trading.Symbols.Contains(s.Symbol)).Select(s => new KeyValuePair<string, JsonNode?>(s.Symbol, JsonValue.Create(s.MaxPositionPercent))));
             section["RiskPerTrade"] = trading.RiskPerTrade; section["MaxDrawdown"] = trading.MaxDrawdown;
             section["PaperTradingMode"] = PaperTradingMode; section["AiCanClosePositions"] = AiCanClosePositions;
             root["Trading"] = section;

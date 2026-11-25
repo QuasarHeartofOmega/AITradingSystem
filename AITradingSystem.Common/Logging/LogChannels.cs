@@ -295,7 +295,19 @@ public static class TradeLog
             mode, cash, equity, drawdownPercent.ToString("F2", CultureInfo.InvariantCulture));
     }
 
-    /// <summary>P0.1: машинно-читаемый срез капитала для risk-аудита.</summary>
+    /// <summary>P0.6: активная вселенная и причины исключений на каждом старте.</summary>
+    public static void SymbolUniverse(string environment, string configHash,
+        IReadOnlyList<string> active, IReadOnlyDictionary<string, string> excluded,
+        IReadOnlyList<string> volatileSymbols, IReadOnlyList<string> stablecoinPairs,
+        IReadOnlyList<string> benchmarkSymbols)
+    {
+        Ch.Information(
+            "SYMBOL-UNIVERSE env={Environment} config_hash={Hash} active={Active} excluded={Excluded} volatile={Volatile} stablecoin_pairs={Stable} benchmark_symbols={Bench}",
+            environment, configHash, string.Join(",", active),
+            AITradingSystem.Common.Configuration.SymbolUniversePolicy.FormatReasons(excluded),
+            string.Join(",", volatileSymbols), string.Join(",", stablecoinPairs), string.Join(",", benchmarkSymbols));
+    }
+
     public static void RiskSnapshot(string environment, string accountId, string quoteAsset,
         decimal equity, decimal free, decimal locked, decimal peak, decimal dayStart,
         decimal drawdownPercent, decimal dailyPnl, string source, bool valuationComplete)

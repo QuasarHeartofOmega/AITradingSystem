@@ -13,6 +13,15 @@ public sealed class TradingConfig
     /// Здесь задаются только значения по умолчанию, если symbols.json отсутствует.
     /// </summary>
     public List<string> Symbols { get; set; } = new();
+
+    /// <summary>P0.6: единственная вселенная трендовых входов. Пустой список — legacy fallback.</summary>
+    public List<string> VolatileSymbols { get; set; } = new();
+    /// <summary>P0.6: наблюдаются отдельно; обычные трендовые входы запрещены.</summary>
+    public List<string> StablecoinPairs { get; set; } = new(SymbolUniversePolicy.DefaultStablecoinPairs);
+    /// <summary>P0.6: рыночный контекст/корреляция, не торговые входы.</summary>
+    public List<string> BenchmarkSymbols { get; set; } = new(SymbolUniversePolicy.DefaultBenchmarkSymbols);
+    /// <summary>P0.6: исключение → reason_code; включается в эффективный config hash.</summary>
+    public Dictionary<string, string> SymbolExclusions { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> WatchAssets { get; set; } = new();
     public List<string> QuoteAssets { get; set; } = new(SymbolNaming.DefaultQuotes);
     public Dictionary<string, int> SymbolPriceDecimals { get; set; } = new(StringComparer.OrdinalIgnoreCase);
@@ -456,6 +465,18 @@ public sealed class TradingConfig
             throw new InvalidOperationException("После нормализации список торговых пар пуст.");
         if (Symbols.Count > 32)
             throw new InvalidOperationException($"Максимум 32 торговые пары. Указано: {Symbols.Count}");
+        VolatileSymbols = SymbolUniversePolicy.Normalize(VolatileSymbols, QuoteAssets);
+        StablecoinPairs = SymbolUniversePolicy.Normalize(StablecoinPairs, QuoteAssets);
+        BenchmarkSymbols = SymbolUniversePolicy.Normalize(BenchmarkSymbols, QuoteAssets);
+        SymbolUniversePolicy.ValidateLists(VolatileSymbols, StablecoinPairs, BenchmarkSymbols);
+        foreach (var symbol in Symbols)
+        {
+            var reason = SymbolUniversePolicy.EntryExclusionReason(symbol, VolatileSymbols, StablecoinPairs, BenchmarkSymbols);
+            if (reason != null) throw new InvalidOperationException($"Symbols содержит не-торговый класс {symbol}: {reason}");
+        }
+        SymbolExclusions = SymbolExclusions
+            .Where(x => !string.IsNullOrWhiteSpace(x.Key) && !string.IsNullOrWhiteSpace(x.Value))
+            .ToDictionary(x => x.Key.Trim().ToUpperInvariant(), x => x.Value.Trim(), StringComparer.OrdinalIgnoreCase);
         if (AccountRefreshIntervalSeconds < 5 || AccountRefreshIntervalSeconds > 300)
             throw new InvalidOperationException("AccountRefreshIntervalSeconds должен быть в диапазоне [5; 300].");
         if (MinExchangePositionNotional < 0)

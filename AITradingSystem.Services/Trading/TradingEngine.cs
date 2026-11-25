@@ -89,6 +89,9 @@ public sealed class TradingEngine : IAsyncDisposable
     private sealed record SymbolPrecision(int PriceDecimals, decimal? TickSize, decimal? StepSize);
     private readonly ConcurrentDictionary<string, SymbolPrecision> _symbolPrecision = new(StringComparer.OrdinalIgnoreCase);
     public IReadOnlyList<string> UnavailableSymbols { get; private set; } = Array.Empty<string>();
+    /// <summary>P0.6: все исключённые пары и причины, включая неторговые классы и ошибки exchangeInfo.</summary>
+    public IReadOnlyDictionary<string, string> ExcludedSymbols { get; private set; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private List<string> _activeSymbols = new();
     private DateTime _nextCorrelationBenchmarkRefreshUtc = DateTime.MinValue;
     public BotStatus Status => _status;
@@ -175,11 +178,12 @@ public sealed class TradingEngine : IAsyncDisposable
 
         try
         {
-            // Проверка доступностиDemo/выбранной биржи до дорогой загрузки модели.
-            await ValidateSymbolsAsync(ct);
-
-            // P0.5: эффективный config hash для кэша veto и журнала решений.
+            // P0.5/P0.6: эффективный config hash до первого торгового действия.
             _configHash = ComputeConfigHash();
+            // Проверка классов и доступности выбранной биржи до дорогой загрузки модели.
+            var exclusions = await ValidateSymbolsAsync(ct);
+            TradeLog.SymbolUniverse(_restClient.EnvironmentName, _configHash, _activeSymbols, exclusions,
+                _config.Trading.VolatileSymbols, _config.Trading.StablecoinPairs, _config.Trading.BenchmarkSymbols);
             var aiRole = _config.AI.ResolvedRole;
             TradeLog.LlmRole(aiRole.ToString(), _config.AI.Enabled, _config.AI.VetoBudgetSeconds);
             _logger.LogInformation("P0.5: роль LLM={Role}, enabled={Enabled}, config_hash={Hash}",
@@ -741,6 +745,16 @@ public sealed class TradingEngine : IAsyncDisposable
         var signal = _calibrator.BuildEngineSignal(symbol, preScore,
             BuildCalibrationContext(symbol, indicators, currentCandle.Close, hasPosition: false));
 
+        // P0.6: защита от противоположного/неинициализированного направления даже если
+        // сигнал в будущем придёт из другого источника. Reversal setup пока не реализован.
+        if (signal.Action is SignalAction.Buy or SignalAction.Sell &&
+            !SignalCalibrator.IsEntryDirectionAllowed(signal.Action, preScore.Direction))
+        {
+            TradeLog.Rejected(symbol, "symbol-policy",
+                $"direction_mismatch: engine={preScore.DirectionName}, proposed={signal.Action}; вход запрещён без отдельного reversal setup");
+            return;
+        }
+
         _metrics.RecordSignal(signal);
         OnSignalGenerated?.Invoke(signal);
 
@@ -1239,21 +1253,45 @@ public sealed class TradingEngine : IAsyncDisposable
         PriceDecimals = GetPriceDecimals(symbol)
     };
 
-    private async Task ValidateSymbolsAsync(CancellationToken ct)
+    private async Task<Dictionary<string, string>> ValidateSymbolsAsync(CancellationToken ct)
     {
+        _activeSymbols = new List<string>();
+        _symbolPrecision.Clear();
+        var excluded = new Dictionary<string, string>(_config.Trading.SymbolExclusions, StringComparer.OrdinalIgnoreCase);
         var valid = (await _restClient.GetValidSymbolsAsync(ct)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var available = new List<string>();
         var unavailable = new List<string>();
         foreach (var symbol in _config.Trading.Symbols)
         {
             ct.ThrowIfCancellationRequested();
-            if (!valid.Contains(symbol)) { unavailable.Add(symbol); continue; }
+            // Runtime не доверяет только ConfigLoader: прямой AppConfig тоже проходит политику.
+            var policyReason = SymbolUniversePolicy.EntryExclusionReason(symbol,
+                _config.Trading.VolatileSymbols, _config.Trading.StablecoinPairs, _config.Trading.BenchmarkSymbols);
+            if (policyReason != null)
+            {
+                excluded[symbol] = policyReason;
+                continue;
+            }
+            if (!valid.Contains(symbol))
+            {
+                excluded[symbol] = "exchange_not_trading";
+                unavailable.Add(symbol);
+                continue;
+            }
             try
             {
                 var info = await _restClient.GetSymbolInfoAsync(symbol, ct);
-                if (info is null || !info.IsSpotTradingAllowed ||
+                if (info is null)
+                {
+                    excluded[symbol] = "exchange_info_missing";
+                    unavailable.Add(symbol);
+                    continue;
+                }
+                if (!info.IsSpotTradingAllowed ||
                     !string.Equals(info.Status, "TRADING", StringComparison.OrdinalIgnoreCase))
                 {
+                    excluded[symbol] = !info.IsSpotTradingAllowed
+                        ? "spot_trading_disabled" : "exchange_status_not_trading";
                     unavailable.Add(symbol);
                     continue;
                 }
@@ -1266,15 +1304,20 @@ public sealed class TradingEngine : IAsyncDisposable
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
+                excluded[symbol] = "exchange_info_error:" + ex.GetType().Name;
                 unavailable.Add(symbol);
                 _logger.LogWarning(ex, "Фильтры {Symbol} недоступны; пара отключена до следующего старта", symbol);
             }
         }
         UnavailableSymbols = unavailable;
+        ExcludedSymbols = excluded;
         foreach (var symbol in unavailable)
-            _logger.LogWarning("SYMBOL UNAVAILABLE: {Symbol} отключена в текущем окружении {Environment}", symbol, _restClient.EnvironmentName);
+            _logger.LogWarning("SYMBOL UNAVAILABLE: {Symbol} reason={Reason} environment={Environment}",
+                symbol, excluded[symbol], _restClient.EnvironmentName);
         _activeSymbols = available;
-        if (available.Count == 0) throw new InvalidOperationException("Нет доступных торговых пар в выбранном окружении Binance.");
+        if (available.Count == 0)
+            throw new InvalidOperationException("Нет доступных торговых пар: " + SymbolUniversePolicy.FormatReasons(excluded));
+        return excluded;
     }
 
     private static int TickDecimals(decimal tick)

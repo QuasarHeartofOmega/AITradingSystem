@@ -1,10 +1,19 @@
 # PLAN-PROFIT-ENGINE — исправленный план превращения AITradingSystem в проверяемый торговый движок
 
 **Дата редакции:** 2026-11-26  
-**Статус:** активный план; P0.1–P0.5 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1–P0.5 не выполнена  
+**Статус:** активный план восстановлен в корне репозитория; P0.1–P0.6 код-изменения присутствуют в checkout, без сборок/тестовых прогонов; runtime-приёмка P0.1–P0.6 не выполнена; следующий шаг — E1 (журнал решений, ордеров и исходов)  
 **Базовый документ:** `docs/history/PLAN-PROFIT-ENGINE.md` сохранён как история  
 **Ограничение аудита:** без сборок, тестовых прогонов и новых ордеров  
 **Главный вывод:** за 6 ч 47 м торговых решений получено 501 AI-предложение, 20 BUY, 0 отправленных ордеров, 0 филлов, 0 закрытых сделок. Прибыльность не доказана; сначала нужно починить учёт капитала, данные, журнал исходов и исполняемость.
+
+---
+
+## Ход выполнения в текущей сессии
+
+- **Шаг 1 — восстановление плана: файлы изменены.** Из коммита `6825706fde16514ffe49bfb500005ef9b49f8f66` восстановлены `docs/history/PLAN-PROFIT-ENGINE.md` (историческая база) и `PLAN-PROFIT-ENGINE.md` (активная рабочая копия). В текущем `main` до восстановления отсутствовали оба файла; исходный текст сохранён без изменений в истории. Затем обновлён статус активной копии и добавлена эта запись.
+- Сборки, компиляции и тестовые прогоны не выполнялись. P0.6 и последующие пункты ещё не начаты в этой сессии.
+- **Шаг 2 — P0.6: файлы изменены.** Введены явные классы символов и единая политика исключений; stablecoin-пары и benchmark-пары исключены из трендовых входов, сохранены для наблюдения/контекста. Runtime проверяет доступность и пишет причины исключений вместе с active universe и config hash. Добавлена защита от входа против направления движка. Тесты добавлены, но не запускались; сборки/компиляции не выполнялись. Затем обновлён этот план.
+- После каждого следующего шага: сначала изменения файлов, затем актуализация этого плана; продолжение — только по команде пользователя.
 
 ---
 
@@ -285,15 +294,43 @@
 
 ### P0.6. Символы и стабильные пары
 
+**Статус после правок текущего шага:** код и конфигурация внесены; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
+
+**Принятые границы:** `USDCUSDT`/`FDUSDUSDT` остаются в реестре наблюдения, но исключены из входов до отдельной depeg/liquidity стратегии. `BTCUSDT`/`ETHUSDT` — benchmark/корреляционный контекст, не торговые кандидаты. `FLRUSDT` остаётся volatile-кандидатом и проходит проверку доступности окружения; его доступность не предполагается. Лимиты исключённых пар не перераспределяются автоматически.
+
 **Задачи:**
 
-- `[ ]` Явно разделить `volatile_symbols`, `stablecoin_pairs`, `benchmark_symbols`.
-- `[ ]` `USDCUSDT`/`FDUSDUSDT` не анализировать как обычный трендовый актив; либо исключить, либо отдельная depeg/liquidity strategy.
-- `[ ]` `FLRUSDT` и другие unavailable symbols логировать с причиной и не включать в active universe.
-- `[ ]` Запретить BUY, если engine direction = SHORT и нет отдельного reversal setup.
-- `[ ]` В начале сессии логировать effective config hash и active/excluded symbols.
+- `[~]` Явно разделить `volatile_symbols`, `stablecoin_pairs`, `benchmark_symbols`.
+  - В `symbols.json` и fallback `appsettings.json` заданы `VolatileSymbols`, `StablecoinPairs`, `BenchmarkSymbols`; версия реестра повышена до `1.3`.
+  - `SymbolUniversePolicy` нормализует списки, запрещает пересечение классов и требует класс символа при непустом явном volatile-списке. Пустой volatile-список сохраняет legacy fallback; поставляемая конфигурация использует явный список.
+  - `ConfigLoader` передаёт только volatile-кандидаты в `Trading.Symbols`; причины исключений сохраняет в `Trading.SymbolExclusions`. Реестр/UI сохраняют классы при загрузке и сохранении настроек.
+- `[~]` `USDCUSDT`/`FDUSDUSDT` не анализировать как обычный трендовый актив; либо исключить, либо отдельная depeg/liquidity strategy.
+  - Выбрано исключение из active universe с причиной `stablecoin_no_depeg_strategy`; отдельная стратегия не реализовывалась. Пары остаются в `WatchAssets` и реестре.
+- `[~]` `FLRUSDT` и другие unavailable symbols логировать с причиной и не включать в active universe.
+  - Runtime-валидация различает `exchange_not_trading`, `exchange_info_missing`, `spot_trading_disabled`, `exchange_status_not_trading`, `exchange_info_error:<type>`; отключённые в реестре пары получают `registry_disabled`.
+  - Исключённые пары не запрашивают фильтры и не попадают в `_activeSymbols`; причины доступны через `TradingEngine.ExcludedSymbols`. Если кандидатов после исключений нет, старт завершается ошибкой.
+- `[~]` Запретить BUY, если engine direction = SHORT и нет отдельного reversal setup.
+  - `SignalCalibrator.IsEntryDirectionAllowed` требует LONG для BUY и SHORT для SELL; FLAT не разрешает вход. Проверка стоит в `TryUpgrade` и повторно в `TradingEngine` перед публикацией сигнала/LLM/исполнением. Отказ: `symbol-policy`, `direction_mismatch`. Отдельный reversal setup не добавлен.
+- `[~]` В начале сессии логировать effective config hash и active/excluded symbols.
+  - Хэш эффективного конфига вычисляется до валидации символов и торговых действий; классы и причины исключений входят в конфигурацию.
+  - `TradeLog.SymbolUniverse` пишет `SYMBOL-UNIVERSE env=… config_hash=… active=… excluded=SYM:reason,… volatile=… stablecoin_pairs=… benchmark_symbols=…` на каждом старте.
+
+**Изменённые файлы P0.6:**
+
+- `AITradingSystem.Common/Configuration/SymbolUniversePolicy.cs` — новый: классы, нормализация, пересечения, причины исключений.
+- `AITradingSystem.Common/Configuration/TradingConfig.cs` — списки классов, карта исключений, нормализация/валидация.
+- `AITradingSystem.Common/Models/Config/SymbolsRegistry.cs` — классы в реестре и проверка принадлежности каждого символа.
+- `AITradingSystem.Common/Configuration/ConfigLoader.cs` — фильтрация торговых кандидатов и сохранение причин исключений.
+- `AITradingSystem.UI/symbols.json`, `AITradingSystem.UI/appsettings.json` — явная вселенная и пояснения неторговых классов.
+- `AITradingSystem.UI/ViewModels/SettingsViewModel.cs` — сохранение классов/исключений и согласованный fallback-список.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — runtime-политика, причины недоступности, стартовый журнал вселенной, повторный direction-гейт.
+- `AITradingSystem.Services/Analysis/SignalCalibrator.cs` — запрет противоположного направления при генерации/пересмотре сигнала.
+- `AITradingSystem.Common/Logging/LogChannels.cs` — `SYMBOL-UNIVERSE`.
+- `AITradingSystem.Tests/SymbolUniverseTests.cs` — новый: классы/исключения/валидация/направление; не запускался.
+- `PLAN-PROFIT-ENGINE.md` — статус и ход выполнения обновлены после изменения файлов.
 
 **Критерий:** список анализируемых символов совпадает с торговым смыслом стратегии.
+**Осталось для закрытия P0.6:** runtime-проверка `SYMBOL-UNIVERSE`: ожидаемые восемь volatile-кандидатов с учётом доступности окружения; отсутствие stable/benchmark/unavailable пар в анализе и ордерах; причины исключений и config hash в стартовом логе; проверка сохранения классов через UI; отказ `direction_mismatch` на противоположном направлении. Depeg-стратегия и reversal setup остаются отдельными будущими задачами.
 
 ---
 

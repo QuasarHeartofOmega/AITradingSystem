@@ -1,6 +1,24 @@
 {
-  "Version": "1.2",
-  "UpdatedAt": "2026-11-24T00:00:00Z",
+  "Version": "1.3",
+  "UpdatedAt": "2026-11-25T00:00:00Z",
+  "VolatileSymbols": [
+    "BTTCUSDT",
+    "DOGEUSDT",
+    "DASHUSDT",
+    "XRPUSDT",
+    "FLRUSDT",
+    "ENJUSDT",
+    "STRAXUSDT",
+    "BNBUSDT"
+  ],
+  "StablecoinPairs": [
+    "USDCUSDT",
+    "FDUSDUSDT"
+  ],
+  "BenchmarkSymbols": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
   "Symbols": [
     {
       "Symbol": "BTTCUSDT",
@@ -63,25 +81,29 @@
       "Symbol": "USDCUSDT",
       "Enabled": true,
       "MaxPositionPercent": 9,
-      "Priority": 8
+      "Priority": 8,
+      "Notes": "Наблюдение за peg/ликвидностью; трендовые входы запрещены до отдельной стратегии."
     },
     {
       "Symbol": "FDUSDUSDT",
       "Enabled": true,
       "MaxPositionPercent": 9,
-      "Priority": 9
+      "Priority": 9,
+      "Notes": "Наблюдение за peg/ликвидностью; трендовые входы запрещены до отдельной стратегии."
     },
     {
       "Symbol": "BTCUSDT",
       "Enabled": true,
       "MaxPositionPercent": 14,
-      "Priority": 10
+      "Priority": 10,
+      "Notes": "Рыночный benchmark/корреляционный контекст; не торговый кандидат."
     },
     {
       "Symbol": "ETHUSDT",
       "Enabled": true,
       "MaxPositionPercent": 14,
-      "Priority": 11
+      "Priority": 11,
+      "Notes": "Рыночный benchmark/корреляционный контекст; не торговый кандидат."
     }
   ],
   "WatchAssets": [

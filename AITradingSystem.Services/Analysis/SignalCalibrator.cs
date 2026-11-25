@@ -404,8 +404,19 @@ public sealed class SignalCalibrator
     /// HOLD → вход по детерминированным ценам: entry = текущая цена,
     /// SL = entry − k·ATR, TP = entry + R/R·risk. Без цен сигнал был бы отклонён как невалидный.
     /// </summary>
+    /// <summary>P0.6: отдельного reversal setup нет; вход строго согласован с направлением движка.</summary>
+    public static bool IsEntryDirectionAllowed(SignalAction action, decimal engineDirection) =>
+        action == SignalAction.Buy ? engineDirection > 0.05m
+        : action == SignalAction.Sell && engineDirection < -0.05m;
+
     private static void TryUpgrade(TradingSignal signal, SignalAction action, EngineScore score, CalibrationContext ctx)
     {
+        if (!IsEntryDirectionAllowed(action, score.Direction))
+        {
+            TradeLog.Rejected(signal.Symbol, "symbol-policy",
+                $"direction_mismatch: engine={score.DirectionName}, proposed={action}; отдельный reversal setup не реализован");
+            return;
+        }
         if (ctx.Price <= 0m)
             return;
 

@@ -58,13 +58,33 @@ public static class ConfigLoader
 
         config.Trading.QuoteAssets = registry.QuoteAssets;
         config.Trading.WatchAssets = registry.WatchAssets;
+        config.Trading.VolatileSymbols = registry.VolatileSymbols;
+        config.Trading.StablecoinPairs = registry.StablecoinPairs;
+        config.Trading.BenchmarkSymbols = registry.BenchmarkSymbols;
+        config.Trading.SymbolExclusions.Clear();
 
         var enabled = registry.Symbols.Where(s => s.Enabled).ToList();
         if (enabled.Count == 0)
             throw new InvalidOperationException("symbols.json: все торговые пары отключены (Enabled=false).");
 
-        config.Trading.Symbols = enabled.Select(s => s.Symbol).ToList();
+        var candidates = new List<string>();
         foreach (var symbol in enabled)
+        {
+            var reason = SymbolUniversePolicy.EntryExclusionReason(symbol.Symbol,
+                registry.VolatileSymbols, registry.StablecoinPairs, registry.BenchmarkSymbols);
+            if (reason != null)
+            {
+                config.Trading.SymbolExclusions[symbol.Symbol] = reason;
+                continue;
+            }
+            candidates.Add(symbol.Symbol);
+        }
+        foreach (var symbol in registry.Symbols.Where(s => !s.Enabled))
+            config.Trading.SymbolExclusions[symbol.Symbol] = "registry_disabled";
+        if (candidates.Count == 0)
+            throw new InvalidOperationException("symbols.json: нет торговых кандидатов после исключения stablecoin/benchmark пар.");
+        config.Trading.Symbols = candidates;
+        foreach (var symbol in enabled.Where(s => candidates.Contains(s.Symbol)))
         {
             config.Trading.SymbolPositionLimits[symbol.Symbol] = symbol.MaxPositionPercent;
             if (symbol.PriceDecimals.HasValue)
