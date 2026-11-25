@@ -362,6 +362,45 @@ public sealed class SignalCalibrator
     }
 
     /// <summary>
+    /// P0.5: детерминированный сигнал БЕЗ LLM. Направление и prior — из PreScore,
+    /// цены — из той же математики, что и ENGINE-ENTRY (entry=цена, SL=k·ATR, TP=R/R·risk).
+    /// Слабый/флэт-сетап остаётся HOLD. Модель в этом пути не участвует вообще.
+    /// </summary>
+    public TradingSignal BuildEngineSignal(string symbol, EngineScore score, CalibrationContext context)
+    {
+        if (score == null) throw new ArgumentNullException(nameof(score));
+        if (context == null) throw new ArgumentNullException(nameof(context));
+
+        var signal = new TradingSignal
+        {
+            Symbol = symbol,
+            Action = SignalAction.Hold,
+            Confidence = score.PriorConfidence,
+            ModelConfidence = 0m,
+            EngineConfidence = score.PriorConfidence,
+            ConfidenceSource = "EngineOnly",
+            Reasoning = $"Детерминированный сетап движка ({score.Summary}): {score.ReasonsText}",
+            Timestamp = DateTime.UtcNow,
+            ModelVersion = "engine-deterministic"
+        };
+
+        if (!context.HasPosition && score.PriorConfidence >= context.MinConfidence)
+        {
+            if (score.Direction > 0.05m)
+                TryUpgrade(signal, SignalAction.Buy, score, context);
+            else if (score.Direction < -0.05m && context.AllowShort)
+                TryUpgrade(signal, SignalAction.Sell, score, context);
+        }
+
+        TradeLog.Decision(symbol, "ENGINE-SIGNAL",
+            string.Format(CultureInfo.InvariantCulture,
+                "action={0}, prior={1:0.##}, порог={2:0.##}, source=EngineOnly (LLM вне критического пути)",
+                signal.Action, score.PriorConfidence, context.MinConfidence));
+
+        return signal;
+    }
+
+    /// <summary>
     /// HOLD → вход по детерминированным ценам: entry = текущая цена,
     /// SL = entry − k·ATR, TP = entry + R/R·risk. Без цен сигнал был бы отклонён как невалидный.
     /// </summary>

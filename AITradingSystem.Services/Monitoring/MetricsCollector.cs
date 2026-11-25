@@ -235,6 +235,33 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
     public void RecordExecutionStateBlock() { lock (_lock) ExecutionStateBlocks++; }
     public void RecordReconciliationFailure() { lock (_lock) ReconciliationFailures++; }
 
+    /// <summary>P0.5: LLM вне критического пути — покрытие veto, уникальные veto, опоздания, отказы.</summary>
+    public long LlmOpinionRequests { get; private set; }
+    public long LlmOpinionResults { get; private set; }
+    public long LlmVetoes { get; private set; }
+    public long LlmVetoesApplied { get; private set; }
+    public long LlmOpinionsLate { get; private set; }
+    public long LlmOpinionTimeouts { get; private set; }
+    public long LlmOpinionFailures { get; private set; }
+    public long LlmVetoPendingBlocks { get; private set; }
+    public long LlmReviewCloseRequests { get; private set; }
+
+    public void RecordLlmOpinionRequest() { lock (_lock) LlmOpinionRequests++; }
+    public void RecordLlmOpinionResult(bool withinBudget, bool veto)
+    {
+        lock (_lock)
+        {
+            LlmOpinionResults++;
+            if (veto) LlmVetoes++;
+        }
+    }
+    public void RecordLlmVetoApplied() { lock (_lock) LlmVetoesApplied++; }
+    public void RecordLlmOpinionLate() { lock (_lock) LlmOpinionsLate++; }
+    public void RecordLlmOpinionTimeout() { lock (_lock) LlmOpinionTimeouts++; }
+    public void RecordLlmOpinionFailure() { lock (_lock) LlmOpinionFailures++; }
+    public void RecordLlmVetoPendingBlock() { lock (_lock) LlmVetoPendingBlocks++; }
+    public void RecordLlmReviewCloseRequest() { lock (_lock) LlmReviewCloseRequests++; }
+
     /// <summary>P1.5: отказы входа по фильтру ликвидности — всего и по причинам.</summary>
     public long LiquidityRejections { get; private set; }
     public long LiquiditySpreadRejections { get; private set; }
@@ -584,6 +611,9 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
                $"kill-switch {KillSwitchActivations}, " +
                $"user-data probes {UserDataStreamProbes} (failures {UserDataStreamProbeFailures}), polling reconciles {PollingFallbackReconciles}, " +
                $"recon failures {ReconciliationFailures}, execution-state blocks {ExecutionStateBlocks}, " +
+               $"llm opinions {LlmOpinionRequests}/{LlmOpinionResults} (vetoes {LlmVetoes}, applied {LlmVetoesApplied}, " +
+               $"pending-blocks {LlmVetoPendingBlocks}, late {LlmOpinionsLate}, timeouts {LlmOpinionTimeouts}, failures {LlmOpinionFailures}), " +
+               $"llm review-close requests {LlmReviewCloseRequests}, " +
                $"clock drift checks {ClockDriftChecks}, last {LastClockDriftMs?.ToString() ?? "n/a"} ms, " +
                $"max |drift| {MaxAbsClockDriftMs} ms, failures {ClockDriftFailures}, alerts {ClockDriftAlerts}, " +
                $"liquidity rejections {LiquidityRejections} (spread {LiquiditySpreadRejections}, depth {LiquidityDepthRejections}, " +

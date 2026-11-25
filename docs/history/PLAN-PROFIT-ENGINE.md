@@ -1,7 +1,7 @@
 # PLAN-PROFIT-ENGINE — исправленный план превращения AITradingSystem в проверяемый торговый движок
 
 **Дата редакции:** 2026-11-26  
-**Статус:** активный план; P0.1–P0.4 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1–P0.4 не выполнена  
+**Статус:** активный план; P0.1–P0.5 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1–P0.5 не выполнена  
 **Базовый документ:** `docs/history/PLAN-PROFIT-ENGINE.md` сохранён как история  
 **Ограничение аудита:** без сборок, тестовых прогонов и новых ордеров  
 **Главный вывод:** за 6 ч 47 м торговых решений получено 501 AI-предложение, 20 BUY, 0 отправленных ордеров, 0 филлов, 0 закрытых сделок. Прибыльность не доказана; сначала нужно починить учёт капитала, данные, журнал исходов и исполняемость.
@@ -240,18 +240,48 @@
 
 **Проблема:** 14B на RX590 с частичным оффлоадом даёт ~47 с на решение и почти полностью занимает цикл.
 
+**Статус после локальных правок:** код внесён; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
+
 **Задачи:**
 
-- `[ ]` Добавить `AI.Enabled` и `AI.Role = Off | Shadow | VetoOnly | Explainer`.
-- `[ ]` Для baseline допустить `Role=Off` или `Shadow`; вход только из engine setup + EdgeGate.
-- `[ ]` Deterministic path не ждёт LLM.
-- `[ ]` Veto вызывается асинхронно на закрытой свече, кэш на `(symbol, candle_close, config_hash)`.
-- `[ ]` Жёсткий бюджет, например 5–15 с; опоздал → veto не применён к уже принятому решению, но событие логируется.
-- `[ ]` Для VetoOnly отключить thinking или использовать меньшую модель; 14B explainer — отдельно.
-- `[ ]` Timeout/parse fail/degenerate не разрешают вход и не блокируют защиту.
-- `[ ]` Метрики: `llm_latency`, `veto_coverage`, `unique_veto`, `avoided_R`, `false_veto_cost`.
+- `[~]` Добавить `AI.Enabled` и `AI.Role = Off | Shadow | VetoOnly | Explainer`.
+  - `AIConfig.Enabled` (true), `AIConfig.Role` (по умолчанию "Shadow"), enum `AiRole`, `ResolvedRole` (Enabled=false → Off), валидация Role и `VetoBudgetSeconds` [1; 60].
+- `[~]` Для baseline допустить `Role=Off` или `Shadow`; вход только из engine setup + EdgeGate.
+  - `SignalCalibrator.BuildEngineSignal`: детерминированный сигнал из PreScore (направление/prior), цены entry/SL/TP — та же математика, что ENGINE-ENTRY; `ConfidenceSource=EngineOnly`, `ModelConfidence=0`.
+  - `TradingEngine.ProcessSymbolAsync` больше не вызывает LLM на входе; EdgeGate — E3, ещё не реализован.
+- `[~]` Deterministic path не ждёт LLM.
+  - Вход считается до любого обращения к модели; veto-вердикт берётся из кэша, отсутствующий вердикт в VetoOnly блокирует вход без ожидания (fail-closed).
+  - `ReviewOpenPositionAsync` стал fire-and-forget: один in-flight на символ, бюджет `VetoBudgetSeconds`, таймаут логируется как `LLM-REVIEW-TIMEOUT`; защита остаётся в PositionMonitor.
+- `[~]` Veto вызывается асинхронно на закрытой свече, кэш на `(symbol, candle_close, config_hash)`.
+  - Новый `LlmVetoService`: `RequestOpinion` (fire-and-forget, один in-flight на символ), кэш вердиктов (лимит 512, вытеснение старых), ключ `(symbol, candle_close_utc, config_hash)`; `candle_close_utc = OpenTime` текущей свечи.
+  - `TradingEngine.ComputeConfigHash`: SHA-256 сериализованного AppConfig, первые 16 hex; логируется при старте.
+- `[~]` Жёсткий бюджет, например 5–15 с; опоздал → veto не применён к уже принятому решению, но событие логируется.
+  - `AI.VetoBudgetSeconds` (по умолчанию 10); linked CTS с CancelAfter; опоздавший вердикт → `LLM-VETO-LATE`, вход по этой свече не разрешается (fail-closed), постфактум решение не меняется.
+- `[~]` Для VetoOnly отключить thinking или использовать меньшую модель; 14B explainer — отдельно.
+  - `AiRequestContext.DisableThinking`; `QwenModel.EffectiveThinking` — per-request отключение thinking (промпт, repair, сэмплеры, think-бюджет); veto/shadow-запросы всегда с `DisableThinking=true`. Отдельная модель для explainer не подключена.
+- `[~]` Timeout/parse fail/degenerate не разрешают вход и не блокируют защиту.
+  - `LlmVetoService.EvaluateVeto`: inference failure/degenerate/HOLD/CLOSE/противоположное направление → veto; timeout/исключение → fail-closed veto. Сервис не создаёт ордеров и не закрывает позиций; SL/TP/трейлинг в PositionMonitor не зависят от LLM.
+- `[~]` Метрики: `llm_latency`, `veto_coverage`, `unique_veto`, `avoided_R`, `false_veto_cost`.
+  - `MetricsCollector`: LlmOpinionRequests/Results, LlmVetoes, LlmVetoesApplied, LlmOpinionsLate/Timeouts/Failures, LlmVetoPendingBlocks, LlmReviewCloseRequests + `GetSummary()`; latency через существующий `RecordInferenceTime`.
+  - `avoided_R`/`false_veto_cost` требуют журнала исходов (E1) — не реализованы, отложены до OutcomeLedger.
+  - События журнала: `LLM-ROLE`, `LLM-VETO-RESULT`, `LLM-VETO-APPLIED`, `LLM-VETO-LATE`, `LLM-VETO-PENDING` (`TradeLog`).
+
+**Изменённые файлы P0.5:**
+
+- `AITradingSystem.Common/Configuration/AIConfig.cs` — `Enabled`, `Role`, `VetoBudgetSeconds`, enum `AiRole`, `ResolvedRole`, валидация.
+- `AITradingSystem.Services/AI/AiRequestContext.cs` — `DisableThinking` (per-request).
+- `AITradingSystem.Services/AI/QwenModel.cs` — `EffectiveThinking`: per-request отключение thinking под `_inferenceLock`.
+- `AITradingSystem.Services/Analysis/SignalCalibrator.cs` — `BuildEngineSignal`: детерминированный вход без модели.
+- `AITradingSystem.Services/Trading/LlmVetoService.cs` — новый: асинхронный veto/shadow, кэш, бюджет, чистая политика `EvaluateVeto`.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — вход без ожидания LLM, роль-гейты (Off/Shadow/VetoOnly/Explainer), config hash, асинхронный пересмотр позиции, `LLM-ROLE` при старте, условная загрузка модели (Off → не загружается).
+- `AITradingSystem.Services/Monitoring/MetricsCollector.cs` — счётчики LLM-мнений/veto (+ summary).
+- `AITradingSystem.Common/Logging/LogChannels.cs` — `LLM-ROLE`, `LLM-VETO-*`.
+- `AITradingSystem.UI/App.xaml.cs` — DI-регистрация `LlmVetoService`.
+- `AITradingSystem.UI/appsettings.json` — `AI.Enabled=true`, `AI.Role="Shadow"`, `AI.VetoBudgetSeconds=10`.
+- `AITradingSystem.Tests/LlmRoleTests.cs` — новый файл: парсинг/валидация роли, политика veto, детерминированный сигнал (не запускались).
 
 **Критерий:** выключение LLM не ломает торговый контур; польза LLM измеряется в R.
+**Осталось для закрытия P0.5:** runtime-проверка: Role=Off торгует без модели; VetoOnly блокирует вход без вердикта и применяет готовый veto; опоздавшие вердикты только логируются; пересмотр позиции не занимает цикл; `avoided_R`/`false_veto_cost` после E1; отдельная лёгкая модель/explainer-контур.
 
 ### P0.6. Символы и стабильные пары
 

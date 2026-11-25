@@ -115,6 +115,8 @@ public partial class App : Application
                     services.AddSingleton<PositionMonitor>();
                     // P0.5: реконсиляция + user-data stream; TradingEngine зависит от него.
                     services.AddSingleton<ReconciliationService>();
+                    // P0.5: асинхронный veto/shadow LLM вне критического пути.
+                    services.AddSingleton<LlmVetoService>();
                     services.AddSingleton<TradingEngine>();
                     services.AddSingleton<TelegramAlertService>();
                     services.AddSingleton<MetricsCollector>();

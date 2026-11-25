@@ -334,6 +334,36 @@ public static class TradeLog
         Ch.Warning("KILL-SWITCH-RESTORED reason={Reason} close_status={Status}", reason, closeStatus);
     }
 
+    /// <summary>P0.5: аудит роли LLM и асинхронных veto/shadow-вердиктов.</summary>
+    public static void LlmRole(string role, bool enabled, int vetoBudgetSeconds)
+    {
+        Ch.Information("LLM-ROLE role={Role} enabled={Enabled} veto_budget_s={Budget}", role, enabled, vetoBudgetSeconds);
+    }
+
+    public static void LlmVetoResult(string symbol, string role, bool veto, string reason,
+        double latencyMs, bool withinBudget, DateTime candleCloseUtc)
+    {
+        Ch.Information(
+            "LLM-VETO-RESULT {Symbol} role={Role} veto={Veto} reason={Reason} latency_ms={Latency} within_budget={Within} candle_close={Candle}",
+            symbol, role, veto, reason, latencyMs.ToString("F0", CultureInfo.InvariantCulture), withinBudget, candleCloseUtc);
+    }
+
+    public static void LlmVetoApplied(string symbol, string reason)
+    {
+        Ch.Warning("LLM-VETO-APPLIED {Symbol} reason={Reason}", symbol, reason);
+    }
+
+    public static void LlmVetoLate(string symbol, string reason, double latencyMs)
+    {
+        Ch.Warning("LLM-VETO-LATE {Symbol} reason={Reason} latency_ms={Latency} (не применён к уже принятому решению)",
+            symbol, reason, latencyMs.ToString("F0", CultureInfo.InvariantCulture));
+    }
+
+    public static void LlmVetoPending(string symbol)
+    {
+        Ch.Information("LLM-VETO-PENDING {Symbol} вердикт по закрытой свече ещё не готов — вход не разрешён (fail-closed, без ожидания)", symbol);
+    }
+
     /// <summary>P0.3: аудит здоровья рыночных данных — REST-прогрев и живой стрим пишутся раздельно.</summary>
     public static void DataStale(string symbol, string reason, double ageSeconds)
     {

@@ -67,4 +67,10 @@ public sealed class AiRequestContext
 
     /// <summary>Шаг цены символа (tickSize), если известен.</summary>
     public decimal? TickSize { get; init; }
+
+    /// <summary>
+    /// P0.5: принудительно отключить thinking для этого запроса (VetoOnly/Shadow).
+    /// Не включает thinking, если он выключен в конфиге.
+    /// </summary>
+    public bool DisableThinking { get; init; }
 }

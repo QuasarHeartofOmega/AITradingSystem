@@ -22,6 +22,34 @@ public enum AiBackend
 /// </summary>
 public sealed class AIConfig
 {
+    /// <summary>
+    /// P0.5: полное включение AI-контура. false эквивалентно Role=Off:
+    /// модель не загружается, детерминированный путь работает без LLM.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// P0.5: роль LLM вне последовательного критического пути.
+    /// Off — модель не используется; Shadow — асинхронное мнение только в журнал;
+    /// VetoOnly — асинхронный veto на закрытой свече (кэш по symbol/candle_close/config_hash);
+    /// Explainer — объяснение уже принятого решения, на вход не влияет.
+    /// Вход создаёт только детерминированный сетап движка; LLM BUY не создаёт ордер.
+    /// </summary>
+    public string Role { get; set; } = "Shadow";
+
+    /// <summary>
+    /// P0.5: жёсткий бюджет асинхронного veto/shadow-вызова, секунды.
+    /// Опоздавший результат не применяется к уже принятому решению, а логируется.
+    /// Timeout/parse fail/degenerate в VetoOnly трактуются как veto (fail-closed),
+    /// но никогда не блокируют защиту позиций.
+    /// </summary>
+    public int VetoBudgetSeconds { get; set; } = 10;
+
+    /// <summary>P0.5: эффективная роль с учётом Enabled.</summary>
+    public AiRole ResolvedRole => !Enabled
+        ? AiRole.Off
+        : Enum.TryParse<AiRole>(Role, ignoreCase: true, out var role) ? role : AiRole.Shadow;
+
     /// <summary>Путь к файлу модели в формате GGUF.</summary>
     public string ModelPath { get; set; } = "models/qwen3-14b-q4_k_m.gguf";
 
@@ -281,6 +309,15 @@ public sealed class AIConfig
 
     public void Validate()
     {
+        // P0.5: роль LLM и бюджет veto.
+        if (!Enum.TryParse<AiRole>(Role, ignoreCase: true, out _))
+            throw new InvalidOperationException(
+                $"AI:Role должен быть Off | Shadow | VetoOnly | Explainer. Текущее: {Role}");
+
+        if (VetoBudgetSeconds < 1 || VetoBudgetSeconds > 60)
+            throw new InvalidOperationException(
+                $"AI:VetoBudgetSeconds должен быть в диапазоне [1; 60]. Текущее: {VetoBudgetSeconds}");
+
         if (string.IsNullOrWhiteSpace(ModelPath))
             throw new InvalidOperationException("ModelPath не указан.");
 
@@ -428,6 +465,22 @@ public sealed class AIConfig
             throw new InvalidOperationException(
                 $"AI:ScoringCalibrationBinStep должен быть в диапазоне (0; 0.5]. Текущее: {ScoringCalibrationBinStep}");
     }
+}
+
+/// <summary>P0.5: роль LLM в торговом контуре. Вход создаёт только детерминированный сетап движка.</summary>
+public enum AiRole
+{
+    /// <summary>Модель не загружается и не вызывается.</summary>
+    Off = 0,
+
+    /// <summary>Асинхронное мнение модели пишется в журнал, на решение не влияет.</summary>
+    Shadow = 1,
+
+    /// <summary>Асинхронный veto на закрытой свече; может только запретить вход.</summary>
+    VetoOnly = 2,
+
+    /// <summary>Объяснение уже принятого решения; на вход не влияет.</summary>
+    Explainer = 3
 }
 
 /// <summary>Политика итоговой уверенности сигнала (B9).</summary>

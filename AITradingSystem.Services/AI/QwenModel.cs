@@ -43,6 +43,9 @@ public sealed class QwenModel : IAIModel
     private int _loadedThreads;
     private int _consecutiveDegenerate;
     private bool _weightsReloadedOnce;
+    // P0.5: per-request thinking override (VetoOnly/Shadow). Защищён _inferenceLock.
+    private bool _disableThinkingForRequest;
+    private bool EffectiveThinking => _config.EnableThinking && !_disableThinkingForRequest;
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -654,6 +657,7 @@ public sealed class QwenModel : IAIModel
         await _inferenceLock.WaitAsync(ct);
         try
         {
+            _disableThinkingForRequest = context.DisableThinking;
             var prompt = BuildPromptWithinBudget(symbol, indicators, newsContext, context);
 
             TradingSignal? signal = null;
@@ -680,7 +684,7 @@ public sealed class QwenModel : IAIModel
                     AiLog.Retry(symbol, attempt, lastParseError ?? "invalid JSON");
                 }
 
-                var meta = $"backend={ActiveBackend}, thinking={_config.EnableThinking}, " +
+                var meta = $"backend={ActiveBackend}, thinking={EffectiveThinking}, " +
                            $"position={(context.HasPosition ? context.PositionSide ?? "LONG" : "none")}";
                 AiLog.Prompt(symbol, attempt, maxAttempts, currentPrompt, meta);
 
@@ -783,6 +787,7 @@ public sealed class QwenModel : IAIModel
         }
         finally
         {
+            _disableThinkingForRequest = false;
             _inferenceLock.Release();
         }
     }
@@ -797,7 +802,7 @@ public sealed class QwenModel : IAIModel
         var executor = _executor ?? throw new InvalidOperationException("Executor не инициализирован");
         var reserve = _config.EffectiveMaxTokens + 8;
         var news = LimitNews(newsContext, _config.MaxNewsChars);
-        var prompt = _promptBuilder.BuildTradingPrompt(symbol, indicators, news, _config.EnableThinking, context);
+        var prompt = _promptBuilder.BuildTradingPrompt(symbol, indicators, news, EffectiveThinking, context);
 
         while (true)
         {
@@ -810,7 +815,7 @@ public sealed class QwenModel : IAIModel
                 var next = news.Length > 1 ? news[..(news.Length / 2)] : null;
                 AiLog.Backend($"промпт не влезает в контекст: новости {news.Length} → {next?.Length ?? 0} символов");
                 news = next;
-                prompt = _promptBuilder.BuildTradingPrompt(symbol, indicators, news, _config.EnableThinking, context);
+                prompt = _promptBuilder.BuildTradingPrompt(symbol, indicators, news, EffectiveThinking, context);
                 continue;
             }
 
@@ -822,7 +827,7 @@ public sealed class QwenModel : IAIModel
     private string BuildRepairPromptWithinBudget(string basePrompt, string invalidResponse, string error)
     {
         var executor = _executor ?? throw new InvalidOperationException("Executor не инициализирован");
-        var repair = _promptBuilder.BuildRepairPrompt(basePrompt, invalidResponse, error, _config.EnableThinking);
+        var repair = _promptBuilder.BuildRepairPrompt(basePrompt, invalidResponse, error, EffectiveThinking);
         var reserve = _config.EffectiveMaxTokens + 8;
 
         if (executor.CountTokens(repair) + reserve <= executor.ContextSize)
@@ -913,9 +918,9 @@ public sealed class QwenModel : IAIModel
         var opts = new KvGenerationOptions
         {
             MaxTokens = _config.EffectiveMaxTokens,
-            ThinkingBudgetTokens = _config.EnableThinking ? _config.ThinkingBudgetTokens : 0,
-            Temperature = _config.EnableThinking ? _config.Temperature : _config.NoThinkTemperature,
-            TopP = _config.EnableThinking ? _config.TopP : _config.NoThinkTopP,
+            ThinkingBudgetTokens = EffectiveThinking ? _config.ThinkingBudgetTokens : 0,
+            Temperature = EffectiveThinking ? _config.Temperature : _config.NoThinkTemperature,
+            TopP = EffectiveThinking ? _config.TopP : _config.NoThinkTopP,
             TopK = _config.TopK,
             MinP = _config.MinP,
             RepeatPenalty = _config.RepeatPenalty,

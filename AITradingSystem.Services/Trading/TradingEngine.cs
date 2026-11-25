@@ -41,6 +41,8 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly MetricsCollector _metrics;
     private readonly ILogger<TradingEngine> _logger;
     private readonly AccountSnapshotService _accountSnapshots;
+    private readonly LlmVetoService _llmVeto;
+    private string _configHash = "unknown";
     private AccountSnapshot? _accountSnapshot;
     private decimal _paperFreeCash;
     private DateTime _nextAccountRefreshUtc = DateTime.MinValue;
@@ -127,6 +129,7 @@ public sealed class TradingEngine : IAsyncDisposable
         ITradeHistoryRepository tradeHistory,
         IStateRepository stateRepository,
         MetricsCollector metrics,
+        LlmVetoService llmVeto,
         ILogger<TradingEngine> logger)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
@@ -148,6 +151,7 @@ public sealed class TradingEngine : IAsyncDisposable
         _tradeHistory = tradeHistory ?? throw new ArgumentNullException(nameof(tradeHistory));
         _stateRepository = stateRepository ?? throw new ArgumentNullException(nameof(stateRepository));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
+        _llmVeto = llmVeto ?? throw new ArgumentNullException(nameof(llmVeto));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager);
 
@@ -174,8 +178,18 @@ public sealed class TradingEngine : IAsyncDisposable
             // Проверка доступностиDemo/выбранной биржи до дорогой загрузки модели.
             await ValidateSymbolsAsync(ct);
 
-            // Загрузка модели
-            await _aiModel.LoadAsync(ct);
+            // P0.5: эффективный config hash для кэша veto и журнала решений.
+            _configHash = ComputeConfigHash();
+            var aiRole = _config.AI.ResolvedRole;
+            TradeLog.LlmRole(aiRole.ToString(), _config.AI.Enabled, _config.AI.VetoBudgetSeconds);
+            _logger.LogInformation("P0.5: роль LLM={Role}, enabled={Enabled}, config_hash={Hash}",
+                aiRole, _config.AI.Enabled, _configHash);
+
+            // P0.5: модель загружается только если роль не Off — детерминированный путь работает без неё.
+            if (aiRole != AiRole.Off)
+                await _aiModel.LoadAsync(ct);
+            else
+                _logger.LogInformation("P0.5: AI.Role=Off — модель не загружается, вход только из engine setup");
 
             // P0.3: ключи идемпотентности из журнала намерений — ДО первой торговой операции.
             // Иначе после рестарта повторное закрытие/защита ушли бы вторым ордером.
@@ -721,21 +735,61 @@ public sealed class TradingEngine : IAsyncDisposable
         var preScore = _calibrator.PreScore(indicators);
         TradeLog.Decision(symbol, "PRE-SCORE", $"{preScore.Summary}; {preScore.ReasonsText}");
 
-        var newsContext = await _sentimentAnalyzer.GetNewsContextAsync(symbol, ct);
-
-        // 4. Сигнал ИИ. Контекст обязателен: без него модель предлагает шорт на споте
-        //    и не знает, что позиция уже открыта.
-        var requestContext = BuildAiContext(symbol, position: null, preScore, indicators, currentCandle.Close);
-        var signal = await _aiModel.GetTradingSignalAsync(symbol, indicators, newsContext, requestContext, ct);
-
-        // 4a. Калибровка уверенности: модель + prior движка (политика AI:ConfidencePolicy).
-        signal = _calibrator.Calibrate(signal, preScore, _config.AI.ResolvedConfidencePolicy,
-            BuildCalibrationContext(symbol, indicators, currentCandle.Close, hasPosition: false),
-            blendModelWeight: _config.AI.BlendModelWeight);
+        // 4. P0.5: детерминированный сигнал БЕЗ ожидания LLM. Направление/prior — PreScore,
+        //    цены — математика движка. LLM может только запретить (VetoOnly) или наблюдаться
+        //    (Shadow/Explainer); её BUY никогда не создаёт ордер.
+        var signal = _calibrator.BuildEngineSignal(symbol, preScore,
+            BuildCalibrationContext(symbol, indicators, currentCandle.Close, hasPosition: false));
 
         _metrics.RecordSignal(signal);
-        _metrics.RecordInferenceTime(_aiModel.LastInferenceTimeMs);
         OnSignalGenerated?.Invoke(signal);
+
+        // 4a. P0.5: роль LLM. Verdict кэшируется по (symbol, закрытая свеча, config_hash);
+        //     закрытая свеча закрывается в момент открытия текущей (currentCandle.OpenTime).
+        var aiRole = _config.AI.ResolvedRole;
+        if (aiRole != AiRole.Off && signal.Action is SignalAction.Buy or SignalAction.Sell)
+        {
+            var candleCloseUtc = currentCandle.OpenTime;
+            var requestContext = BuildAiContext(symbol, position: null, preScore, indicators, currentCandle.Close);
+
+            if (!_llmVeto.TryGetVerdict(symbol, candleCloseUtc, _configHash, out var verdict))
+            {
+                // Асинхронный запрос: цикл не ждёт инференс.
+                var newsContext = await _sentimentAnalyzer.GetNewsContextAsync(symbol, ct);
+                _llmVeto.RequestOpinion(symbol, candleCloseUtc, _configHash, indicators, newsContext, requestContext);
+
+                if (aiRole == AiRole.VetoOnly)
+                {
+                    // Fail-closed: без готового вердикта вход не разрешён, но и не ждём —
+                    // вердикт будет готов к следующему проходу по символу.
+                    _metrics.RecordLlmVetoPendingBlock();
+                    TradeLog.LlmVetoPending(symbol);
+                    TradeLog.Rejected(symbol, "llm-veto", "вердикт LLM по закрытой свече ещё не готов (VetoOnly, fail-closed)");
+                    return;
+                }
+            }
+            else if (aiRole == AiRole.VetoOnly && verdict != null)
+            {
+                if (!verdict.WithinBudget)
+                {
+                    // Опоздавший вердикт не применяется постфактум, но и не разрешает вход:
+                    // для этой свечи валидного в-бюджет вердикта нет → fail-closed.
+                    _metrics.RecordLlmVetoPendingBlock();
+                    TradeLog.Rejected(symbol, "llm-veto",
+                        $"вердикт LLM опоздал ({verdict.LatencyMs:F0} ms > бюджета {_config.AI.VetoBudgetSeconds}s) — вход не разрешён");
+                    return;
+                }
+
+                if (verdict.Veto)
+                {
+                    _metrics.RecordLlmVetoApplied();
+                    TradeLog.LlmVetoApplied(symbol, verdict.Reason);
+                    TradeLog.Rejected(symbol, "llm-veto", verdict.Reason);
+                    return;
+                }
+            }
+            // Shadow/Explainer: вердикт только в журнале (LLM-VETO-RESULT), на вход не влияет.
+        }
 
         if (signal.Action is SignalAction.Hold or SignalAction.Close)
         {
@@ -1275,10 +1329,49 @@ public sealed class TradingEngine : IAsyncDisposable
     /// Периодический вопрос модели об открытой позиции: держать или закрыть.
     /// Без этого шага ИИ умел только открывать сделки, а выход был лишь по SL/TP.
     /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _positionReviewInFlight = new(StringComparer.OrdinalIgnoreCase);
+
     private async Task ReviewOpenPositionAsync(string symbol, CancellationToken ct)
     {
         if (!_config.Trading.AiCanClosePositions)
             return;
+
+        // P0.5: LLM-пересмотр позиции не входит в последовательный критический путь.
+        // Off — пересмотра нет (защита в PositionMonitor); остальные роли — асинхронно,
+        // один in-flight на символ, с жёстким бюджетом. Цикл анализа не ждёт инференс.
+        if (_config.AI.ResolvedRole == AiRole.Off)
+            return;
+
+        if (!_positionReviewInFlight.TryAdd(symbol, 0))
+            return;
+
+        _metrics.RecordLlmReviewCloseRequest();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                budgetCts.CancelAfter(TimeSpan.FromSeconds(_config.AI.VetoBudgetSeconds));
+                await ReviewOpenPositionCoreAsync(symbol, budgetCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                TradeLog.Decision(symbol, "LLM-REVIEW-TIMEOUT",
+                    $"пересмотр позиции не уложился в бюджет {_config.AI.VetoBudgetSeconds}s — позиция держится, защита в PositionMonitor");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "P0.5: асинхронный пересмотр позиции {Symbol} завершился ошибкой", symbol);
+            }
+            finally
+            {
+                _positionReviewInFlight.TryRemove(symbol, out _);
+            }
+        }, ct);
+    }
+
+    private async Task ReviewOpenPositionCoreAsync(string symbol, CancellationToken ct)
+    {
 
         lock (_reviewLock)
         {
@@ -2298,6 +2391,22 @@ public sealed class TradingEngine : IAsyncDisposable
         return false;
     }
 
+    /// <summary>P0.5: хэш эффективного конфига для кэша veto и журнала решений.</summary>
+    private string ComputeConfigHash()
+    {
+        try
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(_config);
+            var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(json));
+            return Convert.ToHexString(hash)[..16].ToLowerInvariant();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "P0.5: не удалось вычислить config hash");
+            return "unknown";
+        }
+    }
+
     private OHLCV? GetCurrentCandle(string symbol)
     {
         lock (_candleLock)
@@ -2315,5 +2424,6 @@ public sealed class TradingEngine : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
+        await _llmVeto.DisposeAsync();
     }
 }
