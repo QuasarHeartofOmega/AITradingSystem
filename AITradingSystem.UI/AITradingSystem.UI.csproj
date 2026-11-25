@@ -1,0 +1,103 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<UseWPF>true</UseWPF>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+		<PlatformTarget>x64</PlatformTarget>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Update="appsettings.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+		<None Update="symbols.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\AITradingSystem.Core\AITradingSystem.Core.csproj" />
+		<ProjectReference Include="..\AITradingSystem.Data\AITradingSystem.Data.csproj" />
+		<ProjectReference Include="..\AITradingSystem.Services\AITradingSystem.Services.csproj" />
+		<ProjectReference Include="..\AITradingSystem.Common\AITradingSystem.Common.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+		<PackageReference Include="CommunityToolkit.Mvvm" Version="8.3.2" />
+		<PackageReference Include="LiveChartsCore.SkiaSharpView.WPF" Version="2.0.0-rc2" />
+	</ItemGroup>
+
+<!--
+		НАТИВНЫЕ БИБЛИОТЕКИ llama.cpp (CPU / CUDA / Vulkan).
+
+		LLamaSharp.Backend.* раздаёт нативные DLL через .props (Content), а Content
+		не передаётся транзитивно из Services в UI. Поэтому пакеты подключены прямо
+		в запускаемый проект, а нужные DLL раскладываются target'ом ниже:
+
+		  $(OutDir)\           — CPU (avx2/avx512/avx/noavx)
+		  $(OutDir)\cuda12\    — NVIDIA CUDA 12 (llama.dll + ggml-cuda.dll)
+		  $(OutDir)\vulkan\    — AMD/Intel/NVIDIA через Vulkan
+
+		LlamaNativeLoader ищет именно эту раскладку и выбирает бэкенд по железу.
+		ExcludeAssets="build" отключает штатный .props, чтобы не тащить в вывод
+		все платформы и все наборы инструкций сразу.
+
+		Управление составом (по умолчанию тянутся CPU + CUDA12 + Vulkan, ~300 МБ):
+		  dotnet build -p:LlamaGpuBackends=vulkan     (только AMD/Intel GPU + CPU)
+		  dotnet build -p:LlamaGpuBackends=cuda12     (только NVIDIA + CPU)
+		  dotnet build -p:LlamaGpuBackends=none       (только CPU, ~40 МБ)
+	-->
+	<PropertyGroup>
+		<LlamaSharpBackendVersion>0.30.0</LlamaSharpBackendVersion>
+		<!-- avx2 | avx512 | avx | noavx. Для очень старого CPU без AVX2 поставьте avx или noavx. -->
+		<LlamaCpuAvxLevel Condition="'$(LlamaCpuAvxLevel)' == ''">avx2</LlamaCpuAvxLevel>
+		<!-- Список GPU-бэкендов: cuda12;vulkan | cuda12 | vulkan | none -->
+		<LlamaGpuBackends Condition="'$(LlamaGpuBackends)' == ''">cuda12;vulkan</LlamaGpuBackends>
+		<LlamaWithCuda12 Condition="$([System.String]::Copy('$(LlamaGpuBackends)').ToLowerInvariant().Contains('cuda12'))">true</LlamaWithCuda12>
+                <LlamaWithVulkan Condition="$([System.String]::Copy('$(LlamaGpuBackends)').ToLowerInvariant().Contains('vulkan'))">true</LlamaWithVulkan>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="LLamaSharp.Backend.Cpu" Version="$(LlamaSharpBackendVersion)" ExcludeAssets="build" />
+		<PackageReference Include="LLamaSharp.Backend.Cuda12.Windows" Version="$(LlamaSharpBackendVersion)" ExcludeAssets="build" Condition="'$(LlamaWithCuda12)' == 'true'" />
+		<PackageReference Include="LLamaSharp.Backend.Vulkan.Windows" Version="$(LlamaSharpBackendVersion)" ExcludeAssets="build" Condition="'$(LlamaWithVulkan)' == 'true'" />
+	</ItemGroup>
+
+	<Target Name="CopyLlamaNativeLibraries" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+		<PropertyGroup>
+			<LlamaPackagesRoot Condition="'$(NuGetPackageRoot)' != ''">$(NuGetPackageRoot)</LlamaPackagesRoot>
+			<LlamaPackagesRoot Condition="'$(LlamaPackagesRoot)' == ''">$(UserProfile)\.nuget\packages\</LlamaPackagesRoot>
+			<LlamaCpuNativeDir>$(LlamaPackagesRoot)llamasharp.backend.cpu\$(LlamaSharpBackendVersion)\LLamaSharpRuntimes\win-x64\native\</LlamaCpuNativeDir>
+			<LlamaCuda12NativeDir>$(LlamaPackagesRoot)llamasharp.backend.cuda12.windows\$(LlamaSharpBackendVersion)\LLamaSharpRuntimes\win-x64\native\cuda12\</LlamaCuda12NativeDir>
+			<LlamaVulkanNativeDir>$(LlamaPackagesRoot)llamasharp.backend.vulkan.windows\$(LlamaSharpBackendVersion)\LLamaSharpRuntimes\win-x64\native\vulkan\</LlamaVulkanNativeDir>
+		</PropertyGroup>
+
+		<ItemGroup>
+			<LlamaCpuFile Include="$(LlamaCpuNativeDir)$(LlamaCpuAvxLevel)\*.dll" />
+			<LlamaCpuFile Condition="'@(LlamaCpuFile)' == ''" Include="$(LlamaCpuNativeDir)avx2\*.dll" />
+			<LlamaCpuFile Condition="'@(LlamaCpuFile)' == ''" Include="$(LlamaCpuNativeDir)avx\*.dll" />
+			<LlamaCpuFile Condition="'@(LlamaCpuFile)' == ''" Include="$(LlamaCpuNativeDir)noavx\*.dll" />
+			<!-- Запасной вариант: то, что уже скопировал .props в вывод проекта Services. -->
+			<LlamaCpuFile Condition="'@(LlamaCpuFile)' == ''" Include="$(MSBuildThisFileDirectory)..\AITradingSystem.Services\bin\$(Configuration)\net8.0\runtimes\win-x64\native\$(LlamaCpuAvxLevel)\*.dll" />
+
+			<LlamaCuda12File Include="$(LlamaCuda12NativeDir)*.dll" Condition="'$(LlamaWithCuda12)' == 'true'" />
+			<LlamaVulkanFile Include="$(LlamaVulkanNativeDir)*.dll" Condition="'$(LlamaWithVulkan)' == 'true'" />
+		</ItemGroup>
+
+		<Message Importance="high" Text="llama.cpp CPU: @(LlamaCpuFile-&gt;'%(Filename)%(Extension)', ', ') -&gt; $(OutDir)" Condition="'@(LlamaCpuFile)' != ''" />
+		<Message Importance="high" Text="llama.cpp CUDA12: @(LlamaCuda12File-&gt;'%(Filename)%(Extension)', ', ') -&gt; $(OutDir)cuda12\" Condition="'@(LlamaCuda12File)' != ''" />
+		<Message Importance="high" Text="llama.cpp Vulkan: @(LlamaVulkanFile-&gt;'%(Filename)%(Extension)', ', ') -&gt; $(OutDir)vulkan\" Condition="'@(LlamaVulkanFile)' != ''" />
+		<Message Importance="high" Text="ВНИМАНИЕ: нативные DLL llama.cpp не найдены в $(LlamaCpuNativeDir). Выполните dotnet restore для AITradingSystem.UI." Condition="'@(LlamaCpuFile)' == ''" />
+
+		<Copy SourceFiles="@(LlamaCpuFile)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+		<Copy SourceFiles="@(LlamaCuda12File)" DestinationFolder="$(OutDir)cuda12\" SkipUnchangedFiles="true" Condition="'@(LlamaCuda12File)' != ''" />
+		<Copy SourceFiles="@(LlamaVulkanFile)" DestinationFolder="$(OutDir)vulkan\" SkipUnchangedFiles="true" Condition="'@(LlamaVulkanFile)' != ''" />
+	</Target>
+
+</Project>

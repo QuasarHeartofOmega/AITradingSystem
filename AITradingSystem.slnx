@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="AITradingSystem.Common/AITradingSystem.Common.csproj" />
+  <Project Path="AITradingSystem.Core/AITradingSystem.Core.csproj" />
+  <Project Path="AITradingSystem.Data/AITradingSystem.Data.csproj" />
+  <Project Path="AITradingSystem.Services/AITradingSystem.Services.csproj" />
+  <Project Path="AITradingSystem.Tests/AITradingSystem.Tests.csproj" />
+  <Project Path="AITradingSystem.UI/AITradingSystem.UI.csproj" />
+</Solution>

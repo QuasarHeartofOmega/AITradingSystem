@@ -1,0 +1,60 @@
+<UserControl x:Class="AITradingSystem.UI.Views.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="#1E1E1E" Foreground="White">
+    <UserControl.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+    </UserControl.Resources>
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="20" MaxWidth="850" HorizontalAlignment="Left">
+            <TextBlock Text="Настройки системы" FontSize="24" FontWeight="Bold" Margin="0,0,0,15"/>
+            <TextBlock Text="Торговые пары: включение, лимит позиции (%). До 32 пар; сумма активных лимитов ≤ 100%." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <DataGrid ItemsSource="{Binding SymbolItems}" AutoGenerateColumns="False" CanUserAddRows="False" MaxHeight="300" Margin="0,0,0,8">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Символ" Binding="{Binding Symbol, UpdateSourceTrigger=PropertyChanged}" Width="160"/>
+                    <DataGridCheckBoxColumn Header="Вкл." Binding="{Binding IsEnabled, UpdateSourceTrigger=PropertyChanged}" Width="60"/>
+                    <DataGridTextColumn Header="Лимит, %" Binding="{Binding MaxPositionPercent, UpdateSourceTrigger=PropertyChanged}" Width="100"/>
+                    <DataGridTemplateColumn Header="Действие" Width="100">
+                        <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                            <Button Content="Удалить" Command="{Binding DataContext.RemoveSymbolCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}"/>
+                        </DataTemplate></DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+            <Button Content="Добавить пару" Command="{Binding AddSymbolCommand}" HorizontalAlignment="Left" Padding="10,5" Margin="0,0,0,15"/>
+            <TextBlock Text="Отслеживаемые активы (через запятую)"/><TextBox Text="{Binding WatchAssetsList}" Padding="6" Margin="0,4,0,12"/>
+            <TextBlock Text="Котировки (longest-match; USDT, FDUSD, USDC, BTC…)"/><TextBox Text="{Binding QuoteAssetsList}" Padding="6" Margin="0,4,0,12"/>
+            <UniformGrid Columns="2" Margin="0,0,0,12">
+                <StackPanel Margin="0,0,10,0"><TextBlock Text="Риск на сделку, %"/><TextBox Text="{Binding RiskPerTrade}" Padding="6"/></StackPanel>
+                <StackPanel><TextBlock Text="Максимальная просадка, %"/><TextBox Text="{Binding MaxDrawdown}" Padding="6"/></StackPanel>
+            </UniformGrid>
+            <CheckBox Content="Paper Trading: ордера НЕ отправляются на биржу" IsChecked="{Binding PaperTradingMode}" Foreground="#FFC107" Margin="0,0,0,12"/>
+            <TextBlock Text="Снятый флажок = реальные ордера в выбранном окружении. Для виртуальных средств Binance выберите Demo." Foreground="#FFC107" TextWrapping="Wrap" Margin="0,0,0,12"/>
+            <TextBlock Text="Окружение Binance"/><ComboBox ItemsSource="{Binding BinanceEnvironments}" SelectedItem="{Binding BinanceEnvironment}" Padding="6" Margin="0,4,0,8"/>
+            <Border Background="#4A1414" BorderBrush="#C62828" BorderThickness="1" Padding="10" Margin="0,0,0,12"
+                    Visibility="{Binding IsLiveConfirmPending, Converter={StaticResource BoolToVis}}">
+                <StackPanel>
+                    <TextBlock Text="REAL MONEY: переход в Live требует второго шага" Foreground="#FF8A80" FontWeight="Bold" TextWrapping="Wrap"/>
+                    <TextBlock Text="Введите LIVE и нажмите «Подтвердить Live». Без этого сохранение заблокировано." Foreground="#FFCDD2" TextWrapping="Wrap" Margin="0,4,0,6"/>
+                    <DockPanel>
+                        <Button DockPanel.Dock="Right" Content="Подтвердить Live" Command="{Binding ConfirmLiveCommand}" Padding="10,5" Margin="8,0,0,0"/>
+                        <TextBox Text="{Binding LiveConfirmPhrase, UpdateSourceTrigger=PropertyChanged}" Padding="6"/>
+                    </DockPanel>
+                </StackPanel>
+            </Border>
+            <TextBlock Text="Отдельные ключи Live (пусто — не менять сохранённые)" Foreground="#FF8A80" Margin="0,0,0,4"/>
+            <TextBox Text="{Binding LiveApiKeyInput, UpdateSourceTrigger=PropertyChanged}" Padding="6" Margin="0,0,0,6"
+                     ToolTip="Live API Key; сохраняется только в зашифрованном виде"/>
+            <PasswordBox x:Name="LiveApiSecretBox" PasswordChanged="LiveApiSecretBox_PasswordChanged" Padding="6" Margin="0,0,0,12"
+                         ToolTip="Live API Secret; сохраняется только в зашифрованном виде"/>
+            <TextBlock Text="Бэкенд ИИ"/><ComboBox ItemsSource="{Binding AiBackends}" SelectedItem="{Binding AiBackend}" Padding="6" Margin="0,4,0,12"/>
+            <TextBlock Text="{Binding BackendInfo}" TextWrapping="Wrap" Foreground="#AAAAAA" Margin="0,0,0,12"/>
+            <CheckBox Content="Thinking модели" IsChecked="{Binding EnableThinking}" Foreground="White" Margin="0,0,0,8"/>
+            <CheckBox Content="Разрешить ИИ закрывать позиции" IsChecked="{Binding AiCanClosePositions}" Foreground="White" Margin="0,0,0,8"/>
+            <CheckBox Content="Новости cryptocurrency.cv" IsChecked="{Binding CryptocurrencyCvEnabled}" Foreground="White" Margin="0,0,0,15"/>
+            <Button Content="Сохранить" Command="{Binding SaveCommand}" HorizontalAlignment="Left" Padding="15,8"/>
+            <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Foreground="#FFC107" Margin="0,12,0,15"/>
+            <TextBlock Text="symbols.json — основной реестр пар. Настройки записываются рядом с exe; перезапуск обязателен для применения списка, окружения и режима. Live использует реальные средства." TextWrapping="Wrap" Foreground="#AAAAAA" Margin="0,0,0,20"/>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

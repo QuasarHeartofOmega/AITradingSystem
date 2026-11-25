@@ -1,0 +1,95 @@
+{
+  "timestamp_utc": "2026-11-23T15:49:24Z",
+  "results": [
+    {
+      "check": "Demo REST /time",
+      "ok": true,
+      "required": true,
+      "detail": "HTTP 200, 246 мс, {\"serverTime\":1795448957409}"
+    },
+    {
+      "check": "Demo REST /klines",
+      "ok": true,
+      "required": true,
+      "detail": "HTTP 200, свечей 3, 239 мс"
+    },
+    {
+      "check": "Demo REST /exchangeInfo (фильтры)",
+      "ok": true,
+      "required": true,
+      "detail": "HTTP 200, 318 мс, step=0.00001000 tick=0.01000000 minNotional=5.00000000"
+    },
+    {
+      "check": "Demo REST /account существует (ждём 401 без ключа)",
+      "ok": false,
+      "required": false,
+      "detail": "HTTP 400, {\"code\":-1102,\"msg\":\"Mandatory parameter 'signature' was not sent, was empty/null, or malformed.\"}"
+    },
+    {
+      "check": "Demo WS kline+depth20",
+      "ok": true,
+      "required": true,
+      "detail": "кадров 4, kline=True, depth20=True"
+    },
+    {
+      "check": "Mainnet REST /time",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, 115 мс, {\"serverTime\":1795448961130}"
+    },
+    {
+      "check": "Mainnet REST /klines",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, свечей 3, 105 мс"
+    },
+    {
+      "check": "Mainnet REST /exchangeInfo (фильтры)",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, 108 мс, step=0.00001000 tick=0.01000000 minNotional=5.00000000"
+    },
+    {
+      "check": "Mainnet REST /account существует (ждём 401 без ключа)",
+      "ok": false,
+      "required": false,
+      "detail": "HTTP 400, {\"code\":-1102,\"msg\":\"Mandatory parameter 'signature' was not sent, was empty/null, or malformed.\"}"
+    },
+    {
+      "check": "Mainnet WS kline+depth20",
+      "ok": true,
+      "required": false,
+      "detail": "кадров 4, kline=True, depth20=True"
+    },
+    {
+      "check": "Testnet REST /time",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, 115 мс, {\"serverTime\":1795448964128}"
+    },
+    {
+      "check": "Testnet REST /klines",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, свечей 3, 116 мс"
+    },
+    {
+      "check": "Testnet REST /exchangeInfo (фильтры)",
+      "ok": true,
+      "required": false,
+      "detail": "HTTP 200, 111 мс, step=0.00001000 tick=0.01000000 minNotional=5.00000000"
+    },
+    {
+      "check": "Testnet REST /account существует (ждём 401 без ключа)",
+      "ok": false,
+      "required": false,
+      "detail": "HTTP 400, {\"code\":-1102,\"msg\":\"Mandatory parameter 'signature' was not sent, was empty/null, or malformed.\"}"
+    },
+    {
+      "check": "cryptocurrency.cv /api/news",
+      "ok": true,
+      "required": true,
+      "detail": "HTTP 200, статей 3, totalCount=1881, 287 мс, пример: Binance Alpha Listing in 2026: Requirements, Market Maker Rules and Od"
+    }
+  ]
+}

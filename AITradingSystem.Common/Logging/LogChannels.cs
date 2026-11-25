@@ -1,0 +1,297 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
+using Serilog;
+
+namespace AITradingSystem.Common.Logging;
+
+/// <summary>
+/// Имена логических каналов логирования. По ним Serilog раскладывает события
+/// в отдельные файлы (ai-*.log, exchange-*.log, news-*.log, trades-*.log).
+/// </summary>
+public static class LogChannel
+{
+    public const string Ai = "ai";
+    public const string Exchange = "exchange";
+    public const string News = "news";
+    public const string Trade = "trade";
+    public const string System = "system";
+}
+
+/// <summary>
+/// Настройки детализации логов. Заполняются из <see cref="Configuration.LoggingConfig"/>
+/// при инициализации логгера и читаются статическими каналами ниже.
+/// </summary>
+public static class LogOptions
+{
+    /// <summary>Логировать полный текст промпта, уходящего в модель.</summary>
+    public static bool LogPrompts { get; set; } = true;
+
+    /// <summary>Логировать сырой ответ модели (до парсинга).</summary>
+    public static bool LogAiResponses { get; set; } = true;
+
+    /// <summary>Логировать блок рассуждений модели (thinking).</summary>
+    public static bool LogThinking { get; set; } = true;
+
+    /// <summary>Логировать HTTP-запросы/ответы к бирже и новостным API.</summary>
+    public static bool LogHttpTraffic { get; set; } = true;
+
+    /// <summary>Логировать тела HTTP-ответов (обрезается по MaxTextLength).</summary>
+    public static bool LogHttpBodies { get; set; } = true;
+
+    /// <summary>Логировать новостной трафик и итоговый контекст для модели.</summary>
+    public static bool LogNews { get; set; } = true;
+
+    /// <summary>Максимальная длина одного текстового блока в логе (0 = без обрезки).</summary>
+    public static int MaxTextLength { get; set; } = 20000;
+
+    /// <summary>Маскировать ключи/подписи/токены в URL и телах.</summary>
+    public static bool MaskSecrets { get; set; } = true;
+
+    /// <summary>Обрезка длинных текстов для лога.</summary>
+    public static string Clip(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        if (MaxTextLength <= 0 || text.Length <= MaxTextLength) return text;
+        return string.Concat(text.AsSpan(0, MaxTextLength),
+            $"\n... [обрезано {text.Length - MaxTextLength} символов]");
+    }
+
+    /// <summary>Маскирует секреты в query-строке/теле запроса.</summary>
+    public static string Mask(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        if (!MaskSecrets) return text;
+
+        var masked = Regex.Replace(text,
+            @"(signature|auth_token|token|api_key|apiKey|X-MBX-APIKEY)([""'\s:=]+)([A-Za-z0-9_\-\.]+)",
+            m => $"{m.Groups[1].Value}{m.Groups[2].Value}***",
+            RegexOptions.IgnoreCase);
+
+        return masked;
+    }
+}
+
+/// <summary>
+/// Лог AI-пайплайна: входящий промпт, сырой ответ, рассуждения, распарсенный сигнал.
+/// Пишет в общий лог и в отдельный файл logs/ai-YYYYMMDD.log.
+/// </summary>
+public static class AiLog
+{
+    private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.Ai);
+
+    public static void Prompt(string symbol, int attempt, int maxAttempts, string prompt, string? meta = null)
+    {
+        if (!LogOptions.LogPrompts) return;
+
+        Ch.Information(
+            "AI PROMPT → {Symbol} (попытка {Attempt}/{Max}, {Chars} символов){Meta}\n{Prompt}",
+            symbol, attempt, maxAttempts, prompt.Length,
+            meta is null ? string.Empty : $" [{meta}]",
+            LogOptions.Clip(prompt));
+    }
+
+    public static void Response(string symbol, int attempt, string rawResponse, double elapsedMs)
+    {
+        if (!LogOptions.LogAiResponses) return;
+
+        Ch.Information(
+            "AI RESPONSE ← {Symbol} (попытка {Attempt}, {Elapsed:F0} мс, {Chars} символов)\n{Response}",
+            symbol, attempt, elapsedMs, rawResponse.Length, LogOptions.Clip(rawResponse));
+    }
+
+    public static void Thinking(string symbol, string thinking, double elapsedMs)
+    {
+        if (!LogOptions.LogThinking || string.IsNullOrWhiteSpace(thinking)) return;
+
+        Ch.Debug("AI THINKING {Symbol} ({Elapsed:F0} мс)\n{Thinking}",
+            symbol, elapsedMs, LogOptions.Clip(thinking));
+    }
+
+    public static void Parsed(string symbol, string action, decimal confidence, string json, double elapsedMs)
+    {
+        Ch.Information(
+            "AI ПРЕДЛОЖЕНИЕ {Symbol}: {Action} conf={Confidence:F2} ({Elapsed:F0} мс) — мнение модели, ещё не ордер. {Json}",
+            symbol, action, confidence, elapsedMs, LogOptions.Clip(json));
+    }
+
+    public static void ParseFailed(string symbol, int attempt, string reason, string? rawResponse)
+    {
+        Ch.Warning("AI PARSE FAIL {Symbol} (попытка {Attempt}): {Reason}\nСырой ответ: {Response}",
+            symbol, attempt, reason, LogOptions.Clip(LogOptions.Mask(rawResponse)));
+    }
+
+    public static void Retry(string symbol, int attempt, string reason)
+    {
+        Ch.Warning("AI RETRY {Symbol}: попытка {Attempt}, причина: {Reason}", symbol, attempt, reason);
+    }
+
+    public static void Backend(string message)
+    {
+        Ch.Information("AI BACKEND: {Message}", message);
+    }
+
+    public static void Failure(string symbol, Exception ex, string context)
+    {
+        Ch.Error(ex, "AI ERROR {Symbol}: {Context}", symbol, context);
+    }
+}
+
+/// <summary>
+/// Лог обмена с биржей: каждый REST-запрос/ответ, ошибки API, ордера, WebSocket.
+/// Отдельный файл logs/exchange-YYYYMMDD.log.
+/// </summary>
+public static class ExchangeLog
+{
+    private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.Exchange);
+
+    public static void Request(string method, string url, string? body = null)
+    {
+        if (!LogOptions.LogHttpTraffic) return;
+
+        Ch.Debug("HTTP → {Method} {Url}{Body}", method, LogOptions.Mask(url),
+            string.IsNullOrEmpty(body) ? string.Empty : " body=" + LogOptions.Clip(LogOptions.Mask(body)));
+    }
+
+    public static void Response(string method, string url, int statusCode, double elapsedMs, string? body)
+    {
+        if (!LogOptions.LogHttpTraffic) return;
+
+        Ch.Debug("HTTP ← {Status} {Method} {Url} ({Elapsed:F0} мс){Body}",
+            statusCode, method, LogOptions.Mask(url), elapsedMs,
+            LogOptions.LogHttpBodies && !string.IsNullOrEmpty(body)
+                ? "\n" + LogOptions.Clip(LogOptions.Mask(body))
+                : string.Empty);
+    }
+
+    public static void ApiError(string method, string url, int statusCode, string body, int? apiCode, string? apiMessage)
+    {
+        Ch.Error("BINANCE API ERROR {Status} {Method} {Url} code={Code} msg={Msg}\n{Body}",
+            statusCode, method, LogOptions.Mask(url), apiCode, apiMessage,
+            LogOptions.Clip(LogOptions.Mask(body)));
+    }
+
+    public static void Retry(string url, int attempt, int maxAttempts, string reason)
+    {
+        Ch.Warning("HTTP RETRY {Attempt}/{Max} {Url}: {Reason}", attempt, maxAttempts, LogOptions.Mask(url), reason);
+    }
+
+    public static void Order(string stage, string symbol, string side, decimal quantity, decimal price, string? details = null)
+    {
+        Serilog.Log.ForContext("Channel", LogChannel.Trade)
+            .Information("ORDER {Stage}: {Symbol} {Side} qty={Quantity} price={Price} {Details}",
+                stage, symbol, side, quantity, price, details ?? string.Empty);
+    }
+
+    public static void WebSocket(string message, string? details = null)
+    {
+        Ch.Information("WS: {Message} {Details}", message, details ?? string.Empty);
+    }
+
+    public static void WebSocketParseError(string rawMessage, Exception ex)
+    {
+        Ch.Error(ex, "WS PARSE ERROR\n{Raw}", LogOptions.Clip(rawMessage));
+    }
+
+    public static void Environment(string environment, string restUrl, string streamUrl)
+    {
+        Ch.Information("Binance environment: {Environment} | REST {Rest} | STREAM {Stream}",
+            environment, restUrl, streamUrl);
+    }
+}
+
+/// <summary>
+/// Лог новостных провайдеров: запросы, количество, итоговый контекст для модели.
+/// Отдельный файл logs/news-YYYYMMDD.log.
+/// </summary>
+public static class NewsLog
+{
+    private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.News);
+
+    public static void Request(string provider, string url)
+    {
+        if (!LogOptions.LogNews) return;
+        Ch.Debug("NEWS → {Provider} {Url}", provider, LogOptions.Mask(url));
+    }
+
+    public static void Response(string provider, int statusCode, int count, double elapsedMs, string? sample = null)
+    {
+        if (!LogOptions.LogNews) return;
+        Ch.Information("NEWS ← {Provider} status={Status} items={Count} ({Elapsed:F0} мс){Sample}",
+            provider, statusCode, count, elapsedMs,
+            string.IsNullOrEmpty(sample) ? string.Empty : "\n" + LogOptions.Clip(sample));
+    }
+
+    public static void Skipped(string provider, string reason)
+    {
+        if (!LogOptions.LogNews) return;
+        Ch.Debug("NEWS SKIP {Provider}: {Reason}", provider, reason);
+    }
+
+    public static void Failure(string provider, Exception ex, string context)
+    {
+        Ch.Warning(ex, "NEWS ERROR {Provider}: {Context}", provider, context);
+    }
+
+    public static void Context(string symbol, int count, string context)
+    {
+        if (!LogOptions.LogNews) return;
+        Ch.Debug("NEWS CONTEXT {Symbol} ({Count} новостей)\n{Context}", symbol, count, LogOptions.Clip(context));
+    }
+}
+
+/// <summary>
+/// Лог торговых решений и сделок: открытие/закрытие/отклонение с причинами.
+/// Отдельный файл logs/trades-YYYYMMDD.log.
+/// </summary>
+public static class TradeLog
+{
+    private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.Trade);
+
+    public static void Decision(string symbol, string decision, string reason)
+    {
+        Ch.Information("DECISION {Symbol}: {Decision} — {Reason}", symbol, decision, reason);
+    }
+
+    /// <summary>Единый финал решения по символу: что бот РЕАЛЬНО сделал (или почему не сделал).</summary>
+    public static void Outcome(string symbol, string verdict, string reason)
+    {
+        Ch.Information("ИТОГ {Symbol}: {Verdict} — {Reason}", symbol, verdict, reason);
+    }
+
+    public static void Opened(string symbol, string side, decimal quantity, decimal entry,
+        decimal stopLoss, decimal takeProfit, string mode, string? orderId = null)
+    {
+        var verdict = string.Equals(side, "Buy", StringComparison.OrdinalIgnoreCase) ? "КУПЛЕНО" : "ПРОДАНО";
+        Ch.Information(
+            "ИТОГ [{Mode}] {Symbol}: {Verdict} qty={Quantity} entry={Entry} SL={SL} TP={TP} order={Order}",
+            mode, symbol, verdict, quantity, entry, stopLoss, takeProfit, orderId ?? "-");
+    }
+
+    public static void Closed(string symbol, string reason, decimal quantity, decimal entry, decimal exit,
+        decimal pnl, decimal pnlPercent, decimal commission, string mode)
+    {
+        Ch.Information(
+            "ИТОГ [{Mode}] {Symbol}: ЗАКРЫТО ({Reason}) qty={Quantity} entry={Entry} exit={Exit} PnL={PnL} ({PnLPct}%) fee={Fee}",
+            mode, symbol, reason, quantity, entry, exit,
+            pnl.ToString("F4", CultureInfo.InvariantCulture),
+            pnlPercent.ToString("F2", CultureInfo.InvariantCulture),
+            commission.ToString("F4", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>Ожидание (прогрев индикаторов, cooldown) — чтобы «бот ничего не делает» было видно в логе.</summary>
+    public static void Waiting(string symbol, string reason)
+    {
+        Ch.Information("ИТОГ {Symbol}: ПАУЗА — {Reason}", symbol, reason);
+    }
+
+    public static void Rejected(string symbol, string stage, string reason)
+    {
+        Ch.Warning("ИТОГ {Symbol}: ОТКАЗ [{Stage}] — {Reason}", symbol, stage, reason);
+    }
+
+    public static void Balance(string mode, decimal cash, decimal equity, decimal drawdownPercent)
+    {
+        Ch.Information("BALANCE [{Mode}] cash={Cash} equity={Equity} drawdown={Drawdown}% ",
+            mode, cash, equity, drawdownPercent.ToString("F2", CultureInfo.InvariantCulture));
+    }
+}

@@ -1,0 +1,110 @@
+{
+  "Version": "1.2",
+  "UpdatedAt": "2026-11-24T00:00:00Z",
+  "Symbols": [
+    {
+      "Symbol": "BTTCUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 4,
+      "Priority": 0,
+      "MaxSpreadPercent": 0.25,
+      "MinDepthQuote": 2000,
+      "MinCandleQuoteVolume": 25000
+    },
+    {
+      "Symbol": "DOGEUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 9,
+      "Priority": 1
+    },
+    {
+      "Symbol": "DASHUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 7,
+      "Priority": 2
+    },
+    {
+      "Symbol": "XRPUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 11,
+      "Priority": 3
+    },
+    {
+      "Symbol": "FLRUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 4,
+      "Priority": 4,
+      "MaxSpreadPercent": 0.25,
+      "MinDepthQuote": 2000,
+      "MinCandleQuoteVolume": 25000
+    },
+    {
+      "Symbol": "ENJUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 4,
+      "Priority": 5
+    },
+    {
+      "Symbol": "STRAXUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 4,
+      "Priority": 6,
+      "MaxSpreadPercent": 0.25,
+      "MinDepthQuote": 2000,
+      "MinCandleQuoteVolume": 25000
+    },
+    {
+      "Symbol": "BNBUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 11,
+      "Priority": 7
+    },
+    {
+      "Symbol": "USDCUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 9,
+      "Priority": 8
+    },
+    {
+      "Symbol": "FDUSDUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 9,
+      "Priority": 9
+    },
+    {
+      "Symbol": "BTCUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 14,
+      "Priority": 10
+    },
+    {
+      "Symbol": "ETHUSDT",
+      "Enabled": true,
+      "MaxPositionPercent": 14,
+      "Priority": 11
+    }
+  ],
+  "WatchAssets": [
+    "BTTC",
+    "DOGE",
+    "DASH",
+    "XRP",
+    "USDT",
+    "FDUSD",
+    "FLR",
+    "ENJ",
+    "USDC",
+    "STRAX",
+    "BNB",
+    "BTC",
+    "ETH"
+  ],
+  "QuoteAssets": [
+    "USDT",
+    "FDUSD",
+    "USDC",
+    "BTC",
+    "ETH",
+    "BNB"
+  ]
+}
