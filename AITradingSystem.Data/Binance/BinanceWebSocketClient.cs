@@ -25,6 +25,10 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
     private string? _streamUrl;
+    private string _marketInterval = "15m";
+    private CancellationToken _marketConnectToken;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _subscribeRequestId;
     private long _messagesReceived;
     private long _parseErrors;
 
@@ -60,12 +64,10 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             throw new ArgumentException("Symbols list cannot be empty", nameof(symbols));
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _marketConnectToken = ct;
+        _marketInterval = interval;
 
-        var streams = symbolList.SelectMany(s => new[]
-        {
-            $"{s.ToLowerInvariant()}@kline_{interval}",
-            $"{s.ToLowerInvariant()}@depth20@1000ms"
-        });
+        var streams = BuildStreams(symbolList, interval);
 
         var combinedStream = string.Join("/", streams);
         _streamUrl = $"{_config.MarketStreamBaseUrl}?streams={combinedStream}";
@@ -76,6 +78,97 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
 
         await ConnectInternalAsync(_cts.Token);
         _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
+    }
+
+    private static IEnumerable<string> BuildStreams(IEnumerable<string> symbols, string interval) =>
+        symbols.SelectMany(s => new[]
+        {
+            $"{s.ToLowerInvariant()}@kline_{interval}",
+            $"{s.ToLowerInvariant()}@depth20@1000ms"
+        });
+
+    /// <summary>
+    /// P0.3: UNSUBSCRIBE + SUBSCRIBE по молчащему символу. Соединение и остальные стримы не рвутся.
+    /// Успех запроса не считается подтверждением live: это делает только реальный тик в MarketAnalyzer.
+    /// </summary>
+    public async Task ResubscribeAsync(IEnumerable<string> symbols, string interval, CancellationToken ct = default)
+    {
+        var streams = BuildStreams(symbols, interval).ToArray();
+        if (streams.Length == 0)
+            return;
+
+        var ws = _ws;
+        if (ws is not { State: WebSocketState.Open })
+            throw new InvalidOperationException("Рыночный WebSocket не подключён — resubscribe невозможен.");
+
+        await _sendLock.WaitAsync(ct);
+        try
+        {
+            await SendControlFrameAsync(ws, "UNSUBSCRIBE", streams, ct);
+            await SendControlFrameAsync(ws, "SUBSCRIBE", streams, ct);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+
+        ExchangeLog.WebSocket("resubscribe", $"{string.Join("/", streams)}");
+        _logger.LogInformation("DATA-WS-RESUBSCRIBE: {Streams}", string.Join("/", streams));
+    }
+
+    private async Task SendControlFrameAsync(ClientWebSocket ws, string method, string[] streams, CancellationToken ct)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            method,
+            @params = streams,
+            id = Interlocked.Increment(ref _subscribeRequestId)
+        });
+        var bytes = Encoding.UTF8.GetBytes(payload);
+        await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+    }
+
+    /// <summary>
+    /// P0.3: жёсткий реконнект рыночного сокета по инициативе движка; user-data socket остаётся жить.
+    /// </summary>
+    public async Task ReconnectMarketStreamsAsync(CancellationToken ct = default)
+    {
+        if (_streamUrl == null)
+            throw new InvalidOperationException("Рыночный WebSocket ещё не подключался — реконнект невозможен.");
+
+        try { OnDisconnected?.Invoke(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnDisconnected при принудительном реконнекте"); }
+
+        _cts?.Cancel();
+        if (_receiveTask != null)
+        {
+            try { await _receiveTask; }
+            catch (OperationCanceledException) { /* ожидаемо */ }
+            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка завершения receive loop при реконнекте"); }
+            _receiveTask = null;
+        }
+
+        if (_ws?.State == WebSocketState.Open)
+        {
+            try
+            {
+                using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Market data reconnect", closeCts.Token);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка закрытия рыночного сокета при реконнекте"); }
+        }
+
+        _ws?.Dispose();
+        _ws = null;
+        _cts?.Dispose();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(_marketConnectToken, ct);
+
+        ExchangeLog.WebSocket("принудительный реконнект", _streamUrl);
+        await ConnectInternalAsync(_cts.Token);
+        _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
+
+        try { OnReconnected?.Invoke(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnReconnected при принудительном реконнекте"); }
     }
 
     private async Task ConnectInternalAsync(CancellationToken ct)

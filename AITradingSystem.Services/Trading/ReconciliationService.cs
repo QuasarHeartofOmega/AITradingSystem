@@ -18,6 +18,8 @@ namespace AITradingSystem.Services.Trading;
 ///  - подхват сиротских позиций бота из журнала намерений и исполненных entry-ордеров;
 ///  - снятие сиротских ордеров/OCO бота (внешние ордера не трогаем);
 ///  - учёт частичных филлов через кумулятив ордера и durable-леджер Position.AppliedExchangeFills.
+/// P0.4: явная проверка поддержки user-data stream в окружении, режим POLLING-FALLBACK с интервалом,
+/// fail-closed по неизвестному состоянию ордеров/позиций (IsExecutionStateTrusted) и журнал RECON-*.
 /// </summary>
 public sealed class ReconciliationService : IAsyncDisposable
 {
@@ -33,7 +35,97 @@ public sealed class ReconciliationService : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private Task? _keepAliveLoop;
     private Task? _healthLoop;
+    private Task? _pollingLoop;
     private string? _listenKey;
+
+    /// <summary>P0.4: результат явной проверки поддержки user-data stream в текущем окружении.</summary>
+    public bool UserDataStreamProbeCompleted { get; private set; }
+    public bool IsUserDataStreamSupported { get; private set; }
+    private string _executionMode = "UNKNOWN";
+    private int _unresolvedStateIssues;
+
+    /// <summary>P0.4: момент последней успешной реконсиляции — основа доверия к состоянию исполнения.</summary>
+    public DateTime LastSuccessfulReconcileUtc { get; private set; }
+
+    /// <summary>P0.4: STREAM | POLLING-FALLBACK | UNAVAILABLE | PAPER | DISABLED.</summary>
+    public string ExecutionMode => _executionMode;
+
+    /// <summary>
+    /// P0.4: можно ли доверять состоянию ордеров/позиций. Ложь = freeze entries, не угадывать.
+    /// </summary>
+    public bool IsExecutionStateTrusted =>
+        EvaluateExecutionTrust(
+            _config.PaperTradingMode, _rest.HasApiKeys, _config.UserDataStreamEnabled,
+            _ws.IsUserDataStreamConnected, _config.UserDataPollingFallbackEnabled,
+            LastSuccessfulReconcileUtc, DateTime.UtcNow, _config.ExecutionStateMaxStalenessSeconds,
+            Volatile.Read(ref _unresolvedStateIssues), out _);
+
+    /// <summary>P0.4: причина недоверия к состоянию исполнения (для журнала отказов).</summary>
+    public string ExecutionStateBlockReason =>
+        EvaluateExecutionTrust(
+            _config.PaperTradingMode, _rest.HasApiKeys, _config.UserDataStreamEnabled,
+            _ws.IsUserDataStreamConnected, _config.UserDataPollingFallbackEnabled,
+            LastSuccessfulReconcileUtc, DateTime.UtcNow, _config.ExecutionStateMaxStalenessSeconds,
+            Volatile.Read(ref _unresolvedStateIssues), out var reason)
+            ? string.Empty
+            : reason;
+
+    /// <summary>
+    /// P0.4: чистая политика fail-closed. Отправленный REST-запрос сам по себе не доказывает исполнение:
+    /// нужна либо живая лента executionReport, либо свежая успешная реконсиляция в polling-режиме.
+    /// </summary>
+    public static bool EvaluateExecutionTrust(
+        bool paperMode, bool hasApiKeys, bool streamEnabled, bool streamConnected,
+        bool pollingFallbackEnabled, DateTime lastSuccessfulReconcileUtc, DateTime nowUtc,
+        int maxStalenessSeconds, int unresolvedIssues, out string reason)
+    {
+        if (unresolvedIssues > 0)
+        {
+            reason = $"unknown-order-or-position-state:{unresolvedIssues}";
+            return false;
+        }
+
+        // Paper/без ключей/контур выключен — реального биржевого состояния нет.
+        if (paperMode || !hasApiKeys || !streamEnabled)
+        {
+            reason = string.Empty;
+            return true;
+        }
+
+        if (lastSuccessfulReconcileUtc == default)
+        {
+            reason = "no-successful-reconciliation";
+            return false;
+        }
+
+        var age = (nowUtc - lastSuccessfulReconcileUtc).TotalSeconds;
+        if (streamConnected)
+        {
+            // Стрим жив, но состояние всё равно должно быть сверено хотя бы раз и не быть древним.
+            if (age > maxStalenessSeconds * 4)
+            {
+                reason = $"execution-state-stale:{age:F0}s";
+                return false;
+            }
+            reason = string.Empty;
+            return true;
+        }
+
+        if (!pollingFallbackEnabled)
+        {
+            reason = "user-data-stream-down-without-polling-fallback";
+            return false;
+        }
+
+        if (age > maxStalenessSeconds)
+        {
+            reason = $"execution-state-stale:{age:F0}s";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
     private readonly SemaphoreSlim _applyLock = new(1, 1);
     private readonly SemaphoreSlim _listenKeyLock = new(1, 1);
 
@@ -95,12 +187,14 @@ public sealed class ReconciliationService : IAsyncDisposable
 
         if (_config.PaperTradingMode || !_rest.HasApiKeys || !_config.UserDataStreamEnabled)
         {
+            _executionMode = _config.PaperTradingMode ? "PAPER" : "DISABLED";
             _logger.LogInformation(
                 "Реконсиляция/user-data stream пропущены: paper={Paper}, ключи={Keys}, включено={Enabled}",
                 _config.PaperTradingMode, _rest.HasApiKeys, _config.UserDataStreamEnabled);
+            TradeLog.ExecutionMode(_executionMode, "paper-or-no-keys-or-disabled", _config.UserDataPollingIntervalSeconds);
             // Инвентаризация всё равно полезна в live без stream; в paper — нет.
             if (!_config.PaperTradingMode && _rest.HasApiKeys)
-                await ReconcileAsync(ct);
+                await ReconcileAsync(ct, "startup-no-stream");
             return;
         }
 
@@ -111,21 +205,93 @@ public sealed class ReconciliationService : IAsyncDisposable
             await ConnectUserDataAsync(_cts.Token);
             _keepAliveLoop = Task.Run(() => KeepAliveLoopAsync(_cts.Token), _cts.Token);
             _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), _cts.Token);
+            SetExecutionMode("STREAM", "user-data-stream-connected");
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "USER-DATA-FAIL: user-data stream не поднят — остаётся polling/периодическая реконсиляция");
+            // P0.4: недоступность stream — не «тихое продолжение», а явный режим с политикой fail-closed.
+            _logger.LogWarning(ex, "USER-DATA-FAIL: user-data stream не поднят");
+            EnterDegradedMode($"start-failed:{ex.GetType().Name}", _cts.Token);
         }
 
-        await ReconcileAsync(ct);
+        await ReconcileAsync(ct, "startup");
+    }
+
+    /// <summary>P0.4: явный режим исполнения и его причина в trade-log.</summary>
+    private void SetExecutionMode(string mode, string reason)
+    {
+        _executionMode = mode;
+        TradeLog.ExecutionMode(mode, reason, _config.UserDataPollingIntervalSeconds);
+        _logger.LogWarning("EXECUTION-MODE={Mode}: {Reason}", mode, reason);
+    }
+
+    /// <summary>
+    /// P0.4: stream недоступен. Если polling разрешён — переходим на периодическую REST-реконсиляцию,
+    /// иначе состояние исполнения считается неизвестным и входы запрещаются.
+    /// </summary>
+    private void EnterDegradedMode(string reason, CancellationToken ct)
+    {
+        if (_config.UserDataPollingFallbackEnabled)
+        {
+            SetExecutionMode("POLLING-FALLBACK", reason);
+            if (_pollingLoop is null && _cts is { IsCancellationRequested: false })
+                _pollingLoop = Task.Run(() => PollingLoopAsync(ct), ct);
+            return;
+        }
+
+        SetExecutionMode("UNAVAILABLE", reason);
+        if (_config.UserDataStreamRequiredForEntries)
+            TradeLog.ExecutionStateBlocked("user-data-stream-down-without-polling-fallback");
+    }
+
+    /// <summary>P0.4: polling-fallback — периодическая реконсиляция вместо executionReport.</summary>
+    private async Task PollingLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(_config.UserDataPollingIntervalSeconds));
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                if (_ws.IsUserDataStreamConnected)
+                {
+                    SetExecutionMode("STREAM", "user-data-stream-restored");
+                    return;
+                }
+
+                _metrics.RecordPollingFallbackReconcile();
+                await ReconcileAsync(ct, "polling-fallback");
+            }
+        }
+        catch (OperationCanceledException) { /* остановка */ }
     }
 
     private async Task ConnectUserDataAsync(CancellationToken ct)
     {
-        _listenKey = await _rest.CreateListenKeyAsync(ct);
+        // P0.4: явная проверка поддержки user-data stream в Demo/Testnet/Live (410 = окружение не поддерживает).
+        try
+        {
+            _listenKey = await _rest.CreateListenKeyAsync(ct);
+        }
+        catch (BinanceApiException ex)
+        {
+            UserDataStreamProbeCompleted = true;
+            IsUserDataStreamSupported = false;
+            _metrics.RecordUserDataStreamProbe(supported: false);
+            TradeLog.UserDataProbe(_rest.EnvironmentName, false, ex.HttpStatus, ex.ApiCode, ex.ApiMessage);
+            _logger.LogWarning("USER-DATA-PROBE: окружение {Env} не поддержало listenKey (http {Http}, code {Code})",
+                _rest.EnvironmentName, ex.HttpStatus, ex.ApiCode);
+            throw;
+        }
+
         _ws.OnExecutionReport -= OnExecutionReport;
         _ws.OnExecutionReport += OnExecutionReport;
         await _ws.ConnectUserDataStreamAsync(_listenKey, ct);
+
+        UserDataStreamProbeCompleted = true;
+        IsUserDataStreamSupported = true;
+        _metrics.RecordUserDataStreamProbe(supported: true);
+        TradeLog.UserDataProbe(_rest.EnvironmentName, true, null, null, "listenKey+socket ok");
         _logger.LogInformation("USER-DATA-START: listenKey получен, keepalive каждые {Minutes} мин, health-check каждые {Seconds} с",
             _config.UserDataKeepAliveMinutes, _config.UserDataStreamHealthCheckSeconds);
     }
@@ -144,7 +310,8 @@ public sealed class ReconciliationService : IAsyncDisposable
             }
             await ConnectUserDataAsync(ct);
             _metrics.RecordListenKeyRecreation();
-            await ReconcileAsync(ct);
+            SetExecutionMode("STREAM", "listenKey-recreated");
+            await ReconcileAsync(ct, "listenKey-recreated");
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -157,36 +324,57 @@ public sealed class ReconciliationService : IAsyncDisposable
         }
     }
 
-    public async Task<ReconciliationReport?> ReconcileAsync(CancellationToken ct = default)
+    public async Task<ReconciliationReport?> ReconcileAsync(CancellationToken ct = default) =>
+        await ReconcileAsync(ct, "manual");
+
+    public async Task<ReconciliationReport?> ReconcileAsync(CancellationToken ct, string trigger)
     {
         if (_config.PaperTradingMode || !_rest.HasApiKeys) return null;
+
+        var positionsSnapshot = _positions.GetOpenPositions();
+        TradeLog.ReconStart(trigger, positionsSnapshot.Count);
+        Interlocked.Exchange(ref _unresolvedStateIssues, 0);
 
         try
         {
             var openOrders = await _rest.GetOpenOrdersAsync(ct: ct);
             var openLists = await _rest.GetOpenOrderListsAsync(ct: ct);
-            var positions = _positions.GetOpenPositions();
 
-            var report = Classify(positions, openOrders, openLists);
+            var report = Classify(positionsSnapshot, openOrders, openLists);
             LastReport = report;
             _metrics.RecordReconciliation(report.TotalIssues);
 
             foreach (var finding in report.Findings)
                 _logger.LogWarning("RECON: {Finding}", finding);
 
-            await RemediateAsync(positions, openOrders, openLists, ct);
+            await RemediateAsync(positionsSnapshot, openOrders, openLists, ct);
+
+            // P0.4: успех фиксируется только если не осталось неразрешённых состояний.
+            var unresolved = Volatile.Read(ref _unresolvedStateIssues);
+            if (unresolved == 0)
+                LastSuccessfulReconcileUtc = DateTime.UtcNow;
+            else
+                TradeLog.ExecutionStateBlocked($"unknown-order-or-position-state:{unresolved}");
+
+            TradeLog.ReconSummary(report.PositionsChecked, report.OrphanOcoLists, report.OrphanOrders,
+                report.ExternalOrders, report.ProtectionMissing, unresolved, IsExecutionStateTrusted);
 
             _logger.LogInformation(
                 "RECON-SUMMARY: позиций {Positions}, сиротских OCO {OrphanOco}, сиротских ордеров {OrphanOrders}, " +
-                "внешних ордеров {External}, позиций без защиты {Missing}",
+                "внешних ордеров {External}, позиций без защиты {Missing}, неразрешённых {Unresolved}",
                 report.PositionsChecked, report.OrphanOcoLists, report.OrphanOrders,
-                report.ExternalOrders, report.ProtectionMissing);
+                report.ExternalOrders, report.ProtectionMissing, unresolved);
 
             return report;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
+            // P0.4: неизвестное состояние — freeze entries, а не оптимистичное продолжение.
+            Interlocked.Increment(ref _unresolvedStateIssues);
+            _metrics.RecordReconciliationFailure();
+            TradeLog.ReconFail(trigger, ex.Message);
+            TradeLog.ExecutionStateBlocked("reconciliation-failed");
             _logger.LogWarning(ex, "RECON-FAIL: реконсиляция не выполнена");
             return null;
         }
@@ -347,12 +535,14 @@ public sealed class ReconciliationService : IAsyncDisposable
                     };
                     await _adoptOrphanPosition(orphan, ct);
                     _metrics.RecordOrphanPositionAdopted();
+                    TradeLog.ReconAdopt(orphan.Symbol, orphan.Quantity, orphan.EntryPrice, order.ClientOrderId);
                     _logger.LogWarning("RECON-ADOPT: подхвачена сиротская позиция {Symbol} {Qty}@{Price} из ордера {ClientId}",
                         orphan.Symbol, orphan.Quantity, orphan.EntryPrice, order.ClientOrderId);
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
+                    Interlocked.Increment(ref _unresolvedStateIssues);
                     _logger.LogWarning(ex, "RECON-ADOPT-FAIL: не удалось подхватить {Symbol} по {ClientId}", intent.Symbol, intent.ClientOrderId);
                 }
             }
@@ -369,6 +559,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
+                    Interlocked.Increment(ref _unresolvedStateIssues);
                     _logger.LogWarning(ex, "RECON-CLOSE-FAIL: не удалось применить close-филл {Symbol} {ClientId}", intent.Symbol, intent.ClientOrderId);
                 }
             }
@@ -414,6 +605,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                     };
                     await _adoptOrphanPosition(orphan, ct);
                     _metrics.RecordOrphanPositionAdopted();
+                    TradeLog.ReconAdopt(orphan.Symbol, orphan.Quantity, orphan.EntryPrice, order.ClientOrderId);
                 }
 
                 if (!order.IsActive) continue;
@@ -427,11 +619,13 @@ public sealed class ReconciliationService : IAsyncDisposable
                             return null;
                         }, ct);
                     _metrics.RecordOrphanOrderCanceled();
+                    TradeLog.ReconCancel(order.Symbol, "order", order.ClientOrderId);
                     _logger.LogWarning("RECON-CANCEL: снят сиротский ордер бота {Symbol} {ClientId}", order.Symbol, order.ClientOrderId);
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
+                    Interlocked.Increment(ref _unresolvedStateIssues);
                     _logger.LogWarning(ex, "RECON-CANCEL-FAIL: не удалось снять сиротский ордер {Symbol} {ClientId}", order.Symbol, order.ClientOrderId);
                 }
             }
@@ -453,11 +647,13 @@ public sealed class ReconciliationService : IAsyncDisposable
                             return null;
                         }, ct);
                     _metrics.RecordOrphanOrderCanceled();
+                    TradeLog.ReconCancel(list.Symbol, "oco", list.OrderListId.ToString());
                     _logger.LogWarning("RECON-CANCEL: снята сиротская OCO#{ListId} {Symbol}", list.OrderListId, list.Symbol);
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
+                    Interlocked.Increment(ref _unresolvedStateIssues);
                     _logger.LogWarning(ex, "RECON-CANCEL-FAIL: не удалось снять сиротскую OCO#{ListId} {Symbol}", list.OrderListId, list.Symbol);
                 }
             }
@@ -496,8 +692,11 @@ public sealed class ReconciliationService : IAsyncDisposable
                     if (live is null) return;
                     var applied = await _applyExchangeFill(live, report, reason, _cts.Token);
                     if (applied)
+                    {
+                        TradeLog.ProtectionFillApplied(live.Symbol, reason, report.CumulativeQuantity, "user-data-stream");
                         _logger.LogWarning("PROTECTION-FILLED-APPLIED: {Symbol} {Reason} cum={CumQty} применён к позиции без повторного MARKET",
                             live.Symbol, reason, report.CumulativeQuantity);
+                    }
                 }
                 finally
                 {
@@ -575,6 +774,7 @@ public sealed class ReconciliationService : IAsyncDisposable
             {
                 if (_ws.IsUserDataStreamConnected) continue;
                 _logger.LogWarning("USER-DATA-DOWN: socket не подключён — пересоздаю listenKey и реконсилирую");
+                EnterDegradedMode("health-check-socket-down", ct);
                 await RecreateListenKeyAsync(ct);
             }
         }
@@ -585,7 +785,7 @@ public sealed class ReconciliationService : IAsyncDisposable
     {
         _cts?.Cancel();
 
-        foreach (var loop in new[] { _keepAliveLoop, _healthLoop })
+        foreach (var loop in new[] { _keepAliveLoop, _healthLoop, _pollingLoop })
         {
             if (loop is null) continue;
             try { await loop; }
@@ -593,6 +793,8 @@ public sealed class ReconciliationService : IAsyncDisposable
         }
         _keepAliveLoop = null;
         _healthLoop = null;
+        _pollingLoop = null;
+        _executionMode = "STOPPED";
 
         _ws.OnExecutionReport -= OnExecutionReport;
 

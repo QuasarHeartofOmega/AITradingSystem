@@ -172,6 +172,24 @@ public sealed class TradingConfig
     /// <summary>P0.5: проверка живости user-data socket и пересоздание listenKey при обрыве, секунды.</summary>
     public int UserDataStreamHealthCheckSeconds { get; set; } = 15;
 
+    /// <summary>
+    /// P0.4: user-data stream обязателен для новых входов. Если стрим недоступен и polling-fallback выключен —
+    /// входы запрещены (fail-closed), сопровождение открытых позиций продолжается.
+    /// </summary>
+    public bool UserDataStreamRequiredForEntries { get; set; } = true;
+
+    /// <summary>P0.4: разрешить polling-режим (периодическая REST-реконсиляция) вместо user-data stream.</summary>
+    public bool UserDataPollingFallbackEnabled { get; set; } = true;
+
+    /// <summary>P0.4: интервал polling-реконсиляции в режиме EXECUTION-MODE=POLLING-FALLBACK, секунды.</summary>
+    public int UserDataPollingIntervalSeconds { get; set; } = 20;
+
+    /// <summary>
+    /// P0.4: предельный возраст последней успешной реконсиляции. Старше — состояние исполнения считается
+    /// неизвестным и новые входы запрещаются, даже если socket формально поднят.
+    /// </summary>
+    public int ExecutionStateMaxStalenessSeconds { get; set; } = 90;
+
     /// <summary>P0.5: подхватывать сиротские позиции бота из журнала/ордеров при реконсиляции.</summary>
     public bool ReconciliationAdoptOrphanPositions { get; set; } = true;
 
@@ -242,6 +260,21 @@ public sealed class TradingConfig
 
     /// <summary>P1.4: пауза перед повторной попыткой REST-дозагрузки истории при неудаче, секунд.</summary>
     public int MarketDataRecoveryRetrySeconds { get; set; } = 15;
+
+    /// <summary>
+    /// P0.3: сколько секунд после REST-прогрева ждать живой WS-тик по символу.
+    /// REST-история сама по себе не подтверждает, что стрим снова delivering.
+    /// </summary>
+    public int MarketDataLiveConfirmSeconds { get; set; } = 20;
+
+    /// <summary>P0.3: сколько попыток resubscribe symbol/stream до полного реконнекта и карантина.</summary>
+    public int MarketDataMaxResubscribeAttempts { get; set; } = 2;
+
+    /// <summary>P0.3: длительность карантина символа, у которого WS так и не ожил, секунд.</summary>
+    public int MarketDataQuarantineSeconds { get; set; } = 300;
+
+    /// <summary>P0.3: минимальная пауза между принудительными реконнектами рыночного WS, секунд.</summary>
+    public int MarketDataReconnectCooldownSeconds { get; set; } = 60;
 
     /// <summary>
     /// Период обновления стакана ордеров в секундах (FR-1.3).
@@ -453,6 +486,22 @@ public sealed class TradingConfig
             throw new InvalidOperationException(
                 $"MarketDataRecoveryRetrySeconds должен быть в диапазоне [5; 600]. Текущее: {MarketDataRecoveryRetrySeconds}");
 
+        if (MarketDataLiveConfirmSeconds < 5 || MarketDataLiveConfirmSeconds > 300)
+            throw new InvalidOperationException(
+                $"MarketDataLiveConfirmSeconds должен быть в диапазоне [5; 300]. Текущее: {MarketDataLiveConfirmSeconds}");
+
+        if (MarketDataMaxResubscribeAttempts < 0 || MarketDataMaxResubscribeAttempts > 5)
+            throw new InvalidOperationException(
+                $"MarketDataMaxResubscribeAttempts должен быть в диапазоне [0; 5]. Текущее: {MarketDataMaxResubscribeAttempts}");
+
+        if (MarketDataQuarantineSeconds < 30 || MarketDataQuarantineSeconds > 3600)
+            throw new InvalidOperationException(
+                $"MarketDataQuarantineSeconds должен быть в диапазоне [30; 3600]. Текущее: {MarketDataQuarantineSeconds}");
+
+        if (MarketDataReconnectCooldownSeconds < 10 || MarketDataReconnectCooldownSeconds > 600)
+            throw new InvalidOperationException(
+                $"MarketDataReconnectCooldownSeconds должен быть в диапазоне [10; 600]. Текущее: {MarketDataReconnectCooldownSeconds}");
+
         if (PaperCommissionRate < 0 || PaperCommissionRate > 0.01m)
             throw new InvalidOperationException("PaperCommissionRate должен быть в диапазоне [0; 0.01].");
 
@@ -552,6 +601,14 @@ public sealed class TradingConfig
         if (UserDataKeepAliveMinutes < 1 || UserDataKeepAliveMinutes > 59)
             throw new InvalidOperationException(
                 $"UserDataKeepAliveMinutes должен быть в диапазоне [1; 59] (Binance аннулирует listenKey через 60 мин). Текущее: {UserDataKeepAliveMinutes}");
+
+        if (UserDataPollingIntervalSeconds < 5 || UserDataPollingIntervalSeconds > 300)
+            throw new InvalidOperationException(
+                $"UserDataPollingIntervalSeconds должен быть в диапазоне [5; 300]. Текущее: {UserDataPollingIntervalSeconds}");
+
+        if (ExecutionStateMaxStalenessSeconds < 15 || ExecutionStateMaxStalenessSeconds > 900)
+            throw new InvalidOperationException(
+                $"ExecutionStateMaxStalenessSeconds должен быть в диапазоне [15; 900]. Текущее: {ExecutionStateMaxStalenessSeconds}");
 
         if (UserDataStreamHealthCheckSeconds < 5 || UserDataStreamHealthCheckSeconds > 300)
             throw new InvalidOperationException(

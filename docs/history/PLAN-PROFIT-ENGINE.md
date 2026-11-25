@@ -1,7 +1,7 @@
 # PLAN-PROFIT-ENGINE — исправленный план превращения AITradingSystem в проверяемый торговый движок
 
 **Дата редакции:** 2026-11-26  
-**Статус:** активный план; P0.1 и P0.2 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1/P0.2 не выполнена  
+**Статус:** активный план; P0.1–P0.4 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1–P0.4 не выполнена  
 **Базовый документ:** `docs/history/PLAN-PROFIT-ENGINE.md` сохранён как история  
 **Ограничение аудита:** без сборок, тестовых прогонов и новых ордеров  
 **Главный вывод:** за 6 ч 47 м торговых решений получено 501 AI-предложение, 20 BUY, 0 отправленных ордеров, 0 филлов, 0 закрытых сделок. Прибыльность не доказана; сначала нужно починить учёт капитала, данные, журнал исходов и исполняемость.
@@ -61,14 +61,14 @@
 | Confidence gate | `[x]` | 16 отказов | отделить model conf от engine prior и edge |
 | Risk gate | `[~]` | 4 отказа MaxDrawdown 50% | проверить equity/free-cash/deposit/peak |
 | Kill-switch block | `[~]` | 11 отказов | persist engaged state, engage/reset audit |
-| Market-data fail-closed | `[~]` | 71 отказ, но recovery loops | исправить stale-kline после REST recovery |
+| Market-data fail-closed | `[~]` | 71 отказ, но recovery loops | код P0.3 внесён (history_reloaded ≠ stream_live, resubscribe/reconnect/карантин); runtime-приёмка не выполнена |
 | Order submit / fill | `[ ]` | 0 наблюдаемых | Demo smoke-test post-only и market |
 | OCO SL/TP | `[ ]` | нет постановки/срабатывания | Demo smoke-test обеих ног |
 | Independent protection monitor | `[~]` | MONITOR-START есть | тест во время занятого LLM/паузы/сети |
 | Idempotency | `[ ]` | нет повторной отправки | тест duplicate clientOrderId |
 | Risk-state persistence | `[ ]` | нет RISK-STATE-RESTORED | тест рестарта после убытка/просадки |
-| User-data stream | `[ ]` | 410 POST userDataStream | проверить Demo support/fail-closed |
-| Reconciliation | `[ ]` | нет RECON-SUMMARY | orphan order/OCO/position tests |
+| User-data stream | `[~]` | 410 POST userDataStream | код P0.4 внесён (USER-DATA-PROBE, POLLING-FALLBACK, fail-closed); поддержка Demo не проверена runtime |
+| Reconciliation | `[~]` | нет RECON-SUMMARY | код P0.4 внесён (RECON-START/SUMMARY/FAIL/ADOPT/CANCEL, unresolved → freeze); orphan order/OCO/position tests не выполнены |
 | 429 / -1003 | `[ ]` | не наблюдались | контролируемый weight-budget test |
 | Tick/step/minNotional | `[ ]` | до filters не дошло | тесты на BTTC/STRAX/FLR и dust |
 | Portfolio/symbol/cash caps | `[ ]` | до sizing не дошло | логировать requested/capped quantity |
@@ -151,31 +151,90 @@
 ### P0.3. Market-data recovery: REST-прогрев ≠ живой WS
 
 **Проблема:** `DATA-RECOVERED` повторяется 101 раз, но `stale-kline` продолжается для ENJ/STRAX/FDUSD/DASH.
+Причина в коде: `TryReloadHistory` выставлял `LastKlineUtc = nowUtc`, то есть REST-прогрев сам себе подделывал
+«свежий тик», снимал `RecoveryRequired` и писал «входы разрешены». Через `MarketDataMaxAgeSeconds` watchdog
+снова видел `stale-kline` и заново запускал тот же REST-прогрев — цикл recovered → stale.
+
+**Статус после локальных правок:** код внесён; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
 
 **Задачи:**
 
-- `[ ]` Разделить `history_reloaded` и `stream_live`.
-- `[ ]` После REST recovery требовать свежий WS tick по символу в течение `N` секунд.
-- `[ ]` Если WS молчит: resubscribe symbol/stream, затем reconnect, затем quarantine.
-- `[ ]` Не писать `DATA-RECOVERED` как «входы разрешены», пока не подтверждён live tick и стакан.
-- [ ] Логировать `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-WS-RESUBSCRIBE`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE`.
-- `[ ]` Счётчики: stale_blocks, recovery_attempts, recovery_success, mean_time_to_live.
+- `[~]` Разделить `history_reloaded` и `stream_live`.
+  - `MarketAnalyzer.SymbolState` получил `LastRestReloadUtc` (REST) отдельно от `LastKlineUtc` (только WS-тик).
+  - `TryReloadHistory` больше не трогает `LastKlineUtc`; выставляет `LiveTickPending` и окно ожидания.
+  - Единственный источник факта «стрим жив» — `NoteLiveTickLocked`, вызываемый из `NoteKline`/`UpdateIndicators`.
+- `[~]` После REST recovery требовать свежий WS tick по символу в течение `N` секунд.
+  - Новый `TradingConfig.MarketDataLiveConfirmSeconds` (по умолчанию 20, диапазон [5; 300]).
+  - `IsDataFresh` возвращает `awaiting-live-tick`, пока живой тик не пришёл; вход запрещён.
+- `[~]` Если WS молчит: resubscribe symbol/stream, затем reconnect, затем quarantine.
+  - `IBinanceWebSocketClient.ResubscribeAsync` (UNSUBSCRIBE + SUBSCRIBE без разрыва сокета).
+  - `IBinanceWebSocketClient.ReconnectMarketStreamsAsync` — реконнект только рыночного сокета, user-data не гасится.
+  - `TradingEngine.EscalateSilentStreamAsync`: `MarketDataMaxResubscribeAttempts` (2) → принудительный реконнект
+    с кулдауном `MarketDataReconnectCooldownSeconds` (60) → карантин `MarketDataQuarantineSeconds` (300).
+  - Карантин снимается живым тиком или по истечении срока; после истечения символ идёт в REST-прогрев, не в торговлю.
+- `[~]` Не писать `DATA-RECOVERED` как «входы разрешены», пока не подтверждён live tick и стакан.
+  - Событие `DATA-RECOVERED` удалено из кода; вместо него `DATA-REST-RELOAD` (`entries_allowed=false`)
+    и отдельное `DATA-LIVE-CONFIRMED` (`entries_allowed_after_fresh_book=true`).
+- `[~]` Логировать `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-WS-RESUBSCRIBE`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE`.
+  - Добавлены `TradeLog.DataStale/DataRestReload/DataWsResubscribe/DataWsReconnect/DataLiveConfirmed/DataQuarantine/DataQuarantineLifted`.
+- `[~]` Счётчики: stale_blocks, recovery_attempts, recovery_success, mean_time_to_live.
+  - `MetricsCollector`: `MarketDataRecoveryAttempts`, `MarketDataLiveConfirmations`, `MarketDataMeanTimeToLiveSeconds`,
+    `MarketDataMaxTimeToLiveSeconds`, `MarketDataResubscribes`, `MarketDataReconnectRequests`, `MarketDataQuarantines`,
+    `MarketDataQuarantineLifts`; всё выведено в `GetSummary()`.
+
+**Изменённые файлы P0.3:**
+
+- `AITradingSystem.Services/Analysis/MarketAnalyzer.cs` — разделение history_reloaded/stream_live, окно live-подтверждения, счётчик resubscribe, карантин/снятие карантина, `awaiting-live-tick` в `IsDataFresh`.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — `RecoverMarketDataAsync` переписан: снятие карантина → подтверждение live → watchdog → REST-прогрев (`ReloadHistoryAsync`) → эскалация (`EscalateSilentStreamAsync`); startup-прогрев тоже требует live-тик; freshness-гейт не гоняет REST по карантину/ожиданию тика.
+- `AITradingSystem.Data/Binance/IBinanceWebSocketClient.cs`, `AITradingSystem.Data/Binance/BinanceWebSocketClient.cs` — `ResubscribeAsync`, `ReconnectMarketStreamsAsync`, send-lock и id управляющих фреймов.
+- `AITradingSystem.Common/Configuration/TradingConfig.cs` — `MarketDataLiveConfirmSeconds`, `MarketDataMaxResubscribeAttempts`, `MarketDataQuarantineSeconds`, `MarketDataReconnectCooldownSeconds` + валидация диапазонов.
+- `AITradingSystem.Common/Logging/LogChannels.cs` — аудит-события `DATA-*`.
+- `AITradingSystem.Services/Monitoring/MetricsCollector.cs` — счётчики recovery/live/resubscribe/quarantine и mean/max time-to-live.
+- `AITradingSystem.Tests/MarketDataIntegrityTests.cs` — контракты обновлены под «прогрев ≠ live», добавлены тесты окна ожидания, resubscribe, карантина, конфигурации и метрик (не запускались).
 
 **Критерий:** нет бесконечного цикла recovered → stale; символ либо жив, либо явно карантинирован.
+**Осталось для закрытия P0.3:** runtime-проверка на Demo: молчащий символ проходит resubscribe → reconnect → карантин и возвращается только после живого тика; `mean_time_to_live` и `stale_blocks` собираются; отсутствует рост `DATA-REST-RELOAD` без `DATA-LIVE-CONFIRMED`; проверить, что принудительный реконнект не рвёт user-data stream.
 
 ### P0.4. User-data stream и реконсиляция fail-closed
 
 **Проблема:** `410 POST /userDataStream`; дальнейшая работа stream/recon не подтверждена.
+В коде отказ поднятия stream глотался в `catch` с сообщением «остаётся polling», но самого polling-контура не было,
+а входы продолжали разрешаться без какого-либо подтверждения состояния ордеров.
+
+**Статус после локальных правок:** код внесён; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
 
 **Задачи:**
 
-- `[ ]` Явно проверить поддержку user-data stream в Demo/Testnet/Live.
-- `[ ]` Если stream обязателен для режима, при недоступности запретить новые входы.
-- `[ ]` Если разрешён fallback polling, задать интервал и логировать `EXECUTION-MODE=POLLING-FALLBACK`.
-- `[ ]` Реконсиляция должна писать `RECON-START`, `RECON-SUMMARY`, `RECON-FAIL`, `RECON-ADOPT`, `RECON-CANCEL`, `PROTECTION-FILL-APPLIED`.
-- `[ ]` При неизвестном состоянии ордера/позиции — freeze entries, не угадывать.
+- `[~]` Явно проверить поддержку user-data stream в Demo/Testnet/Live.
+  - `ConnectUserDataAsync` логирует `USER-DATA-PROBE env=… supported=… http=… code=…` и при `BinanceApiException`
+    помечает окружение как не поддержавшее listenKey; результат виден в `IsUserDataStreamSupported` / `UserDataStreamProbeCompleted`.
+- `[~]` Если stream обязателен для режима, при недоступности запретить новые входы.
+  - Новый `TradingConfig.UserDataStreamRequiredForEntries` (по умолчанию true).
+  - `ReconciliationService.IsExecutionStateTrusted` + `ExecutionStateBlockReason`; чистая политика `EvaluateExecutionTrust`.
+  - `TradingEngine.ProcessSymbolAsync` гейт `execution-state` до AI и повторный `pre-exec` гейт перед отправкой ордера.
+- `[~]` Если разрешён fallback polling, задать интервал и логировать `EXECUTION-MODE=POLLING-FALLBACK`.
+  - `UserDataPollingFallbackEnabled` (true), `UserDataPollingIntervalSeconds` (20, [5; 300]), `ExecutionStateMaxStalenessSeconds` (90, [15; 900]).
+  - `PollingLoopAsync` вызывает реконсиляцию по таймеру; при восстановлении сокета режим возвращается в `STREAM`.
+  - Режимы: `STREAM | POLLING-FALLBACK | UNAVAILABLE | PAPER | DISABLED | STOPPED`, каждый пишется как `EXECUTION-MODE=…`.
+- `[~]` Реконсиляция должна писать `RECON-START`, `RECON-SUMMARY`, `RECON-FAIL`, `RECON-ADOPT`, `RECON-CANCEL`, `PROTECTION-FILL-APPLIED`.
+  - Добавлены методы `TradeLog.ReconStart/ReconSummary/ReconFail/ReconAdopt/ReconCancel/ProtectionFillApplied`;
+    `RECON-SUMMARY` содержит `unresolved` и `entries_allowed`, вызовы принимают `trigger` (startup/polling-fallback/listenKey-recreated/manual).
+- `[~]` При неизвестном состоянии ордера/позиции — freeze entries, не угадывать.
+  - Счётчик `_unresolvedStateIssues` растёт при RECON-FAIL и при отказе adopt/close/cancel; успешной реконсиляция
+    считается только при `unresolved == 0`, иначе `LastSuccessfulReconcileUtc` не обновляется.
+  - Просроченная сверка блокирует входы даже при формально живом сокете; аккаунт без ни одной успешной сверки не торгует.
+
+**Изменённые файлы P0.4:**
+
+- `AITradingSystem.Services/Trading/ReconciliationService.cs` — probe окружения, режимы исполнения, polling-контур, trust-политика, unresolved-счётчик, журнал `RECON-*`, остановка polling-цикла.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — гейты `execution-state` до AI и перед отправкой ордера.
+- `AITradingSystem.Common/Configuration/TradingConfig.cs` — `UserDataStreamRequiredForEntries`, `UserDataPollingFallbackEnabled`, `UserDataPollingIntervalSeconds`, `ExecutionStateMaxStalenessSeconds` + валидация.
+- `AITradingSystem.Common/Logging/LogChannels.cs` — `USER-DATA-PROBE`, `EXECUTION-MODE`, `RECON-*`, `PROTECTION-FILL-APPLIED`, `EXECUTION-STATE-BLOCKED`.
+- `AITradingSystem.Services/Monitoring/MetricsCollector.cs` — probes/failures, polling reconciles, recon failures, execution-state blocks (+ summary).
+- `AITradingSystem.Tests/ExecutionStateTrustTests.cs` — новый файл: политика доверия (stream down без polling, устаревшая сверка, отсутствие сверки, unresolved, paper/keyless), валидация конфига, метрики (не запускались).
 
 **Критерий:** бот не считает ордер исполненным только потому, что REST-запрос был отправлен.
+**Осталось для закрытия P0.4:** runtime-проверка на Demo: поддерживает ли окружение listenKey (410), реально ли идёт polling-fallback и обновляет `LastSuccessfulReconcileUtc`, блокируются ли входы при `UNAVAILABLE`/протухшей сверке, применяются ли филлы защитных ног из `executionReport` и из REST без повторного MARKET.
 
 ### P0.5. LLM вне последовательного критического пути
 

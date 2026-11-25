@@ -54,6 +54,18 @@ public interface IBinanceWebSocketClient : IAsyncDisposable
     Task ConnectAsync(IEnumerable<string> symbols, string interval, CancellationToken ct = default);
 
     /// <summary>
+    /// P0.3: переподписать стримы конкретных символов (UNSUBSCRIBE + SUBSCRIBE) без разрыва соединения.
+    /// Используется, когда символ молчит после REST-прогрева: history_reloaded ≠ stream_live.
+    /// </summary>
+    Task ResubscribeAsync(IEnumerable<string> symbols, string interval, CancellationToken ct = default);
+
+    /// <summary>
+    /// P0.3: принудительный реконнект только рыночного сокета (user-data socket не затрагивается).
+    /// Вызывает OnDisconnected/OnReconnected, чтобы движок заново прошёл REST-прогрев и подтверждение live.
+    /// </summary>
+    Task ReconnectMarketStreamsAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Отключиться.
     /// </summary>
     Task DisconnectAsync();

@@ -19,7 +19,6 @@ artifacts/
 # Runtime data
 logs/
 data/
-models/
 *.gguf
 *.log
 

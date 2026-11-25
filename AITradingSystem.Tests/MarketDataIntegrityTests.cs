@@ -184,6 +184,11 @@ public class MarketDataIntegrityTests
         var history = ClosedHistory("BTCUSDT", 250);
         Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _));
 
+        // P0.3: REST-прогрев не подтверждает живой стрим.
+        Assert.False(analyzer.IsDataFresh("BTCUSDT", now, TimeSpan.FromSeconds(30), out var awaiting));
+        Assert.Equal("awaiting-live-tick", awaiting);
+
+        analyzer.NoteKline("BTCUSDT", now);
         Assert.False(analyzer.IsDataFresh("BTCUSDT", now, TimeSpan.FromSeconds(30), out var noBook));
         Assert.Equal("no-book", noBook);
 
@@ -209,6 +214,7 @@ public class MarketDataIntegrityTests
         var now = DateTime.UtcNow;
         var history = ClosedHistory("BTCUSDT", 250);
         Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _));
+        analyzer.NoteKline("BTCUSDT", now);
         analyzer.NoteOrderBook("BTCUSDT", now);
         Assert.NotNull(analyzer.GetIndicatorSnapshot("BTCUSDT", history[^1]));
 
@@ -219,6 +225,7 @@ public class MarketDataIntegrityTests
         Assert.Equal("ws-reconnected", reason);
 
         Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _));
+        analyzer.NoteKline("BTCUSDT", now);
         analyzer.NoteOrderBook("BTCUSDT", now);
         Assert.True(analyzer.IsDataFresh("BTCUSDT", now, TimeSpan.FromSeconds(30), out _));
     }
@@ -290,5 +297,137 @@ public class MarketDataIntegrityTests
         Assert.Equal(1, metrics.MarketDataStaleEntryBlocks);
         Assert.Contains("market-data disconnects 1", metrics.GetSummary());
         Assert.Contains("stale-entry blocks 1", metrics.GetSummary());
+    }
+
+    /// <summary>
+    /// P0.3: REST-прогрев — это history_reloaded, а не stream_live. Входы разрешает только живой WS-тик.
+    /// Тесты добавлены, но не запускались (запрет сборок/прогонов в этом проходе).
+    /// </summary>
+    [Fact]
+    public void MarketAnalyzer_RestReload_Does_Not_Fake_Live_Tick()
+    {
+        var analyzer = NewAnalyzer();
+        var now = DateTime.UtcNow;
+        var history = ClosedHistory("BTCUSDT", 250);
+
+        Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _, TimeSpan.FromSeconds(20)));
+        analyzer.NoteOrderBook("BTCUSDT", now);
+
+        Assert.False(analyzer.IsRecoveryRequired("BTCUSDT"));
+        Assert.True(analyzer.IsAwaitingLiveTick("BTCUSDT", out var deadline));
+        Assert.Equal(now + TimeSpan.FromSeconds(20), deadline);
+        Assert.False(analyzer.IsDataFresh("BTCUSDT", now, TimeSpan.FromSeconds(30), out var reason));
+        Assert.Equal("awaiting-live-tick", reason);
+        Assert.False(analyzer.IsLiveTickOverdue("BTCUSDT", now));
+        Assert.True(analyzer.IsLiveTickOverdue("BTCUSDT", now + TimeSpan.FromSeconds(21)));
+
+        analyzer.NoteKline("BTCUSDT", now + TimeSpan.FromSeconds(5));
+        Assert.False(analyzer.IsAwaitingLiveTick("BTCUSDT", out _));
+        Assert.True(analyzer.TryConsumeLiveConfirmation("BTCUSDT", out var ttl));
+        Assert.Equal(5d, ttl, 3);
+        Assert.False(analyzer.TryConsumeLiveConfirmation("BTCUSDT", out _));
+        Assert.True(analyzer.IsDataFresh("BTCUSDT", now + TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(30), out _));
+    }
+
+    [Fact]
+    public void MarketAnalyzer_Resubscribe_Attempts_Extend_Window_And_Reset_On_Live_Tick()
+    {
+        var analyzer = NewAnalyzer();
+        var now = DateTime.UtcNow;
+        var history = ClosedHistory("BTCUSDT", 250);
+        Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _, TimeSpan.FromSeconds(20)));
+
+        var window = TimeSpan.FromSeconds(20);
+        Assert.Equal(1, analyzer.NoteResubscribeAttempt("BTCUSDT", now + TimeSpan.FromSeconds(21), window));
+        Assert.Equal(2, analyzer.NoteResubscribeAttempt("BTCUSDT", now + TimeSpan.FromSeconds(42), window));
+        Assert.True(analyzer.IsLiveTickOverdue("BTCUSDT", now + TimeSpan.FromSeconds(63)));
+
+        analyzer.NoteKline("BTCUSDT", now + TimeSpan.FromSeconds(63));
+        Assert.Equal(0, analyzer.GetResubscribeAttempts("BTCUSDT"));
+        Assert.False(analyzer.IsLiveTickOverdue("BTCUSDT", now + TimeSpan.FromSeconds(100)));
+    }
+
+    [Fact]
+    public void MarketAnalyzer_Quarantine_Blocks_Entries_And_Expires_Into_Recovery()
+    {
+        var analyzer = NewAnalyzer();
+        var now = DateTime.UtcNow;
+        var history = ClosedHistory("BTCUSDT", 250);
+        Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _));
+        analyzer.NoteKline("BTCUSDT", now);
+        analyzer.NoteOrderBook("BTCUSDT", now);
+        Assert.True(analyzer.IsDataFresh("BTCUSDT", now, TimeSpan.FromSeconds(30), out _));
+
+        analyzer.Quarantine("BTCUSDT", "no-live-tick:stale-kline", now, TimeSpan.FromSeconds(300));
+        Assert.True(analyzer.IsQuarantined("BTCUSDT", now + TimeSpan.FromSeconds(10), out var qReason));
+        Assert.Equal("no-live-tick:stale-kline", qReason);
+        Assert.False(analyzer.IsDataFresh("BTCUSDT", now + TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), out var blocked));
+        Assert.StartsWith("quarantined", blocked);
+        Assert.Null(analyzer.GetIndicatorSnapshot("BTCUSDT", history[^1]));
+        Assert.False(analyzer.TryLiftExpiredQuarantine("BTCUSDT", now + TimeSpan.FromSeconds(10)));
+
+        Assert.True(analyzer.TryLiftExpiredQuarantine("BTCUSDT", now + TimeSpan.FromSeconds(301)));
+        Assert.True(analyzer.IsRecoveryRequired("BTCUSDT"));
+        Assert.True(analyzer.TryConsumeQuarantineLift("BTCUSDT", out var lift));
+        Assert.Equal("no-live-tick:stale-kline", lift);
+        Assert.False(analyzer.TryConsumeQuarantineLift("BTCUSDT", out _));
+    }
+
+    [Fact]
+    public void MarketAnalyzer_Live_Tick_Lifts_Quarantine_Early()
+    {
+        var analyzer = NewAnalyzer();
+        var now = DateTime.UtcNow;
+        var history = ClosedHistory("BTCUSDT", 250);
+        Assert.True(analyzer.TryReloadHistory("BTCUSDT", history, Interval, 200, now, out _));
+        analyzer.Quarantine("BTCUSDT", "no-live-tick:stale-kline", now, TimeSpan.FromSeconds(300));
+
+        analyzer.NoteKline("BTCUSDT", now + TimeSpan.FromSeconds(30));
+        Assert.False(analyzer.IsQuarantined("BTCUSDT", now + TimeSpan.FromSeconds(30), out _));
+        Assert.True(analyzer.TryConsumeQuarantineLift("BTCUSDT", out _));
+    }
+
+    [Fact]
+    public void Config_Validates_MarketData_Live_Confirm_Settings()
+    {
+        var config = new TradingConfig { MarketDataLiveConfirmSeconds = 4 };
+        Assert.Throws<InvalidOperationException>(() => config.Validate());
+
+        config = new TradingConfig { MarketDataMaxResubscribeAttempts = 6 };
+        Assert.Throws<InvalidOperationException>(() => config.Validate());
+
+        config = new TradingConfig { MarketDataQuarantineSeconds = 10 };
+        Assert.Throws<InvalidOperationException>(() => config.Validate());
+
+        config = new TradingConfig { MarketDataReconnectCooldownSeconds = 5 };
+        Assert.Throws<InvalidOperationException>(() => config.Validate());
+
+        config = new TradingConfig();
+        config.Validate();
+    }
+
+    [Fact]
+    public void Metrics_Record_Live_Confirm_And_Quarantine_Events()
+    {
+        var metrics = new MetricsCollector();
+        metrics.RecordMarketDataRecoveryAttempt();
+        metrics.RecordMarketDataRecoveryAttempt();
+        metrics.RecordMarketDataLiveConfirmed(4d);
+        metrics.RecordMarketDataLiveConfirmed(8d);
+        metrics.RecordMarketDataResubscribe();
+        metrics.RecordMarketDataReconnectRequest();
+        metrics.RecordMarketDataQuarantine();
+        metrics.RecordMarketDataQuarantineLift();
+
+        Assert.Equal(2, metrics.MarketDataRecoveryAttempts);
+        Assert.Equal(2, metrics.MarketDataLiveConfirmations);
+        Assert.Equal(6d, metrics.MarketDataMeanTimeToLiveSeconds, 3);
+        Assert.Equal(8d, metrics.MarketDataMaxTimeToLiveSeconds, 3);
+        Assert.Equal(1, metrics.MarketDataResubscribes);
+        Assert.Equal(1, metrics.MarketDataReconnectRequests);
+        Assert.Equal(1, metrics.MarketDataQuarantines);
+        Assert.Equal(1, metrics.MarketDataQuarantineLifts);
+        Assert.Contains("live confirmations 2", metrics.GetSummary());
+        Assert.Contains("quarantines 1", metrics.GetSummary());
     }
 }

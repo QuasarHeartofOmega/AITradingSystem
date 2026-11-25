@@ -333,4 +333,100 @@ public static class TradeLog
     {
         Ch.Warning("KILL-SWITCH-RESTORED reason={Reason} close_status={Status}", reason, closeStatus);
     }
+
+    /// <summary>P0.3: аудит здоровья рыночных данных — REST-прогрев и живой стрим пишутся раздельно.</summary>
+    public static void DataStale(string symbol, string reason, double ageSeconds)
+    {
+        Ch.Warning("DATA-STALE {Symbol} reason={Reason} age_s={Age}",
+            symbol, reason, ageSeconds.ToString("F1", CultureInfo.InvariantCulture));
+    }
+
+    public static void DataRestReload(string symbol, int closedCandles, double liveConfirmWindowSeconds)
+    {
+        Ch.Information("DATA-REST-RELOAD {Symbol} closed_candles={Count} live_confirm_window_s={Window} entries_allowed=false",
+            symbol, closedCandles, liveConfirmWindowSeconds.ToString("F0", CultureInfo.InvariantCulture));
+    }
+
+    public static void DataWsResubscribe(string symbol, int attempt, int maxAttempts, string reason)
+    {
+        Ch.Warning("DATA-WS-RESUBSCRIBE {Symbol} attempt={Attempt}/{Max} reason={Reason}",
+            symbol, attempt, maxAttempts, reason);
+    }
+
+    public static void DataWsReconnect(string symbol, string reason)
+    {
+        Ch.Warning("DATA-WS-RECONNECT {Symbol} reason={Reason}", symbol, reason);
+    }
+
+    public static void DataLiveConfirmed(string symbol, double secondsToLive, int resubscribeAttempts)
+    {
+        Ch.Information("DATA-LIVE-CONFIRMED {Symbol} time_to_live_s={Ttl} resubscribes={Attempts} entries_allowed_after_fresh_book=true",
+            symbol, secondsToLive.ToString("F1", CultureInfo.InvariantCulture), resubscribeAttempts);
+    }
+
+    public static void DataQuarantine(string symbol, string reason, double durationSeconds)
+    {
+        Ch.Warning("DATA-QUARANTINE {Symbol} reason={Reason} duration_s={Duration} entries_allowed=false",
+            symbol, reason, durationSeconds.ToString("F0", CultureInfo.InvariantCulture));
+    }
+
+    public static void DataQuarantineLifted(string symbol, string reason)
+    {
+        Ch.Information("DATA-QUARANTINE-LIFTED {Symbol} previous_reason={Reason} entries_allowed=false",
+            symbol, reason);
+    }
+
+    /// <summary>P0.4: поддержка user-data stream в конкретном окружении и режим исполнения.</summary>
+    public static void UserDataProbe(string environment, bool supported, int? httpStatus, int? apiCode, string detail)
+    {
+        Ch.Warning("USER-DATA-PROBE env={Env} supported={Supported} http={Http} code={Code} detail={Detail}",
+            environment, supported, httpStatus?.ToString() ?? "-", apiCode?.ToString() ?? "-", detail);
+    }
+
+    public static void ExecutionMode(string mode, string reason, int pollingIntervalSeconds)
+    {
+        Ch.Warning("EXECUTION-MODE={Mode} reason={Reason} polling_interval_s={Interval}",
+            mode, reason, pollingIntervalSeconds);
+    }
+
+    /// <summary>P0.4: журнал реконсиляции — старт, итог, отказ, подхват, снятие, применённый филл защиты.</summary>
+    public static void ReconStart(string trigger, int positions)
+    {
+        Ch.Information("RECON-START trigger={Trigger} positions={Positions}", trigger, positions);
+    }
+
+    public static void ReconSummary(int positions, int orphanOco, int orphanOrders, int externalOrders,
+        int protectionMissing, int unresolved, bool entriesAllowed)
+    {
+        Ch.Information(
+            "RECON-SUMMARY positions={Positions} orphan_oco={OrphanOco} orphan_orders={OrphanOrders} external_orders={External} protection_missing={Missing} unresolved={Unresolved} entries_allowed={Allowed}",
+            positions, orphanOco, orphanOrders, externalOrders, protectionMissing, unresolved, entriesAllowed);
+    }
+
+    public static void ReconFail(string trigger, string reason)
+    {
+        Ch.Warning("RECON-FAIL trigger={Trigger} reason={Reason} entries_allowed=false", trigger, reason);
+    }
+
+    public static void ReconAdopt(string symbol, decimal quantity, decimal price, string clientOrderId)
+    {
+        Ch.Warning("RECON-ADOPT {Symbol} qty={Qty} price={Price} client_order_id={ClientId}",
+            symbol, quantity, price, clientOrderId);
+    }
+
+    public static void ReconCancel(string symbol, string kind, string identifier)
+    {
+        Ch.Warning("RECON-CANCEL {Symbol} kind={Kind} id={Id}", symbol, kind, identifier);
+    }
+
+    public static void ProtectionFillApplied(string symbol, string reason, decimal cumulativeQuantity, string source)
+    {
+        Ch.Warning("PROTECTION-FILL-APPLIED {Symbol} reason={Reason} cum_qty={CumQty} source={Source}",
+            symbol, reason, cumulativeQuantity, source);
+    }
+
+    public static void ExecutionStateBlocked(string reason)
+    {
+        Ch.Warning("EXECUTION-STATE-BLOCKED reason={Reason} entries_allowed=false", reason);
+    }
 }

@@ -60,6 +60,10 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly ConcurrentDictionary<string, byte> _pendingMarketDataRecovery = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _nextMarketDataRecoveryAttemptUtc = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _marketDataRecoveryLock = new(1, 1);
+    /// <summary>P0.3: причина ухода символа в восстановление и момент начала ожидания живого WS-тика.</summary>
+    private readonly ConcurrentDictionary<string, string> _marketDataRecoveryReason = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _lastMarketDataForcedReconnectUtc = DateTime.MinValue;
+    private TimeSpan MarketDataLiveConfirmWindow => TimeSpan.FromSeconds(_config.Trading.MarketDataLiveConfirmSeconds);
     private readonly TimeSpan _candleInterval;
     private int RequiredClosedCandles => Math.Min(200, _config.Trading.HistoryCandlesCount);
 
@@ -280,12 +284,19 @@ public sealed class TradingEngine : IAsyncDisposable
                     }
 
                     if (_marketAnalyzer.TryReloadHistory(
-                            symbol, history, _candleInterval, RequiredClosedCandles, DateTime.UtcNow, out var reloadReason))
+                            symbol, history, _candleInterval, RequiredClosedCandles, DateTime.UtcNow, out var reloadReason,
+                            MarketDataLiveConfirmWindow))
                     {
                         if (history.Count > 0)
                             RefreshAtrCache(symbol, history[^1]);
 
-                        _logger.LogInformation("История для {Symbol}: REST-прогрев выполнен, индикаторы готовы", symbol);
+                        // P0.3: прогрев ≠ живой стрим. Символ остаётся в контуре подтверждения live.
+                        _marketDataRecoveryReason[symbol] = "startup-rest-reload";
+                        _pendingMarketDataRecovery[symbol] = 0;
+                        _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
+                        _metrics.RecordMarketDataRecovery(success: true);
+                        TradeLog.DataRestReload(symbol, history.Count(k => k.IsClosed), MarketDataLiveConfirmWindow.TotalSeconds);
+                        _logger.LogInformation("История для {Symbol}: REST-прогрев выполнен; входы запрещены до живого WS-тика", symbol);
                     }
                     else
                     {
@@ -638,6 +649,16 @@ public sealed class TradingEngine : IAsyncDisposable
             return;
         }
 
+        // P0.4: неизвестное состояние ордеров/позиций — freeze entries, не угадывать.
+        if (!_reconciliation.IsExecutionStateTrusted)
+        {
+            var blockReason = _reconciliation.ExecutionStateBlockReason;
+            _metrics.RecordExecutionStateBlock();
+            TradeLog.Rejected(symbol, "execution-state",
+                $"состояние исполнения недостоверно ({blockReason}); режим {_reconciliation.ExecutionMode}");
+            return;
+        }
+
         // P0.1: неполная оценка капитала не допускает входы.
         if (_accountSnapshot?.IsValuationComplete != true)
         {
@@ -823,6 +844,15 @@ public sealed class TradingEngine : IAsyncDisposable
         // P1.4: повторная проверка свежести перед отправкой ордера — пока шёл инференс, WS мог оборваться.
         if (!PassesMarketDataFreshness(symbol, "pre-exec"))
             return;
+
+        // P0.4: пока шёл инференс, user-data stream мог упасть, а реконсиляция — не пройти.
+        if (!_reconciliation.IsExecutionStateTrusted)
+        {
+            _metrics.RecordExecutionStateBlock();
+            TradeLog.Rejected(symbol, "execution-state",
+                $"[pre-exec] состояние исполнения недостоверно ({_reconciliation.ExecutionStateBlockReason})");
+            return;
+        }
 
         var currentOrderBook = GetCurrentOrderBook(symbol);
 
@@ -2028,6 +2058,7 @@ public sealed class TradingEngine : IAsyncDisposable
     private void EnqueueMarketDataRecovery(string symbol, string reason, bool immediate = false)
     {
         _marketAnalyzer.MarkRecoveryRequired(symbol, reason);
+        _marketDataRecoveryReason[symbol] = reason;
         _pendingMarketDataRecovery[symbol] = 0;
         _nextMarketDataRecoveryAttemptUtc.AddOrUpdate(
             symbol,
@@ -2036,7 +2067,9 @@ public sealed class TradingEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// P1.4: watchdog протухания + REST-дозагрузка свечей и повторный прогрев.
+    /// P1.4/P0.3: watchdog протухания + REST-дозагрузка свечей и повторный прогрев.
+    /// P0.3: REST-прогрев (history_reloaded) не разрешает входы. После прогрева требуется живой WS-тик
+    /// (stream_live) в окне MarketDataLiveConfirmSeconds; иначе resubscribe → reconnect → карантин.
     /// Сопровождение открытых позиций не блокируется: PositionMonitor и биржевые OCO продолжают работать.
     /// </summary>
     private async Task RecoverMarketDataAsync(CancellationToken ct)
@@ -2044,17 +2077,50 @@ public sealed class TradingEngine : IAsyncDisposable
         var maxAge = TimeSpan.FromSeconds(_config.Trading.MarketDataMaxAgeSeconds);
         var now = DateTime.UtcNow;
 
+        // 0. Карантин истёк — символ возвращается в восстановление (не сразу в торговлю).
         foreach (var symbol in _activeSymbols)
         {
+            if (_marketAnalyzer.TryLiftExpiredQuarantine(symbol, now))
+                EnqueueMarketDataRecovery(symbol, "quarantine-expired", immediate: true);
+
+            if (_marketAnalyzer.TryConsumeQuarantineLift(symbol, out var liftReason))
+            {
+                _metrics.RecordMarketDataQuarantineLift();
+                TradeLog.DataQuarantineLifted(symbol, liftReason);
+            }
+        }
+
+        // 1. Живой WS-тик подтверждён — только теперь символ считается delivering.
+        foreach (var symbol in _activeSymbols)
+        {
+            if (!_marketAnalyzer.TryConsumeLiveConfirmation(symbol, out var secondsToLive))
+                continue;
+
+            _metrics.RecordMarketDataLiveConfirmed(secondsToLive);
+            TradeLog.DataLiveConfirmed(symbol, secondsToLive, _marketAnalyzer.GetResubscribeAttempts(symbol));
+            _pendingMarketDataRecovery.TryRemove(symbol, out _);
+            _nextMarketDataRecoveryAttemptUtc.TryRemove(symbol, out _);
+            _marketDataRecoveryReason.TryRemove(symbol, out _);
+        }
+
+        // 2. Протухание: REST лечит только историю; awaiting-live-tick лечится resubscribe/reconnect.
+        foreach (var symbol in _activeSymbols)
+        {
+            if (_marketAnalyzer.IsQuarantined(symbol, now, out _))
+                continue;
+
             if (_marketAnalyzer.IsDataFresh(symbol, now, maxAge, out var reason))
                 continue;
 
             // no-book сразу после старта/реконнекта сам по себе не лечится REST — ждём WS-стакан.
-            if (reason is "no-book")
+            if (reason is "no-book" or "awaiting-live-tick")
                 continue;
 
             if (reason is "stale-book" or "stale-kline" or "no-kline" or "warmup-incomplete" or "candle-gap" or "recovery-required")
+            {
+                TradeLog.DataStale(symbol, reason, maxAge.TotalSeconds);
                 EnqueueMarketDataRecovery(symbol, reason);
+            }
         }
 
         if (!_wsClient.IsConnected || _pendingMarketDataRecovery.IsEmpty)
@@ -2066,56 +2132,144 @@ public sealed class TradingEngine : IAsyncDisposable
             if (_nextMarketDataRecoveryAttemptUtc.TryGetValue(symbol, out var next) && next > DateTime.UtcNow)
                 continue;
 
-            await _marketDataRecoveryLock.WaitAsync(ct);
-            try
+            if (_marketAnalyzer.IsQuarantined(symbol, DateTime.UtcNow, out _))
             {
-                if (!_pendingMarketDataRecovery.ContainsKey(symbol) || !_wsClient.IsConnected)
-                    continue;
+                ForgetRecovery(symbol);
+                continue;
+            }
 
-                var history = await _restClient.GetKlinesAsync(
-                    symbol, _config.Trading.CandleInterval, _config.Trading.HistoryCandlesCount, ct);
+            // 3. История ещё недостоверна — REST-дозагрузка.
+            if (_marketAnalyzer.IsRecoveryRequired(symbol))
+            {
+                await ReloadHistoryAsync(symbol, ct);
+                continue;
+            }
 
-                if (_marketAnalyzer.TryReloadHistory(
-                        symbol, history, _candleInterval, RequiredClosedCandles, DateTime.UtcNow, out var reason))
+            // 4. История прогрета, но WS молчит — эскалация вместо повторного REST-цикла.
+            if (_marketAnalyzer.IsLiveTickOverdue(symbol, DateTime.UtcNow))
+                await EscalateSilentStreamAsync(symbol, ct);
+        }
+    }
+
+    private void ForgetRecovery(string symbol)
+    {
+        _pendingMarketDataRecovery.TryRemove(symbol, out _);
+        _nextMarketDataRecoveryAttemptUtc.TryRemove(symbol, out _);
+        _marketDataRecoveryReason.TryRemove(symbol, out _);
+    }
+
+    /// <summary>P0.3: REST-прогрев истории. Успех пишет DATA-REST-RELOAD, а не «входы разрешены».</summary>
+    private async Task ReloadHistoryAsync(string symbol, CancellationToken ct)
+    {
+        await _marketDataRecoveryLock.WaitAsync(ct);
+        try
+        {
+            if (!_pendingMarketDataRecovery.ContainsKey(symbol) || !_wsClient.IsConnected)
+                return;
+
+            _metrics.RecordMarketDataRecoveryAttempt();
+            var history = await _restClient.GetKlinesAsync(
+                symbol, _config.Trading.CandleInterval, _config.Trading.HistoryCandlesCount, ct);
+
+            if (_marketAnalyzer.TryReloadHistory(
+                    symbol, history, _candleInterval, RequiredClosedCandles, DateTime.UtcNow, out var reason,
+                    MarketDataLiveConfirmWindow))
+            {
+                if (history.Count > 0)
                 {
-                    if (history.Count > 0)
+                    lock (_candleLock)
                     {
-                        lock (_candleLock)
-                        {
-                            _currentCandles[symbol] = history[^1];
-                        }
-                        RefreshAtrCache(symbol, history[^1]);
+                        _currentCandles[symbol] = history[^1];
                     }
+                    RefreshAtrCache(symbol, history[^1]);
+                }
 
-                    _pendingMarketDataRecovery.TryRemove(symbol, out _);
-                    _nextMarketDataRecoveryAttemptUtc.TryRemove(symbol, out _);
-                    _metrics.RecordMarketDataRecovery(success: true);
-                    TradeLog.Decision(symbol, "DATA-RECOVERED", "REST-история непрерывна, индикаторы повторно прогреты; входы разрешены после свежего стакана");
-                }
-                else
-                {
-                    _metrics.RecordMarketDataRecovery(success: false);
-                    _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
-                    _logger.LogWarning("DATA-RECOVERY-REJECTED {Symbol}: {Reason}; повтор через {Retry} с",
-                        symbol, reason, _config.Trading.MarketDataRecoveryRetrySeconds);
-                }
+                _metrics.RecordMarketDataRecovery(success: true);
+                TradeLog.DataRestReload(symbol, history.Count(k => k.IsClosed), MarketDataLiveConfirmWindow.TotalSeconds);
+                // Символ остаётся в контуре: следующий шаг — подтверждение живого WS-тика.
+                _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
             }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
+            else
             {
                 _metrics.RecordMarketDataRecovery(success: false);
                 _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
-                _logger.LogWarning(ex, "DATA-RECOVERY-FAILED {Symbol}; повтор через {Retry} с",
-                    symbol, _config.Trading.MarketDataRecoveryRetrySeconds);
-            }
-            finally
-            {
-                _marketDataRecoveryLock.Release();
+                _logger.LogWarning("DATA-RECOVERY-REJECTED {Symbol}: {Reason}; повтор через {Retry} с",
+                    symbol, reason, _config.Trading.MarketDataRecoveryRetrySeconds);
             }
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordMarketDataRecovery(success: false);
+            _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
+            _logger.LogWarning(ex, "DATA-RECOVERY-FAILED {Symbol}; повтор через {Retry} с",
+                symbol, _config.Trading.MarketDataRecoveryRetrySeconds);
+        }
+        finally
+        {
+            _marketDataRecoveryLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// P0.3: молчащий стрим — resubscribe symbol/stream, затем полный реконнект, затем карантин.
+    /// Бесконечный цикл recovered → stale здесь невозможен: попытки конечны и завершаются явным карантином.
+    /// </summary>
+    private async Task EscalateSilentStreamAsync(string symbol, CancellationToken ct)
+    {
+        var cfg = _config.Trading;
+        var reason = _marketDataRecoveryReason.TryGetValue(symbol, out var r) ? r : "silent-stream";
+        var attempts = _marketAnalyzer.GetResubscribeAttempts(symbol);
+
+        if (attempts < cfg.MarketDataMaxResubscribeAttempts)
+        {
+            try
+            {
+                await _wsClient.ResubscribeAsync(new[] { symbol }, cfg.CandleInterval, ct);
+                var attempt = _marketAnalyzer.NoteResubscribeAttempt(symbol, DateTime.UtcNow, MarketDataLiveConfirmWindow);
+                _metrics.RecordMarketDataResubscribe();
+                TradeLog.DataWsResubscribe(symbol, attempt, cfg.MarketDataMaxResubscribeAttempts, reason);
+                _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _marketAnalyzer.NoteResubscribeAttempt(symbol, DateTime.UtcNow, MarketDataLiveConfirmWindow);
+                _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
+                _logger.LogWarning(ex, "DATA-WS-RESUBSCRIBE-FAILED {Symbol}", symbol);
+            }
+            return;
+        }
+
+        var cooldown = TimeSpan.FromSeconds(cfg.MarketDataReconnectCooldownSeconds);
+        if (DateTime.UtcNow - _lastMarketDataForcedReconnectUtc >= cooldown)
+        {
+            _lastMarketDataForcedReconnectUtc = DateTime.UtcNow;
+            try
+            {
+                TradeLog.DataWsReconnect(symbol, reason);
+                _metrics.RecordMarketDataReconnectRequest();
+                await _wsClient.ReconnectMarketStreamsAsync(ct);
+                // Обработчики OnDisconnected/OnReconnected заново отправят все символы на REST-прогрев.
+                _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
+                return;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "DATA-WS-RECONNECT-FAILED {Symbol}", symbol);
+            }
+        }
+
+        // Реконнект уже был недавно или не удался — символ карантинирован, цикл по нему остановлен.
+        var quarantine = TimeSpan.FromSeconds(cfg.MarketDataQuarantineSeconds);
+        _marketAnalyzer.Quarantine(symbol, $"no-live-tick:{reason}", DateTime.UtcNow, quarantine);
+        _metrics.RecordMarketDataQuarantine();
+        TradeLog.DataQuarantine(symbol, $"no-live-tick:{reason}", quarantine.TotalSeconds);
+        ForgetRecovery(symbol);
     }
 
     /// <summary>P1.4: fail-closed гейт свежести рыночных данных перед входом.</summary>
@@ -2136,7 +2290,9 @@ public sealed class TradingEngine : IAsyncDisposable
         _metrics.RecordMarketDataStaleEntryBlock();
         TradeLog.Rejected(symbol, "market-data", $"[{stage}] данные непригодны: {reason}; вход заблокирован");
 
-        if (reason is not "no-book" and not "stale-book")
+        // P0.3: карантин не лечится новым REST-прогревом; awaiting-live-tick обслуживает эскалация.
+        if (reason is not "no-book" and not "stale-book" and not "awaiting-live-tick"
+            && !reason.StartsWith("quarantined", StringComparison.Ordinal))
             EnqueueMarketDataRecovery(symbol, reason);
 
         return false;

@@ -216,6 +216,25 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
     public void RecordOrphanOrderCanceled() { lock (_lock) OrphanOrdersCanceled++; }
     public void RecordListenKeyRecreation() { lock (_lock) ListenKeyRecreations++; }
 
+    /// <summary>P0.4: поддержка user-data stream, polling-fallback и fail-closed по неизвестному состоянию исполнения.</summary>
+    public long UserDataStreamProbes { get; private set; }
+    public long UserDataStreamProbeFailures { get; private set; }
+    public long PollingFallbackReconciles { get; private set; }
+    public long ExecutionStateBlocks { get; private set; }
+    public long ReconciliationFailures { get; private set; }
+
+    public void RecordUserDataStreamProbe(bool supported)
+    {
+        lock (_lock)
+        {
+            UserDataStreamProbes++;
+            if (!supported) UserDataStreamProbeFailures++;
+        }
+    }
+    public void RecordPollingFallbackReconcile() { lock (_lock) PollingFallbackReconciles++; }
+    public void RecordExecutionStateBlock() { lock (_lock) ExecutionStateBlocks++; }
+    public void RecordReconciliationFailure() { lock (_lock) ReconciliationFailures++; }
+
     /// <summary>P1.5: отказы входа по фильтру ликвидности — всего и по причинам.</summary>
     public long LiquidityRejections { get; private set; }
     public long LiquiditySpreadRejections { get; private set; }
@@ -289,6 +308,34 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
         }
     }
     public void RecordMarketDataStaleEntryBlock() { lock (_lock) MarketDataStaleEntryBlocks++; }
+
+    /// <summary>P0.3: recovery_attempts / recovery_success / mean_time_to_live / resubscribe / quarantine.</summary>
+    public long MarketDataRecoveryAttempts { get; private set; }
+    public long MarketDataLiveConfirmations { get; private set; }
+    public double MarketDataMeanTimeToLiveSeconds { get; private set; }
+    public double MarketDataMaxTimeToLiveSeconds { get; private set; }
+    public long MarketDataResubscribes { get; private set; }
+    public long MarketDataReconnectRequests { get; private set; }
+    public long MarketDataQuarantines { get; private set; }
+    public long MarketDataQuarantineLifts { get; private set; }
+
+    public void RecordMarketDataRecoveryAttempt() { lock (_lock) MarketDataRecoveryAttempts++; }
+
+    public void RecordMarketDataLiveConfirmed(double secondsToLive)
+    {
+        lock (_lock)
+        {
+            MarketDataLiveConfirmations++;
+            if (secondsToLive < 0) secondsToLive = 0;
+            MarketDataMeanTimeToLiveSeconds += (secondsToLive - MarketDataMeanTimeToLiveSeconds) / MarketDataLiveConfirmations;
+            if (secondsToLive > MarketDataMaxTimeToLiveSeconds) MarketDataMaxTimeToLiveSeconds = secondsToLive;
+        }
+    }
+
+    public void RecordMarketDataResubscribe() { lock (_lock) MarketDataResubscribes++; }
+    public void RecordMarketDataReconnectRequest() { lock (_lock) MarketDataReconnectRequests++; }
+    public void RecordMarketDataQuarantine() { lock (_lock) MarketDataQuarantines++; }
+    public void RecordMarketDataQuarantineLift() { lock (_lock) MarketDataQuarantineLifts++; }
 
     /// <summary>P2.4: подбор порога MinConfidence по expectancy после издержек.</summary>
     public long ConfidenceTuneRuns { get; private set; }
@@ -535,6 +582,8 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
                $"exec reports {ExecutionReportsReceived}, recon issues {ReconciliationIssues}, fills applied {ReconciliationFillsApplied}, " +
                $"orphans adopted {OrphanPositionsAdopted}, orphan orders canceled {OrphanOrdersCanceled}, listenKey recreations {ListenKeyRecreations}, " +
                $"kill-switch {KillSwitchActivations}, " +
+               $"user-data probes {UserDataStreamProbes} (failures {UserDataStreamProbeFailures}), polling reconciles {PollingFallbackReconciles}, " +
+               $"recon failures {ReconciliationFailures}, execution-state blocks {ExecutionStateBlocks}, " +
                $"clock drift checks {ClockDriftChecks}, last {LastClockDriftMs?.ToString() ?? "n/a"} ms, " +
                $"max |drift| {MaxAbsClockDriftMs} ms, failures {ClockDriftFailures}, alerts {ClockDriftAlerts}, " +
                $"liquidity rejections {LiquidityRejections} (spread {LiquiditySpreadRejections}, depth {LiquidityDepthRejections}, " +
@@ -543,7 +592,10 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
                $"dust closes {DustMarketCloses} (failures {DustCloseFailures}), " +
                $"protection tails {ProtectionTails} (qty {ProtectionTailQuantity}), " +
                $"market-data disconnects {MarketDataDisconnects}, reconnects {MarketDataReconnects}, gaps {MarketDataGaps}, " +
-               $"recoveries {MarketDataRecoveries} (failures {MarketDataRecoveryFailures}), stale-entry blocks {MarketDataStaleEntryBlocks}, " +
+               $"recoveries {MarketDataRecoveries} (attempts {MarketDataRecoveryAttempts}, failures {MarketDataRecoveryFailures}), stale-entry blocks {MarketDataStaleEntryBlocks}, " +
+               $"live confirmations {MarketDataLiveConfirmations} (mean ttl {MarketDataMeanTimeToLiveSeconds:F1}s, max {MarketDataMaxTimeToLiveSeconds:F1}s), " +
+               $"resubscribes {MarketDataResubscribes}, reconnect requests {MarketDataReconnectRequests}, " +
+               $"quarantines {MarketDataQuarantines} (lifts {MarketDataQuarantineLifts}), " +
                $"REST weight {RestUsedWeight}/{RestWeightLimit} (max {RestMaxUsedWeight}), " +
                $"rate limits 429={RateLimit429Hits} -1003={RateLimit1003Hits} 418={IpBan418Hits}, " +
                $"weight throttles {WeightThrottleWaits} (max {MaxWeightThrottleWaitMs:F0} ms, total {TotalWeightThrottleWaitMs:F0} ms), " +

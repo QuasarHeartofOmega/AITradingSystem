@@ -8,6 +8,8 @@ namespace AITradingSystem.Services.Analysis;
 /// <summary>
 /// Анализатор рынка — агрегирует индикаторы и рыночные данные.
 /// P1.4: хранит посимвольную целостность/свежесть данных и выполняет атомарный повторный прогрев из REST-истории.
+/// P0.3: history_reloaded (REST) отделён от stream_live (WS): прогрев не разрешает входы, пока не пришёл живой тик;
+/// молчащий символ проходит resubscribe → reconnect → карантин вместо бесконечного цикла recovered → stale.
 /// Потокобезопасен: WebSocket-поток, основной цикл и контур восстановления работают с одним состоянием символа.
 /// </summary>
 public sealed class MarketAnalyzer
@@ -23,6 +25,19 @@ public sealed class MarketAnalyzer
         public DateTime LastOrderBookUtc;
         public bool RecoveryRequired;
         public string? RecoveryReason;
+
+        // P0.3: history_reloaded (REST) и stream_live (WS) — разные факты.
+        public DateTime LastRestReloadUtc;
+        public bool LiveTickPending;
+        public DateTime LiveWaitStartedUtc;
+        public DateTime LiveTickDeadlineUtc;
+        public bool LiveConfirmationUnreported;
+        public double LastTimeToLiveSeconds;
+        public int ResubscribeAttempts;
+        public DateTime QuarantinedUntilUtc;
+        public string? QuarantineReason;
+        public bool QuarantineLiftUnreported;
+        public string? QuarantineLiftReason;
 
         public SymbolState(string symbol)
         {
@@ -53,7 +68,157 @@ public sealed class MarketAnalyzer
         var state = GetState(symbol);
         lock (state.Gate)
         {
-            state.LastKlineUtc = receivedAtUtc;
+            NoteLiveTickLocked(state, receivedAtUtc);
+        }
+    }
+
+    /// <summary>
+    /// P0.3: единственный источник факта «стрим жив» — реальный WS-тик.
+    /// REST-прогрев этот метод не вызывает, поэтому не может сам себе подтвердить live.
+    /// </summary>
+    private void NoteLiveTickLocked(SymbolState state, DateTime receivedAtUtc)
+    {
+        state.LastKlineUtc = receivedAtUtc;
+
+        if (state.LiveTickPending)
+        {
+            state.LiveTickPending = false;
+            state.LiveConfirmationUnreported = true;
+            state.LastTimeToLiveSeconds = Math.Max(0d, (receivedAtUtc - state.LiveWaitStartedUtc).TotalSeconds);
+            state.ResubscribeAttempts = 0;
+        }
+
+        if (state.QuarantinedUntilUtc != default)
+        {
+            state.QuarantinedUntilUtc = default;
+            state.QuarantineLiftUnreported = true;
+            state.QuarantineLiftReason = state.QuarantineReason ?? "live-tick";
+            state.QuarantineReason = null;
+        }
+    }
+
+    /// <summary>P0.3: забрать однократное подтверждение живого WS-тика после REST-прогрева (для журнала/метрик).</summary>
+    public bool TryConsumeLiveConfirmation(string symbol, out double secondsToLive)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            secondsToLive = state.LastTimeToLiveSeconds;
+            if (!state.LiveConfirmationUnreported)
+                return false;
+            state.LiveConfirmationUnreported = false;
+            return true;
+        }
+    }
+
+    /// <summary>P0.3: жив ли стрим по символу — ожидается ли ещё первый WS-тик после REST-прогрева.</summary>
+    public bool IsAwaitingLiveTick(string symbol, out DateTime deadlineUtc)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            deadlineUtc = state.LiveTickDeadlineUtc;
+            return state.LiveTickPending;
+        }
+    }
+
+    /// <summary>P0.3: окно ожидания живого тика истекло — пора resubscribe/reconnect/quarantine.</summary>
+    public bool IsLiveTickOverdue(string symbol, DateTime nowUtc)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            return state.LiveTickPending && state.LiveTickDeadlineUtc != default && nowUtc > state.LiveTickDeadlineUtc;
+        }
+    }
+
+    /// <summary>P0.3: зарегистрировать попытку resubscribe и продлить окно ожидания живого тика.</summary>
+    public int NoteResubscribeAttempt(string symbol, DateTime nowUtc, TimeSpan liveConfirmWindow)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            state.ResubscribeAttempts++;
+            state.LiveTickPending = true;
+            if (state.LiveWaitStartedUtc == default)
+                state.LiveWaitStartedUtc = nowUtc;
+            state.LiveTickDeadlineUtc = nowUtc + liveConfirmWindow;
+            return state.ResubscribeAttempts;
+        }
+    }
+
+    public int GetResubscribeAttempts(string symbol)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            return state.ResubscribeAttempts;
+        }
+    }
+
+    /// <summary>P0.3: явный карантин символа — входы запрещены, цикл recovery больше не крутится по нему.</summary>
+    public void Quarantine(string symbol, string reason, DateTime nowUtc, TimeSpan duration)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            state.QuarantinedUntilUtc = nowUtc + duration;
+            state.QuarantineReason = reason;
+            state.LiveTickPending = false;
+            state.LiveConfirmationUnreported = false;
+            state.ResubscribeAttempts = 0;
+            _logger.LogWarning(
+                "DATA-QUARANTINE {Symbol}: {Reason}; входы запрещены до {Until:O}",
+                symbol, reason, state.QuarantinedUntilUtc);
+        }
+    }
+
+    public bool IsQuarantined(string symbol, DateTime nowUtc, out string reason)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            if (state.QuarantinedUntilUtc != default && nowUtc < state.QuarantinedUntilUtc)
+            {
+                reason = state.QuarantineReason ?? "quarantine";
+                return true;
+            }
+            reason = string.Empty;
+            return false;
+        }
+    }
+
+    /// <summary>P0.3: карантин истёк — символ возвращается в контур восстановления, но не сразу в торговлю.</summary>
+    public bool TryLiftExpiredQuarantine(string symbol, DateTime nowUtc)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            if (state.QuarantinedUntilUtc == default || nowUtc < state.QuarantinedUntilUtc)
+                return false;
+
+            state.QuarantineLiftUnreported = true;
+            state.QuarantineLiftReason = state.QuarantineReason ?? "quarantine";
+            state.QuarantinedUntilUtc = default;
+            state.QuarantineReason = null;
+            state.RecoveryRequired = true;
+            state.RecoveryReason = "quarantine-expired";
+            return true;
+        }
+    }
+
+    /// <summary>P0.3: забрать однократное событие снятия карантина для журнала.</summary>
+    public bool TryConsumeQuarantineLift(string symbol, out string reason)
+    {
+        var state = GetState(symbol);
+        lock (state.Gate)
+        {
+            reason = state.QuarantineLiftReason ?? string.Empty;
+            if (!state.QuarantineLiftUnreported)
+                return false;
+            state.QuarantineLiftUnreported = false;
+            state.QuarantineLiftReason = null;
+            return true;
         }
     }
 
@@ -76,7 +241,7 @@ public sealed class MarketAnalyzer
         var state = GetState(symbol);
         lock (state.Gate)
         {
-            state.LastKlineUtc = receivedAtUtc;
+            NoteLiveTickLocked(state, receivedAtUtc);
 
             if (!candle.IsClosed)
                 return CandleAppendResult.Accepted;
@@ -106,6 +271,9 @@ public sealed class MarketAnalyzer
         {
             state.RecoveryRequired = true;
             state.RecoveryReason = reason;
+            // P0.3: история снова недостоверна — сначала REST, потом ожидание живого WS-тика.
+            state.LiveTickPending = false;
+            state.LiveTickDeadlineUtc = default;
         }
     }
 
@@ -128,7 +296,8 @@ public sealed class MarketAnalyzer
         TimeSpan interval,
         int requiredClosedCandles,
         DateTime nowUtc,
-        out string reason)
+        out string reason,
+        TimeSpan liveConfirmWindow = default)
     {
         var state = GetState(symbol);
         lock (state.Gate)
@@ -199,13 +368,20 @@ public sealed class MarketAnalyzer
             foreach (var candle in closed)
                 state.Calculator.Update(candle);
 
-            state.LastKlineUtc = nowUtc;
+            // P0.3: REST-прогрев — это history_reloaded, а НЕ stream_live.
+            // LastKlineUtc намеренно не обновляется: свежесть подтверждает только WS-тик.
+            var window = liveConfirmWindow > TimeSpan.Zero ? liveConfirmWindow : TimeSpan.FromSeconds(20);
+            state.LastRestReloadUtc = nowUtc;
             state.RecoveryRequired = false;
             state.RecoveryReason = null;
+            state.LiveTickPending = true;
+            state.LiveWaitStartedUtc = nowUtc;
+            state.LiveTickDeadlineUtc = nowUtc + window;
+            state.LiveConfirmationUnreported = false;
 
             _logger.LogInformation(
-                "DATA-RECOVERED {Symbol}: REST-история непрерывна, закрытых свечей {Count}, индикаторы повторно прогреты",
-                symbol, closed.Count);
+                "DATA-REST-RELOAD {Symbol}: REST-история непрерывна, закрытых свечей {Count}, индикаторы повторно прогреты; ожидается живой WS-тик до {Deadline:O}",
+                symbol, closed.Count, state.LiveTickDeadlineUtc);
             return true;
         }
     }
@@ -219,9 +395,22 @@ public sealed class MarketAnalyzer
         var state = GetState(symbol);
         lock (state.Gate)
         {
+            if (state.QuarantinedUntilUtc != default && nowUtc < state.QuarantinedUntilUtc)
+            {
+                reason = "quarantined:" + (state.QuarantineReason ?? "unknown");
+                return false;
+            }
+
             if (state.RecoveryRequired)
             {
                 reason = state.RecoveryReason ?? "recovery-required";
+                return false;
+            }
+
+            // P0.3: REST-история есть, но живой WS-тик по символу ещё не подтверждён.
+            if (state.LiveTickPending)
+            {
+                reason = "awaiting-live-tick";
                 return false;
             }
 
@@ -302,6 +491,9 @@ public sealed class MarketAnalyzer
         lock (state.Gate)
         {
             if (state.RecoveryRequired || !state.Calculator.AllReady)
+                return null;
+
+            if (state.QuarantinedUntilUtc != default && DateTime.UtcNow < state.QuarantinedUntilUtc)
                 return null;
 
             var snapshot = state.Calculator.GetNormalizedSnapshot(currentCandle);
