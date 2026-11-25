@@ -83,8 +83,8 @@ dotnet build AITradingSystem.sln --configuration Release -p:LlamaGpuBackends=non
 
 ## Runtime-аудит предоставленных логов
 
-Дата анализа: **2026-11-26**. Логи: `trading/trades/ai/exchange/news-20261125.txt`.  
-`exchange.txt` обрезан; HTTP-тела аккаунта также обрезаны логгером. Поэтому ниже разделены **наблюдаемые факты** и **то, что нельзя подтвердить**.
+Дата анализа: **2026-11-26**.  
+Ниже разделены **наблюдаемые факты** и **то, что нельзя подтвердить**.
 
 ### Длительность и охват
 
@@ -204,9 +204,7 @@ BUY по символам: `BTTCUSDT` 11, `BTCUSDT` 4, `DASHUSDT` 4, `ETHUSDT` 1
 - fill probability, slippage, adverse selection;
 - статистическое преимущество стратегии.
 
-Подробный план исправлений: [PLAN-PROFIT-ENGINE.md](PLAN-PROFIT-ENGINE.md).  
-Отдельная оценка для разработчика: [DEVELOPER-ASSESSMENT.md](DEVELOPER-ASSESSMENT.md).  
-Исторический план сохранён без перезаписи: [docs/history/PLAN-PROFIT-ENGINE.md](docs/history/PLAN-PROFIT-ENGINE.md).
+Подробный план исправлений: [PLAN-PROFIT-ENGINE.md](docs/history/PLAN-PROFIT-ENGINE.md).  
 
 ## Структура репозитория
 
@@ -228,7 +226,6 @@ docs/                        настройка и исторические пл
 - [Настройка Windows](docs/SETUP-WINDOWS.md)
 - [Индекс документации](docs/README.md)
 - [Активный план прибыльного движка](PLAN-PROFIT-ENGINE.md)
-- [Оценка работоспособности для разработчика](DEVELOPER-ASSESSMENT.md)
 - Исторические планы и журналы лежат в [docs/history/](docs/history/). Они сохранены как контекст разработки и не являются подтверждением текущего состояния сборки или торговой готовности.
 
 ## Статус проверки
