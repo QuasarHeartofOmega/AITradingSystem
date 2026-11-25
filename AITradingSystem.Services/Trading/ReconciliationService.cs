@@ -147,9 +147,10 @@ public sealed class ReconciliationService : IAsyncDisposable
         int OrphanOrders,
         int ExternalOrders,
         int ProtectionMissing,
-        IReadOnlyList<string> Findings)
+        IReadOnlyList<string> Findings,
+        int ActiveEntries = 0, int SkippedActiveEntryCancels = 0, int UnresolvedEntries = 0)
     {
-        public int TotalIssues => OrphanOcoLists + OrphanOrders + ProtectionMissing;
+        public int TotalIssues => OrphanOcoLists + OrphanOrders + ProtectionMissing + UnresolvedEntries;
     }
 
     public ReconciliationService(
@@ -340,14 +341,15 @@ public sealed class ReconciliationService : IAsyncDisposable
             var openOrders = await _rest.GetOpenOrdersAsync(ct: ct);
             var openLists = await _rest.GetOpenOrderListsAsync(ct: ct);
 
-            var report = Classify(positionsSnapshot, openOrders, openLists);
+            var activeEntries = _executionQueue.ActiveEntries.Snapshot();
+            var report = Classify(positionsSnapshot, openOrders, openLists, activeEntries);
             LastReport = report;
             _metrics.RecordReconciliation(report.TotalIssues);
 
             foreach (var finding in report.Findings)
                 _logger.LogWarning("RECON: {Finding}", finding);
 
-            await RemediateAsync(positionsSnapshot, openOrders, openLists, ct);
+            await RemediateAsync(positionsSnapshot, openOrders, openLists, ct, activeEntries);
 
             // P0.4: успех фиксируется только если не осталось неразрешённых состояний.
             var unresolved = Volatile.Read(ref _unresolvedStateIssues);
@@ -357,7 +359,8 @@ public sealed class ReconciliationService : IAsyncDisposable
                 TradeLog.ExecutionStateBlocked($"unknown-order-or-position-state:{unresolved}");
 
             TradeLog.ReconSummary(report.PositionsChecked, report.OrphanOcoLists, report.OrphanOrders,
-                report.ExternalOrders, report.ProtectionMissing, unresolved, IsExecutionStateTrusted);
+                report.ExternalOrders, report.ProtectionMissing, unresolved, IsExecutionStateTrusted,
+                report.ActiveEntries, report.SkippedActiveEntryCancels);
 
             _logger.LogInformation(
                 "RECON-SUMMARY: позиций {Positions}, сиротских OCO {OrphanOco}, сиротских ордеров {OrphanOrders}, " +
@@ -387,7 +390,9 @@ public sealed class ReconciliationService : IAsyncDisposable
     public static ReconciliationReport Classify(
         IReadOnlyList<Position> positions,
         IReadOnlyList<Order> openOrders,
-        IReadOnlyList<ProtectiveOrderList> openLists)
+        IReadOnlyList<ProtectiveOrderList> openLists,
+        IReadOnlyList<ActiveEntryIntent>? activeEntries = null,
+        DateTime? nowUtc = null)
     {
         var findings = new List<string>();
         var knownListIds = new HashSet<long>();
@@ -418,6 +423,11 @@ public sealed class ReconciliationService : IAsyncDisposable
 
         var orphanOrders = 0;
         var externalOrders = 0;
+        var activeCount = 0;
+        var skipped = 0;
+        var unresolvedEntries = 0;
+        var entries = activeEntries ?? Array.Empty<ActiveEntryIntent>();
+        var now = nowUtc ?? DateTime.UtcNow;
         foreach (var order in openOrders)
         {
             if (knownOrderIds.Contains(order.BinanceOrderId) || knownClientIds.Contains(order.ClientOrderId))
@@ -425,6 +435,26 @@ public sealed class ReconciliationService : IAsyncDisposable
 
             if (IsBotOrder(order.ClientOrderId))
             {
+                if (EntryPrefixes.Any(p => order.ClientOrderId.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                {
+                    var entry = entries.FirstOrDefault(x => x.ClientOrderId.Equals(order.ClientOrderId, StringComparison.OrdinalIgnoreCase)
+                        && x.Symbol.Equals(order.Symbol, StringComparison.OrdinalIgnoreCase));
+                    var action = ActiveEntryRegistry.Evaluate(entry, order, now);
+                    if (action == EntryReconciliationAction.SkipActive)
+                    {
+                        activeCount++; skipped++;
+                        findings.Add($"ACTIVE-ENTRY: {order.ClientOrderId} ({order.Symbol}) owner={entry!.OwnerId} remaining_s={Math.Max(0, (entry.DeadlineUtc-now).TotalSeconds):F1} filled={order.ExecutedQuantity} protection_required={order.ExecutedQuantity > 0}");
+                        continue;
+                    }
+                    if (action == EntryReconciliationAction.IgnoreTerminal) continue;
+                    if (action == EntryReconciliationAction.ResolveUnresolved)
+                    {
+                        unresolvedEntries++;
+                        findings.Add($"UNRESOLVED-ENTRY: {order.ClientOrderId} ({order.Symbol}) submission/ownership state is uncertain");
+                        continue;
+                    }
+                    findings.Add($"ENTRY-{action}: {order.ClientOrderId} ({order.Symbol})");
+                }
                 orphanOrders++;
                 findings.Add($"ORPHAN-ORDER: ордер бота {order.ClientOrderId} ({order.Symbol}) открыт без позиции/защиты в снапшоте");
             }
@@ -446,7 +476,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         }
 
         return new ReconciliationReport(DateTime.UtcNow, positions.Count,
-            orphanOco, orphanOrders, externalOrders, protectionMissing, findings);
+            orphanOco, orphanOrders, externalOrders, protectionMissing, findings, activeCount, skipped, unresolvedEntries);
     }
 
     private static bool IsBotOrder(string clientOrderId) =>
@@ -457,7 +487,8 @@ public sealed class ReconciliationService : IAsyncDisposable
         IReadOnlyList<Position> positions,
         IReadOnlyList<Order> openOrders,
         IReadOnlyList<ProtectiveOrderList> openLists,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<ActiveEntryIntent> activeEntries)
     {
         if (_applyExchangeFill is null || _adoptOrphanPosition is null)
         {
@@ -516,6 +547,9 @@ public sealed class ReconciliationService : IAsyncDisposable
 
             if (intent.Operation is nameof(ExecutionPriority.Entry))
             {
+                // Current-process lifecycle owns this intent, including its partial fill.
+                if (activeEntries.Any(x => x.ClientOrderId.Equals(intent.ClientOrderId, StringComparison.OrdinalIgnoreCase)
+                    && !x.IsTerminal && !x.LifecycleCompleted)) continue;
                 if (!_config.ReconciliationAdoptOrphanPositions) continue;
                 if (_positions.GetPositionBySymbol(intent.Symbol) != null) continue;
                 try
@@ -584,11 +618,32 @@ public sealed class ReconciliationService : IAsyncDisposable
             {
                 if (knownOrderIds.Contains(order.BinanceOrderId) || knownClientIds.Contains(order.ClientOrderId)) continue;
                 if (!IsBotOrder(order.ClientOrderId)) continue;
+                var isEntry = EntryPrefixes.Any(p => order.ClientOrderId.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+                var entryAction = EntryReconciliationAction.CancelOrphan;
+                ActiveEntryIntent? entry = null;
+                if (isEntry)
+                {
+                    entry = activeEntries.FirstOrDefault(x => x.ClientOrderId.Equals(order.ClientOrderId, StringComparison.OrdinalIgnoreCase)
+                        && x.Symbol.Equals(order.Symbol, StringComparison.OrdinalIgnoreCase));
+                    entryAction = ActiveEntryRegistry.Evaluate(entry, order, DateTime.UtcNow);
+                    if (entryAction == EntryReconciliationAction.SkipActive)
+                    {
+                        _metrics.RecordActiveEntrySkip();
+                        TradeLog.ReconSkipActiveEntry(order.Symbol, order.ClientOrderId, entry!.OwnerId,
+                            (entry.DeadlineUtc-DateTime.UtcNow).TotalSeconds, order.ExecutedQuantity);
+                        continue;
+                    }
+                    if (entryAction is EntryReconciliationAction.IgnoreTerminal or EntryReconciliationAction.ResolveUnresolved)
+                    {
+                        if (entryAction == EntryReconciliationAction.ResolveUnresolved) Interlocked.Increment(ref _unresolvedStateIssues);
+                        continue;
+                    }
+                }
 
                 // Сиротский entry с исполненным объёмом уже подхвачен выше из журнала;
                 // если позиции всё ещё нет — подхватываем прямо из открытого ордера.
                 if (_config.ReconciliationAdoptOrphanPositions &&
-                    EntryPrefixes.Any(p => order.ClientOrderId.StartsWith(p, StringComparison.OrdinalIgnoreCase)) &&
+                    isEntry && entryAction == EntryReconciliationAction.CancelOrphan &&
                     order.ExecutedQuantity > 0 &&
                     _positions.GetPositionBySymbol(order.Symbol) is null)
                 {
@@ -618,8 +673,17 @@ public sealed class ReconciliationService : IAsyncDisposable
                             await _rest.CancelOrderAsync(order.Symbol, order.BinanceOrderId, token);
                             return null;
                         }, ct);
-                    _metrics.RecordOrphanOrderCanceled();
-                    TradeLog.ReconCancel(order.Symbol, "order", order.ClientOrderId);
+                    if (entryAction == EntryReconciliationAction.CancelExpired)
+                    {
+                        _executionQueue.ActiveEntries.Complete(order.ClientOrderId);
+                        _metrics.RecordEntryDeadlineCancel();
+                        TradeLog.ReconExpireEntry(order.Symbol, order.ClientOrderId, order.ExecutedQuantity);
+                    }
+                    else
+                    {
+                        _metrics.RecordOrphanOrderCanceled();
+                        TradeLog.ReconCancel(order.Symbol, "order", order.ClientOrderId, "owner-lost-or-untracked-entry");
+                    }
                     _logger.LogWarning("RECON-CANCEL: снят сиротский ордер бота {Symbol} {ClientId}", order.Symbol, order.ClientOrderId);
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }

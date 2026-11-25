@@ -438,11 +438,11 @@ public static class TradeLog
     }
 
     public static void ReconSummary(int positions, int orphanOco, int orphanOrders, int externalOrders,
-        int protectionMissing, int unresolved, bool entriesAllowed)
+        int protectionMissing, int unresolved, bool entriesAllowed, int activeEntries = 0, int skippedActiveEntryCancels = 0)
     {
         Ch.Information(
-            "RECON-SUMMARY positions={Positions} orphan_oco={OrphanOco} orphan_orders={OrphanOrders} external_orders={External} protection_missing={Missing} unresolved={Unresolved} entries_allowed={Allowed}",
-            positions, orphanOco, orphanOrders, externalOrders, protectionMissing, unresolved, entriesAllowed);
+            "RECON-SUMMARY positions={Positions} orphan_oco={OrphanOco} orphan_orders={OrphanOrders} external_orders={External} protection_missing={Missing} unresolved={Unresolved} entries_allowed={Allowed} active_entries={ActiveEntries} skipped_active_entry_cancels={Skipped}",
+            positions, orphanOco, orphanOrders, externalOrders, protectionMissing, unresolved, entriesAllowed, activeEntries, skippedActiveEntryCancels);
     }
 
     public static void ReconFail(string trigger, string reason)
@@ -456,9 +456,18 @@ public static class TradeLog
             symbol, quantity, price, clientOrderId);
     }
 
-    public static void ReconCancel(string symbol, string kind, string identifier)
+    public static void ReconCancel(string symbol, string kind, string identifier, string reason = "orphan")
     {
-        Ch.Warning("RECON-CANCEL {Symbol} kind={Kind} id={Id}", symbol, kind, identifier);
+        Ch.Warning("RECON-CANCEL {Symbol} kind={Kind} id={Id} reason={Reason}", symbol, kind, identifier, reason);
+    }
+
+    public static void ReconSkipActiveEntry(string symbol, string id, Guid owner, double remainingSeconds, decimal filled)
+    {
+        Ch.Information("RECON-SKIP-ACTIVE-ENTRY {Symbol} id={Id} owner={Owner} reason=active-entry-within-deadline remaining_s={Remaining:F1} filled={Filled} protection_required={Protection}", symbol, id, owner, remainingSeconds, filled, filled > 0);
+    }
+    public static void ReconExpireEntry(string symbol, string id, decimal filled)
+    {
+        Ch.Warning("RECON-EXPIRE-ENTRY {Symbol} id={Id} reason=entry-deadline-expired filled={Filled} protection_required={Protection}", symbol, id, filled, filled > 0);
     }
 
     public static void ProtectionFillApplied(string symbol, string reason, decimal cumulativeQuantity, string source)

@@ -38,6 +38,10 @@ public sealed class TradingSignal
     public decimal? EntryPrice { get; set; }
     public decimal? StopLoss { get; set; }
     public decimal? TakeProfit { get; set; }
+    public bool? Veto { get; set; }
+    public string? EventType { get; set; }
+    public IReadOnlyList<string> RiskFlags { get; set; } = Array.Empty<string>();
+    public string? Invalidation { get; set; }
     public string Reasoning { get; set; } = string.Empty;
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
     public string ModelVersion { get; set; } = string.Empty;

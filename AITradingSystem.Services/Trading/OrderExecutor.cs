@@ -174,6 +174,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
     private void OnExecutionReportForFill(ExecutionReport report)
     {
+        _executionQueue.ActiveEntries.ObserveReport(report);
         foreach (var key in ReportKeys(report))
         {
             _latestReports[key] = report;
@@ -338,6 +339,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     signal.Symbol, ExecutionPriority.Entry,
                     StableClientOrderId("mkt", signal.Symbol, side, quantity, executionPrice, signal.Timestamp),
                     (id, token) => _binanceClient.PlaceMarketOrderAsync(signal.Symbol, side, quantity, id, token), ct);
+                _executionQueue.ActiveEntries.Complete(marketOrder.ClientOrderId);
                 return ValidateFilled(marketOrder, signal.Symbol, "market-entry");
             }
 
@@ -349,12 +351,14 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
             if (order.Status is OrderStatus.Rejected or OrderStatus.Expired or OrderStatus.Canceled)
             {
+                _executionQueue.ActiveEntries.Complete(order.ClientOrderId);
                 TradeLog.Rejected(signal.Symbol, "exchange", $"ордер отклонён биржей: {order.Status}");
                 return null;
             }
 
             // Ждём реального исполнения: лимитный Post-Only ордер может простоять в стакане долго.
             var filled = await WaitForFillAsync(order, ct);
+            _executionQueue.ActiveEntries.Complete(order.ClientOrderId);
             return ValidateFilled(filled, signal.Symbol, "limit-entry");
         }
         catch (BinanceApiException ex) when (ex.IsPostOnlyRejection)
@@ -837,6 +841,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         var sw = Stopwatch.StartNew();
         var timeout = TimeSpan.FromSeconds(_tradingConfig.OrderFillTimeoutSeconds);
         var current = order;
+        _executionQueue.ActiveEntries.Observe(order.ClientOrderId, order);
 
         // P0.5: основной источник статуса — executionReport user-data stream.
         // REST-polling остаётся только fallback, если stream выключен/не подключён.
@@ -856,6 +861,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                 if (latest != null)
                 {
                     current = ApplyReport(current, latest);
+                    _executionQueue.ActiveEntries.Observe(current.ClientOrderId, current);
                     if (IsTerminalStatus(current.Status)) break;
                 }
 
@@ -870,6 +876,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     if (completed != waiter.Task) break; // timeout или отмена вызывающего
                     var report = await waiter.Task;
                     current = ApplyReport(current, report);
+                    _executionQueue.ActiveEntries.Observe(current.ClientOrderId, current);
                     if (IsTerminalStatus(current.Status)) break;
                 }
                 finally
@@ -882,6 +889,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             try
             {
                 current = await _binanceClient.GetOrderAsync(order.Symbol, order.BinanceOrderId, ct);
+                _executionQueue.ActiveEntries.Observe(current.ClientOrderId, current);
             }
             catch (Exception ex)
             {
@@ -922,6 +930,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     }, ct);
                 // После отмены забираем финальное состояние (могли исполнить в момент отмены).
                 current = await _binanceClient.GetOrderAsync(current.Symbol, current.BinanceOrderId, ct);
+                _executionQueue.ActiveEntries.Observe(current.ClientOrderId, current);
             }
             catch (Exception ex)
             {

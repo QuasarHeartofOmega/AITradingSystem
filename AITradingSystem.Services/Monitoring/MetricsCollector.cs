@@ -185,6 +185,9 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
     public long ReconciliationFillsApplied { get; private set; }
     public long OrphanPositionsAdopted { get; private set; }
     public long OrphanOrdersCanceled { get; private set; }
+    public long ActiveEntrySkips { get; private set; }
+    public long EntryDeadlineCancels { get; private set; }
+    public long PrematureEntryCancelsPrevented => ActiveEntrySkips;
     public long ListenKeyRecreations { get; private set; }
 
     public void RecordExecutionReport()
@@ -213,6 +216,8 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
 
     public void RecordReconciliationFill() { lock (_lock) ReconciliationFillsApplied++; }
     public void RecordOrphanPositionAdopted() { lock (_lock) OrphanPositionsAdopted++; }
+    public void RecordActiveEntrySkip() { lock (_lock) ActiveEntrySkips++; }
+    public void RecordEntryDeadlineCancel() { lock (_lock) EntryDeadlineCancels++; }
     public void RecordOrphanOrderCanceled() { lock (_lock) OrphanOrdersCanceled++; }
     public void RecordListenKeyRecreation() { lock (_lock) ListenKeyRecreations++; }
 
@@ -607,7 +612,7 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
                $"Exec queue wait: avg {AverageExecutionWaitMs:F0} ms / max {MaxExecutionWaitMs:F0} ms, " +
                $"depth {ExecutionQueueDepth}/{ExecutionQueueMaxDepth}, retries {ExecutionRetries}, " +
                $"exec reports {ExecutionReportsReceived}, recon issues {ReconciliationIssues}, fills applied {ReconciliationFillsApplied}, " +
-               $"orphans adopted {OrphanPositionsAdopted}, orphan orders canceled {OrphanOrdersCanceled}, listenKey recreations {ListenKeyRecreations}, " +
+               $"orphans adopted {OrphanPositionsAdopted}, orphan orders canceled {OrphanOrdersCanceled}, active-entry skips {ActiveEntrySkips}, premature cancels prevented {PrematureEntryCancelsPrevented}, entry deadline cancels {EntryDeadlineCancels}, listenKey recreations {ListenKeyRecreations}, " +
                $"kill-switch {KillSwitchActivations}, " +
                $"user-data probes {UserDataStreamProbes} (failures {UserDataStreamProbeFailures}), polling reconciles {PollingFallbackReconciles}, " +
                $"recon failures {ReconciliationFailures}, execution-state blocks {ExecutionStateBlocks}, " +

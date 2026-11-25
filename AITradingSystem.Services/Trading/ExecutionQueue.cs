@@ -70,6 +70,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
     private readonly ConcurrentDictionary<long, Task> _workers = new();
 
     private Func<ExecutionIntent, CancellationToken, Task<object?>>? _intentResolver;
+    public ActiveEntryRegistry ActiveEntries { get; } = new();
     private long _seq;
     private long _workerSeq;
     private int _started;
@@ -261,7 +262,9 @@ public sealed class ExecutionQueue : IAsyncDisposable
             {
                 var (found, result) = await ResolveRestoredIntentAsync(restoredIntent, ct).ConfigureAwait(false);
                 if (found)
+                {
                     return result;
+                }
 
                 lock (_lock)
                 {
@@ -315,6 +318,8 @@ public sealed class ExecutionQueue : IAsyncDisposable
                 if (key != null)
                     _inFlightByKey[key] = item;
 
+                if (priority == ExecutionPriority.Entry && key != null)
+                    ActiveEntries.Track(symbol, key, _config, item.EnqueuedAtUtc);
                 InsertByPriority(item);
             }
         }
@@ -333,7 +338,10 @@ public sealed class ExecutionQueue : IAsyncDisposable
                 lock (_lock)
                 {
                     if (_pending.Remove(item))
+                    {
+                        if (key != null) ActiveEntries.Remove(key);
                         item.Completion.TrySetCanceled(ct);
+                    }
                 }
             });
         }
@@ -527,6 +535,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
             item.Intent = intent;
             intent.Attempts = item.Attempts;
             intent.Status = ExecutionIntentStatus.Pending;
+            if (item.Priority == ExecutionPriority.Entry && item.Key != null) ActiveEntries.Update(item.Key, intent.Status);
             await TryJournalAsync(intent).ConfigureAwait(false);
         }
 
@@ -599,9 +608,13 @@ public sealed class ExecutionQueue : IAsyncDisposable
         if (intent != null)
         {
             intent.Status = error is null ? ExecutionIntentStatus.Confirmed : ExecutionIntentStatus.Failed;
+            if (item.Priority == ExecutionPriority.Entry && item.Key != null) ActiveEntries.Update(item.Key, intent.Status);
             intent.Error = error?.Message;
             await TryJournalAsync(intent).ConfigureAwait(false);
         }
+
+        if (item.Priority == ExecutionPriority.Entry && item.Key != null && result is Order entryOrder)
+            ActiveEntries.Observe(item.Key, entryOrder);
 
         _signal.Release(); // освободившийся слот/символ — повод пересмотреть очередь
 

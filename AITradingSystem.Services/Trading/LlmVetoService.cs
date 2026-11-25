@@ -75,7 +75,7 @@ public sealed class LlmVetoService : IAsyncDisposable
         string? newsContext,
         AiRequestContext context)
     {
-        if (_config.ResolvedRole == AiRole.Off || !_aiModel.IsLoaded)
+        if (_config.ResolvedRole == AiRole.Off || !_aiModel.IsLoaded || !PromptBuilder.CanBuild(context))
             return;
 
         var key = Key(symbol, candleCloseUtc, configHash);
@@ -110,29 +110,7 @@ public sealed class LlmVetoService : IAsyncDisposable
             budgetCts.CancelAfter(budget);
 
             // P0.5: veto/shadow без thinking — короткий ответ, жёсткий бюджет.
-            var request = new AiRequestContext
-            {
-                HasPosition = context.HasPosition,
-                PositionSide = context.PositionSide,
-                EntryPrice = context.EntryPrice,
-                Quantity = context.Quantity,
-                UnrealizedPnlPercent = context.UnrealizedPnlPercent,
-                StopLoss = context.StopLoss,
-                TakeProfit = context.TakeProfit,
-                MinutesInPosition = context.MinutesInPosition,
-                AllowShort = context.AllowShort,
-                MinRiskReward = context.MinRiskReward,
-                MinConfidence = context.MinConfidence,
-                StopLossAtrMultiplier = context.StopLossAtrMultiplier,
-                EngineScore = context.EngineScore,
-                EngineDirection = context.EngineDirection,
-                EnginePriorConfidence = context.EnginePriorConfidence,
-                EngineReasons = context.EngineReasons,
-                EngineFacts = context.EngineFacts,
-                PriceDecimals = context.PriceDecimals,
-                TickSize = context.TickSize,
-                DisableThinking = true
-            };
+            var request = context with { Role = role, DisableThinking = true };
 
             var signal = await _aiModel.GetTradingSignalAsync(symbol, indicators, newsContext, request, budgetCts.Token);
             var latency = (DateTime.UtcNow - started).TotalMilliseconds;
@@ -198,22 +176,27 @@ public sealed class LlmVetoService : IAsyncDisposable
             return true;
         }
 
-        if (signal.Action is SignalAction.Hold or SignalAction.Close)
+        if (context.Role is AiRole.Shadow or AiRole.Explainer)
         {
-            reason = $"модель против входа ({signal.Action}, conf={signal.Confidence:0.##}): {signal.Reasoning}";
+            reason = $"observation only: {signal.Reasoning}";
+            return false;
+        }
+        if (signal.Veto is not { } veto)
+        {
+            reason = "missing veto contract — fail-closed";
             return true;
         }
-
-        var engineLong = context.EngineScore is > 0.05m;
-        var engineShort = context.EngineScore is < -0.05m;
-        if ((signal.Action == SignalAction.Buy && engineShort) ||
-            (signal.Action == SignalAction.Sell && engineLong))
+        if (signal.RiskFlags.Any(x => x.Equals("direction_mismatch", StringComparison.OrdinalIgnoreCase)))
         {
-            reason = $"модель предлагает {signal.Action} против направления движка {context.EngineDirection}";
+            reason = "opposite engine direction / no separate reversal setup";
             return true;
         }
-
-        reason = $"модель не возражает ({signal.Action}, conf={signal.Confidence:0.##})";
+        if (veto)
+        {
+            reason = $"{signal.EventType}: {signal.Reasoning}; invalidation={signal.Invalidation}";
+            return true;
+        }
+        reason = "valid veto=false; no execution authority";
         return false;
     }
 

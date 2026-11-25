@@ -650,9 +650,13 @@ public sealed class QwenModel : IAIModel
 
         context ??= new AiRequestContext
         {
+            Role = _config.ResolvedRole,
             AllowShort = false,
             MinConfidence = _config.MinConfidence
         };
+
+        if (!PromptBuilder.CanBuild(context))
+            throw new InvalidOperationException("AI role/symbol policy forbids building a prompt (Off or excluded symbol).");
 
         await _inferenceLock.WaitAsync(ct);
         try
@@ -680,7 +684,7 @@ public sealed class QwenModel : IAIModel
                 if (attempt > 1 && _config.RepairInvalidJson && lastRawResponse != null)
                 {
                     currentPrompt = BuildRepairPromptWithinBudget(
-                        prompt, lastRawResponse, lastParseError ?? "invalid JSON");
+                        prompt, lastRawResponse, lastParseError ?? "invalid JSON", context);
                     AiLog.Retry(symbol, attempt, lastParseError ?? "invalid JSON");
                 }
 
@@ -729,7 +733,7 @@ public sealed class QwenModel : IAIModel
                         AiLog.Thinking(symbol, thinking, LastInferenceTimeMs);
                     }
 
-                    signal = ParseSignalFromResponse(symbol, result.Text, out var parseError);
+                    signal = ParseSignalFromResponse(symbol, result.Text, context, out var parseError);
                     lastParseError = parseError;
 
                     if (signal != null)
@@ -824,10 +828,10 @@ public sealed class QwenModel : IAIModel
     }
 
     /// <summary>Repair-промпт; если он не влезает — откат к базовому промпту вместо ContextOverflowException.</summary>
-    private string BuildRepairPromptWithinBudget(string basePrompt, string invalidResponse, string error)
+    private string BuildRepairPromptWithinBudget(string basePrompt, string invalidResponse, string error, AiRequestContext context)
     {
         var executor = _executor ?? throw new InvalidOperationException("Executor не инициализирован");
-        var repair = _promptBuilder.BuildRepairPrompt(basePrompt, invalidResponse, error, EffectiveThinking);
+        var repair = _promptBuilder.BuildRepairPrompt(basePrompt, invalidResponse, error, EffectiveThinking, context);
         var reserve = _config.EffectiveMaxTokens + 8;
 
         if (executor.CountTokens(repair) + reserve <= executor.ContextSize)
@@ -960,7 +964,7 @@ public sealed class QwenModel : IAIModel
         }
     }
 
-    private TradingSignal? ParseSignalFromResponse(string symbol, string response, out string? error)
+    private TradingSignal? ParseSignalFromResponse(string symbol, string response, AiRequestContext context, out string? error)
     {
         error = null;
 
@@ -976,35 +980,21 @@ public sealed class QwenModel : IAIModel
             }
 
             var signalDto = JsonSerializer.Deserialize<TradingSignalDto>(json, _jsonOptions);
-            if (signalDto == null || string.IsNullOrWhiteSpace(signalDto.Action))
+            if (signalDto is null) { error = "empty role response"; return null; }
+            if (context.Role == AiRole.Explainer)
             {
-                error = "в JSON отсутствует поле action";
-                return null;
+                if (string.IsNullOrWhiteSpace(signalDto.Explanation)) { error = "missing explanation"; return null; }
+                return RoleSignal(symbol, signalDto.Explanation);
             }
-
-            if (!Enum.TryParse<SignalAction>(signalDto.Action.Trim(), true, out var action))
-            {
-                error = $"неизвестное действие '{signalDto.Action}'";
-                return null;
-            }
-
-            var modelConfidence = Math.Clamp(signalDto.Confidence, 0m, 1m);
-
-            return new TradingSignal
-            {
-                Symbol = symbol,
-                Action = action,
-                Confidence = modelConfidence,
-                ModelConfidence = modelConfidence,
-                // Дегенерат промпт-якоря: HOLD с conf ≈ 0.45 (правило «below 0.55» из старого промпта).
-                IsDegenerateConfidence = action == SignalAction.Hold && Math.Abs(modelConfidence - 0.45m) <= 0.02m,
-                EntryPrice = NormalizePrice(signalDto.EntryPrice),
-                StopLoss = NormalizePrice(signalDto.StopLoss),
-                TakeProfit = NormalizePrice(signalDto.TakeProfit),
-                Reasoning = signalDto.Reasoning ?? string.Empty,
-                Timestamp = DateTime.UtcNow,
-                ModelVersion = $"Qwen-GGUF/{ActiveBackend}"
-            };
+            if (signalDto.Veto is null || signalDto.VetoReason is null || signalDto.EventType is null
+                || signalDto.RiskFlags is null || signalDto.Invalidation is null)
+            { error = "veto contract requires veto, veto_reason, event_type, risk_flags and invalidation"; return null; }
+            var result = RoleSignal(symbol, signalDto.VetoReason);
+            result.Veto = signalDto.Veto;
+            result.EventType = signalDto.EventType;
+            result.RiskFlags = signalDto.RiskFlags;
+            result.Invalidation = signalDto.Invalidation;
+            return result;
         }
         catch (JsonException ex)
         {
@@ -1019,6 +1009,12 @@ public sealed class QwenModel : IAIModel
             return null;
         }
     }
+
+    private static TradingSignal RoleSignal(string symbol, string reason) => new()
+    {
+        Symbol = symbol, Action = SignalAction.Hold, Confidence = 0m, ModelConfidence = 0m,
+        Reasoning = reason, Timestamp = DateTime.UtcNow
+    };
 
     /// <summary>Модель иногда присылает 0 или отрицательные цены вместо null.</summary>
     private static decimal? NormalizePrice(decimal? price) =>
@@ -1141,6 +1137,13 @@ public sealed class QwenModel : IAIModel
 /// <summary>DTO для парсинга JSON-ответа модели (snake_case, как в промпте).</summary>
 internal sealed class TradingSignalDto
 {
+    [JsonPropertyName("veto")] public bool? Veto { get; set; }
+    [JsonPropertyName("veto_reason")] public string? VetoReason { get; set; }
+    [JsonPropertyName("event_type")] public string? EventType { get; set; }
+    [JsonPropertyName("risk_flags")] public List<string>? RiskFlags { get; set; }
+    [JsonPropertyName("invalidation")] public string? Invalidation { get; set; }
+    [JsonPropertyName("explanation")] public string? Explanation { get; set; }
+
     [JsonPropertyName("action")]
     public string Action { get; set; } = string.Empty;
 

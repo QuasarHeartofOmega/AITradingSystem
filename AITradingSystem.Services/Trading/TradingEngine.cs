@@ -1131,6 +1131,11 @@ public sealed class TradingEngine : IAsyncDisposable
         Dictionary<string, decimal>? indicators = null,
         decimal price = 0m) => new()
     {
+        Role = _config.AI.ResolvedRole,
+        SymbolClass = SymbolUniversePolicy.Classify(symbol, _config.Trading.VolatileSymbols,
+            _config.Trading.StablecoinPairs, _config.Trading.BenchmarkSymbols),
+        SymbolExclusionReason = _config.Trading.SymbolExclusions.TryGetValue(symbol, out var exclusion) ? exclusion : null,
+        HasSeparateReversalSetup = false,
         HasPosition = position != null,
         PositionSide = position == null ? null : (position.Side == OrderSide.Buy ? "LONG" : "SHORT"),
         EntryPrice = position?.EntryPrice,
@@ -1376,7 +1381,9 @@ public sealed class TradingEngine : IAsyncDisposable
 
     private async Task ReviewOpenPositionAsync(string symbol, CancellationToken ct)
     {
-        if (!_config.Trading.AiCanClosePositions)
+        // P0.6a: only the explainer audits an existing deterministic position decision.
+        // The legacy AiCanClosePositions switch no longer grants LLM exit authority.
+        if (_config.AI.ResolvedRole != AiRole.Explainer)
             return;
 
         // P0.5: LLM-пересмотр позиции не входит в последовательный критический путь.
@@ -1452,33 +1459,10 @@ public sealed class TradingEngine : IAsyncDisposable
             BuildCalibrationContext(symbol, indicators, candle.Close, hasPosition: true),
             blendModelWeight: _config.AI.BlendModelWeight);
 
-        _metrics.RecordSignal(signal);
-        _metrics.RecordInferenceTime(_aiModel.LastInferenceTimeMs);
-        OnSignalGenerated?.Invoke(signal);
-
-        // CLOSE — явный выход. BUY/SELL — выход, если действие противоположно стороне позиции.
-        var opposite = position.Side == OrderSide.Buy
-            ? signal.Action == SignalAction.Sell
-            : signal.Action == SignalAction.Buy;
-
-        if (signal.Action != SignalAction.Close && !opposite)
-        {
-            TradeLog.Decision(symbol, "HOLD",
-                $"позиция открыта, ИИ держит (conf={signal.Confidence:P0}): {signal.Reasoning}");
-            return;
-        }
-
-        if (signal.Confidence < _config.AI.MinConfidence)
-        {
-            TradeLog.Decision(symbol, "HOLD",
-                $"ИИ предлагал выход, но уверенность {signal.Confidence:P0} < {_config.AI.MinConfidence:P0}");
-            return;
-        }
-
-        TradeLog.Decision(symbol, "CLOSE",
-            $"решение ИИ (conf={signal.Confidence:P0}): {signal.Reasoning}");
-
-        await ClosePositionAsync(position, $"AI-{signal.Action}", ct);
+        // P0.6a: LLM review is audit/explanation only. It cannot close a position;
+        // deterministic SL/TP/trailing/emergency protection remains the sole exit path here.
+        TradeLog.Decision(symbol, "LLM-REVIEW-AUDIT",
+            $"role={_config.AI.ResolvedRole}; action_authority=false; {signal.Reasoning}");
     }
 
     /// <summary>

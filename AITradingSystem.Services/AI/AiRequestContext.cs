@@ -1,12 +1,18 @@
+using AITradingSystem.Common.Configuration;
+
 namespace AITradingSystem.Services.AI;
 
 /// <summary>
 /// Контекст запроса к модели: что уже открыто по символу и какие ограничения действуют.
 /// Без этого модель предлагала SELL по споту (шорт невозможен) и не могла закрыть позицию.
 /// </summary>
-public sealed class AiRequestContext
+public sealed record AiRequestContext
 {
     /// <summary>Есть открытая позиция по символу.</summary>
+    public AiRole Role { get; init; } = AiRole.VetoOnly;
+    public SymbolUniverseClass SymbolClass { get; init; } = SymbolUniverseClass.Volatile;
+    public string? SymbolExclusionReason { get; init; }
+    public bool HasSeparateReversalSetup { get; init; }
     public bool HasPosition { get; init; }
 
     /// <summary>Сторона открытой позиции ("LONG"/"SHORT").</summary>

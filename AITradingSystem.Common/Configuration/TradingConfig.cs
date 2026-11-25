@@ -200,6 +200,10 @@ public sealed class TradingConfig
     public int ExecutionStateMaxStalenessSeconds { get; set; } = 90;
 
     /// <summary>P0.5: подхватывать сиротские позиции бота из журнала/ордеров при реконсиляции.</summary>
+    /// <summary>P0.4a: grace after the entry fill timeout before reconciliation may cancel it.</summary>
+    public int ReconciliationEntryGraceSeconds { get; set; } = 30;
+
+    /// <summary>P0.5: подхватывать сиротские позиции бота из журнала/ордеров при реконсиляции.</summary>
     public bool ReconciliationAdoptOrphanPositions { get; set; } = true;
 
     /// <summary>P0.5: снимать сиротские ордера/OCO бота, не принадлежащие открытым позициям.</summary>
@@ -622,6 +626,9 @@ public sealed class TradingConfig
         if (UserDataKeepAliveMinutes < 1 || UserDataKeepAliveMinutes > 59)
             throw new InvalidOperationException(
                 $"UserDataKeepAliveMinutes должен быть в диапазоне [1; 59] (Binance аннулирует listenKey через 60 мин). Текущее: {UserDataKeepAliveMinutes}");
+
+        if (ReconciliationEntryGraceSeconds < 5 || ReconciliationEntryGraceSeconds > 300)
+            throw new InvalidOperationException($"ReconciliationEntryGraceSeconds должен быть в диапазоне [5; 300]. Текущее: {ReconciliationEntryGraceSeconds}");
 
         if (UserDataPollingIntervalSeconds < 5 || UserDataPollingIntervalSeconds > 300)
             throw new InvalidOperationException(
