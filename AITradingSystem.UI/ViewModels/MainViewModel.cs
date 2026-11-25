@@ -118,7 +118,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             : realMoneyLive
                 ? "REAL MONEY — LIVE: реальные средства и реальные ордера."
                 : "REAL ORDERS: ордера отправляются в " + _account.EnvironmentName + ".";
-        if (_engine.IsKillSwitchEngaged) AccountBanner += " KILL-SWITCH: новые входы заблокированы.";
+        if (_engine.IsKillSwitchEngaged)
+            AccountBanner += $" KILL-SWITCH: новые входы заблокированы ({_engine.KillSwitchReason}; {_engine.KillSwitchCloseStatus}).";
         if (!_account.HasApiKeys) AccountBanner += " API-ключи не заданы: балансы недоступны.";
         if (_engine.UnavailableSymbols.Count > 0) AccountBanner += " Недоступные пары: " + string.Join(", ", _engine.UnavailableSymbols) + ".";
     }

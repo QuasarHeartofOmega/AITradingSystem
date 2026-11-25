@@ -138,6 +138,9 @@ public interface IBinanceRestClient
     /// Имя активного окружения: Live | Testnet | Demo.
     /// </summary>
     string EnvironmentName { get; }
+
+    /// <summary>P0.1: стабильный не-секретный отпечаток API-ключа для ключа risk-state.</summary>
+    string AccountId { get; }
     /// <summary>Наличие обоих зашифрованных ключей в конфигурации; не результат их расшифровки.</summary>
     bool HasApiKeys { get; }
     /// <summary>Публичные последние цены всех символов выбранного окружения.</summary>

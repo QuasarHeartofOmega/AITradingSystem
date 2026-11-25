@@ -40,6 +40,11 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly IStateRepository _stateRepository;
     private readonly MetricsCollector _metrics;
     private readonly ILogger<TradingEngine> _logger;
+    private readonly AccountSnapshotService _accountSnapshots;
+    private AccountSnapshot? _accountSnapshot;
+    private decimal _paperFreeCash;
+    private DateTime _nextAccountRefreshUtc = DateTime.MinValue;
+    private readonly SemaphoreSlim _accountSnapshotLock = new(1, 1);
 
     private CancellationTokenSource? _cts;
     private Task? _mainLoop;
@@ -86,9 +91,16 @@ public sealed class TradingEngine : IAsyncDisposable
     public event Action<Position>? OnPositionOpened;
     public event Action<TradeRecord>? OnPositionClosed;
 
-    /// <summary>P0.6: kill-switch взведён — новые входы заблокированы до явного сброса.</summary>
+    /// <summary>P0.6/P0.2: kill-switch взведён — новые входы заблокированы до явного сброса.</summary>
     private int _killSwitchEngaged;
+    private string _killSwitchReason = string.Empty;
+    private DateTime _killSwitchEngagedAtUtc;
+    private decimal _killSwitchEquityAtEngage;
+    private bool _killSwitchRequiresManualReset = true;
+    private string _killSwitchCloseStatus = string.Empty;
     public bool IsKillSwitchEngaged => Volatile.Read(ref _killSwitchEngaged) == 1;
+    public string KillSwitchReason => _killSwitchReason;
+    public string KillSwitchCloseStatus => _killSwitchCloseStatus;
     public event Action<string>? OnKillSwitchEngaged;
 
     public TradingEngine(
@@ -133,6 +145,7 @@ public sealed class TradingEngine : IAsyncDisposable
         _stateRepository = stateRepository ?? throw new ArgumentNullException(nameof(stateRepository));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager);
 
         if (!CandleSchedule.TryParseInterval(_config.Trading.CandleInterval, out _candleInterval))
             throw new InvalidOperationException($"Недопустимый интервал свечей: {_config.Trading.CandleInterval}");
@@ -192,33 +205,51 @@ public sealed class TradingEngine : IAsyncDisposable
 
             // P0.4: восстанавливаем пик/дневной старт/макс. просадку ДО первого UpdateBalance —
             // иначе рестарт «прощает» дневной убыток и обнуляет пик.
-            var riskState = await _stateRepository.LoadRiskStateAsync(ct);
+            var riskState = await _stateRepository.LoadRiskStateAsync(RiskEnvironment, RiskAccountId, RiskQuoteAsset, ct);
             if (riskState != null)
             {
                 _riskManager.DrawdownTracker.RestoreState(riskState);
                 _logger.LogInformation(
                     "RISK-STATE-RESTORED: пик {Peak:F2}, старт дня {DayStart:F2} ({Day:yyyy-MM-dd}), макс. просадка {MaxDd:P2}",
                     riskState.PeakBalance, riskState.DayStartBalance, riskState.DayStartUtc, riskState.MaxDrawdownPercent);
+
+                // P0.2: авария переживает рестарт; входы остаются заблокированными до явного reset.
+                if (riskState.KillSwitchEngaged)
+                {
+                    Interlocked.Exchange(ref _killSwitchEngaged, 1);
+                    _killSwitchReason = riskState.KillSwitchReason;
+                    _killSwitchEngagedAtUtc = riskState.KillSwitchEngagedAtUtc;
+                    _killSwitchEquityAtEngage = riskState.KillSwitchEquityAtEngage;
+                    _killSwitchRequiresManualReset = riskState.KillSwitchRequiresManualReset;
+                    _killSwitchCloseStatus = string.IsNullOrWhiteSpace(riskState.KillSwitchCloseStatus)
+                        ? "UNPROTECTED_OR_OPEN" : riskState.KillSwitchCloseStatus;
+                    TradeLog.KillSwitchRestored(_killSwitchReason, _killSwitchCloseStatus);
+                    _logger.LogCritical("KILL-SWITCH-RESTORED: {Reason}; статус закрытия={Status}; требуется ручной сброс",
+                        _killSwitchReason, _killSwitchCloseStatus);
+                    OnKillSwitchEngaged?.Invoke(_killSwitchReason);
+                }
             }
 
             // Получение начального баланса
             if (_config.Trading.PaperTradingMode)
             {
                 // P0.4: виртуальный баланс переживает рестарт — иначе дневной PnL считался бы с нуля.
-                var paperBalance = riskState?.CurrentBalance > 0
-                    ? riskState.CurrentBalance
-                    : _config.Trading.PaperTradingInitialBalance;
-                _logger.LogInformation("Режим Paper Trading: виртуальный баланс {Balance} USDT ({Source})",
-                    paperBalance,
-                    riskState?.CurrentBalance > 0 ? "восстановлен из risk_state.json" : "начальный из конфига");
-                await UpdateRiskBalanceAsync(paperBalance, ct);
+                _paperFreeCash = riskState?.FreeCashQuote
+                    ?? (riskState?.CurrentBalance > 0 ? riskState.CurrentBalance : _config.Trading.PaperTradingInitialBalance);
+                _logger.LogInformation("Режим Paper Trading: виртуальный free cash {Cash} USDT ({Source})",
+                    _paperFreeCash,
+                    riskState?.FreeCashQuote.HasValue == true ? "восстановлен из scoped risk-state" :
+                    riskState?.CurrentBalance > 0 ? "миграция legacy equity" : "начальный из конфига");
+                await UpdateRiskSnapshotAsync(_accountSnapshots.CreatePaper(_paperFreeCash), ct);
             }
             else
             {
                 // В реальном режиме запрашиваем баланс с биржи
                 _logger.LogInformation("Режим Live: запрос баланса с Binance...");
-                var balance = await _restClient.GetAccountBalanceAsync(ct);
-                await UpdateRiskBalanceAsync(balance.AvailableUSDT, ct);
+                var snapshot = await _accountSnapshots.CreateLiveAsync(ct);
+                if (!snapshot.IsValuationComplete)
+                    throw new InvalidOperationException("Не удалось оценить все активы счёта в USDT; запуск fail-closed.");
+                await UpdateRiskSnapshotAsync(snapshot, ct);
             }
 
             // P1.7: портфельный риск восстанавливается из полной истории сделок (день/серия/пауза).
@@ -560,6 +591,11 @@ public sealed class TradingEngine : IAsyncDisposable
             {
                 if (_status == BotStatus.Running)
                 {
+                    if (DateTime.UtcNow >= _nextAccountRefreshUtc)
+                    {
+                        await RefreshAccountSnapshotAsync(ct);
+                        _nextAccountRefreshUtc = DateTime.UtcNow.AddSeconds(_config.Trading.AccountRefreshIntervalSeconds);
+                    }
                     await RecoverMarketDataAsync(ct);
                     await EnsureCorrelationBenchmarkAsync(ct);
                     await ProcessSymbolsAsync(ct);
@@ -599,6 +635,13 @@ public sealed class TradingEngine : IAsyncDisposable
         if (IsKillSwitchEngaged)
         {
             TradeLog.Rejected(symbol, "kill-switch", "входы заблокированы kill-switch (пробит лимит риска или ручная паника)");
+            return;
+        }
+
+        // P0.1: неполная оценка капитала не допускает входы.
+        if (_accountSnapshot?.IsValuationComplete != true)
+        {
+            TradeLog.Rejected(symbol, "risk", "снимок капитала неполон или отсутствует (account valuation fail-closed)");
             return;
         }
 
@@ -705,7 +748,7 @@ public sealed class TradingEngine : IAsyncDisposable
         TryFixSignalTakeProfit(symbol, signal, indicators, currentCandle.Close);
 
         // 6. Валидация риск-менеджером (просадка, дневной лимит, R/R, корректность цен).
-        var balance = _riskManager.DrawdownTracker.CurrentBalance;
+        var balance = _accountSnapshot?.EquityQuote ?? _riskManager.DrawdownTracker.CurrentEquity;
         if (!_riskManager.ValidateSignal(signal, balance, out var reason))
         {
             TradeLog.Rejected(symbol, "risk", reason);
@@ -736,14 +779,14 @@ public sealed class TradingEngine : IAsyncDisposable
         // 7a. Спот без плеча: свободные деньги = баланс минус капитал в открытых позициях.
         //     PositionSizer ограничивает объём всем балансом, поэтому при MaxOpenPositions=3
         //     бот набирал до 3x баланса (в live Binance отклонял ордер по -2010).
-        var freeCash = GetFreeCash(balance);
+        var freeCash = GetFreeCash();
         var feeBuffer = 1m + FeeRate;
         var maxAffordable = freeCash > 0 ? freeCash / (signal.EntryPrice.Value * feeBuffer) : 0m;
 
         if (maxAffordable <= 0)
         {
             TradeLog.Rejected(symbol, "cash",
-                $"нет свободных средств: баланс {balance:F2}, в позициях {balance - freeCash:F2} USDT");
+                $"нет свободных средств: free cash {freeCash:F2}, equity {balance:F2} USDT");
             return;
         }
 
@@ -890,11 +933,15 @@ public sealed class TradingEngine : IAsyncDisposable
         TradeLog.Opened(symbol, side.ToString(), executedQuantity, actualEntry, stopLoss, takeProfit,
             _config.Trading.PaperTradingMode ? "PAPER" : _restClient.EnvironmentName, order.Id);
 
-        // Комиссия входа уменьшает свободный баланс уже сейчас (paper-режим).
-        if (_config.Trading.PaperTradingMode && order.Commission > 0)
+        // P0.1: paper cash-ledger: покупка уменьшает free cash на notional + комиссию.
+        if (_config.Trading.PaperTradingMode)
         {
-            await UpdateRiskBalanceAsync(_riskManager.DrawdownTracker.CurrentBalance - order.Commission, ct);
-            LogBalance();
+            _paperFreeCash -= executedQuantity * actualEntry + order.Commission;
+            await RefreshAccountSnapshotAsync(ct);
+        }
+        else
+        {
+            await RefreshAccountSnapshotAsync(ct);
         }
 
         lock (_reviewLock)
@@ -973,15 +1020,8 @@ public sealed class TradingEngine : IAsyncDisposable
     /// </summary>
     private decimal FeeRate => TradeCostModel.EntryFeeRate(_config.Trading);
 
-    /// <summary>
-    /// Свободные средства спот-счёта: баланс минус капитал, уже вложенный в открытые позиции.
-    /// Баланс в RiskManager — это «деньги + позиции по себестоимости», поэтому вычитаем notional.
-    /// </summary>
-    private decimal GetFreeCash(decimal balance)
-    {
-        var committed = _positionManager.GetOpenPositions().Sum(p => p.Notional);
-        return Math.Max(0m, balance - committed);
-    }
+    /// <summary>P0.1: свободный quote-cash берётся из снимка счёта, не вычитается из equity.</summary>
+    private decimal GetFreeCash() => Math.Max(0m, _accountSnapshot?.FreeCashQuote ?? 0m);
 
     /// <summary>
     /// Контекст для модели: открытая позиция, спот-ограничения, минимальные R/R и уверенность.
@@ -1407,19 +1447,12 @@ public sealed class TradingEngine : IAsyncDisposable
         TradeLog.Closed(position.Symbol, trade.ExitReason, closedQuantity, position.EntryPrice, position.CurrentPrice,
             trade.NetPnL, trade.PnLPercent, trade.Commission, mode);
 
-        // Обновление баланса (P0.4: каждое изменение сразу персистится в risk_state.json)
+        // P0.1: обновление капитала от mark-to-market equity; paper cash-ledger возвращает proceeds.
         if (_config.Trading.PaperTradingMode)
         {
-            // В paper-режиме баланс виртуальный: прибавляем реализованный PnL закрытой части
-            await UpdateRiskBalanceAsync(_riskManager.DrawdownTracker.CurrentBalance + trade.PnL - order.Commission, ct);
+            _paperFreeCash += closedQuantity * position.CurrentPrice - order.Commission;
         }
-        else
-        {
-            var balance = await _restClient.GetAccountBalanceAsync(ct);
-            await UpdateRiskBalanceAsync(balance.AvailableUSDT, ct);
-        }
-
-        LogBalance();
+        await RefreshAccountSnapshotAsync(ct);
 
         if (isPartial)
         {
@@ -1462,23 +1495,84 @@ public sealed class TradingEngine : IAsyncDisposable
         }
     }
 
-    /// <summary>P0.4: снимок риск-состояния на диск (атомарно, внутри репозитория).</summary>
-    private Task PersistRiskStateAsync(CancellationToken ct) =>
-        _stateRepository.SaveRiskStateAsync(_riskManager.DrawdownTracker.CaptureState(), ct);
+    private string RiskEnvironment => _config.Trading.PaperTradingMode ? "Paper" : _restClient.EnvironmentName;
+    private string RiskAccountId => _config.Trading.PaperTradingMode
+        ? (string.IsNullOrWhiteSpace(_config.Trading.PaperTradingAccountId) ? "default" : _config.Trading.PaperTradingAccountId)
+        : _restClient.AccountId;
+    private const string RiskQuoteAsset = "USDT";
 
-    /// <summary>P0.4: обновить баланс и сразу зафиксировать пик/дневной старт — рестарт не обнуляет лимиты.</summary>
-    private async Task UpdateRiskBalanceAsync(decimal newBalance, CancellationToken ct)
+    /// <summary>P0.1: снимок риск-состояния на диск, изолированный по окружению/счёту/quote.</summary>
+    private Task PersistRiskStateAsync(CancellationToken ct)
     {
-        _riskManager.UpdateBalance(newBalance);
-        await PersistRiskStateAsync(ct);
-
-        // P0.6: пробитие лимита после обновления баланса больше не просто запрещает входы —
-        // взводим kill-switch и закрываем все позиции.
-        if (_riskManager.ShouldEngageKillSwitch && !IsKillSwitchEngaged)
+        var state = _riskManager.DrawdownTracker.CaptureState() with
         {
-            var reason = _riskManager.DrawdownTracker.IsMaxDrawdownHit ? "MaxDrawdown" : "DailyLoss";
-            await EngageKillSwitchAsync(reason, ct);
+            FreeCashQuote = _accountSnapshot?.FreeCashQuote,
+            KillSwitchEngaged = IsKillSwitchEngaged,
+            KillSwitchReason = _killSwitchReason,
+            KillSwitchEngagedAtUtc = _killSwitchEngagedAtUtc,
+            KillSwitchEquityAtEngage = _killSwitchEquityAtEngage,
+            KillSwitchRequiresManualReset = _killSwitchRequiresManualReset,
+            KillSwitchCloseStatus = _killSwitchCloseStatus
+        };
+        return _stateRepository.SaveRiskStateAsync(state, RiskEnvironment, RiskAccountId, RiskQuoteAsset, ct);
+    }
+
+    /// <summary>P0.1: обновить equity/free-cash снимок, персист и kill-switch.</summary>
+    private async Task UpdateRiskSnapshotAsync(AccountSnapshot snapshot, CancellationToken ct)
+    {
+        var engageReason = string.Empty;
+        await _accountSnapshotLock.WaitAsync(ct);
+        try
+        {
+            _accountSnapshot = snapshot;
+            var tracker = _riskManager.DrawdownTracker;
+            if (snapshot.IsValuationComplete)
+                _riskManager.UpdateEquity(snapshot.EquityQuote);
+
+            await PersistRiskStateAsync(ct);
+            TradeLog.RiskSnapshot(snapshot.Environment, snapshot.AccountId, snapshot.QuoteAsset,
+                snapshot.EquityQuote, snapshot.FreeCashQuote, snapshot.LockedCashQuote,
+                tracker.CaptureState().PeakBalance, tracker.DayStartBalance,
+                tracker.CurrentDrawdownPercent * 100m, tracker.DailyPnL,
+                snapshot.Source, snapshot.IsValuationComplete);
+
+            if (!snapshot.IsValuationComplete)
+            {
+                _logger.LogWarning("RISK-SNAPSHOT: оценка капитала неполна — входы fail-closed, equity не обновлён");
+                return;
+            }
+
+            if (_riskManager.ShouldEngageKillSwitch && !IsKillSwitchEngaged)
+                engageReason = tracker.IsMaxDrawdownHit ? "MaxDrawdown" : "DailyLoss";
         }
+        finally
+        {
+            _accountSnapshotLock.Release();
+        }
+
+        // P0.2: закрытие позиций обновляет снимок капитала; не держим snapshot-lock во избежание deadlock.
+        if (engageReason.Length > 0)
+            await EngageKillSwitchAsync(engageReason, ct);
+    }
+
+    private async Task RefreshAccountSnapshotAsync(CancellationToken ct)
+    {
+        var snapshot = _config.Trading.PaperTradingMode
+            ? _accountSnapshots.CreatePaper(_paperFreeCash)
+            : await _accountSnapshots.CreateLiveAsync(ct);
+        await UpdateRiskSnapshotAsync(snapshot, ct);
+    }
+
+    /// <summary>P0.1: явная регистрация депозита/вывода/трансфера корректирует baseline, не торговый PnL.</summary>
+    public async Task RegisterExternalCashFlowAsync(decimal amount, string reason, CancellationToken ct = default)
+    {
+        if (amount == 0m) return;
+        _riskManager.DrawdownTracker.RegisterExternalCashFlow(amount);
+        if (_config.Trading.PaperTradingMode)
+            _paperFreeCash += amount;
+        _logger.LogWarning("RISK-CASH-FLOW: amount={Amount} reason={Reason} cumulative={Cumulative}",
+            amount, reason, _riskManager.DrawdownTracker.CumulativeExternalCashFlow);
+        await RefreshAccountSnapshotAsync(ct);
     }
 
     /// <summary>
@@ -1581,12 +1675,7 @@ public sealed class TradingEngine : IAsyncDisposable
         TradeLog.Closed(position.Symbol, reason, closedQuantity, trade.EntryPrice, trade.ExitPrice,
             trade.NetPnL, trade.PnLPercent, trade.Commission, mode);
 
-        if (!_config.Trading.PaperTradingMode)
-        {
-            var balance = await _restClient.GetAccountBalanceAsync(ct);
-            await UpdateRiskBalanceAsync(balance.AvailableUSDT, ct);
-        }
-        LogBalance();
+        await RefreshAccountSnapshotAsync(ct);
 
         _metrics.RecordReconciliationFill();
         if (fullyClosed)
@@ -1646,13 +1735,30 @@ public sealed class TradingEngine : IAsyncDisposable
         var first = Interlocked.CompareExchange(ref _killSwitchEngaged, 1, 0) == 0;
         if (first)
         {
+            _killSwitchReason = reason;
+            _killSwitchEngagedAtUtc = DateTime.UtcNow;
+            _killSwitchEquityAtEngage = _accountSnapshot?.EquityQuote ?? _riskManager.DrawdownTracker.CurrentEquity;
+            _killSwitchRequiresManualReset = true;
+            _killSwitchCloseStatus = "CLOSING";
             _metrics.RecordKillSwitch();
-            _logger.LogCritical("KILL-SWITCH: {Reason} — новые входы заблокированы, закрываю все позиции", reason);
+            TradeLog.KillSwitchEngaged(reason, _killSwitchEquityAtEngage, _killSwitchRequiresManualReset);
+            _logger.LogCritical("KILL-SWITCH-ENGAGED: {Reason} — новые входы заблокированы, закрываю все позиции", reason);
             Pause(); // если уже Running; в Starting флаг выше всё равно блокирует входы
             OnKillSwitchEngaged?.Invoke(reason);
+            await PersistRiskStateAsync(ct);
         }
 
-        return await CloseAllPositionsAsync($"KillSwitch:{reason}", ct);
+        var total = _positionManager.GetOpenPositions().Count;
+        var closed = await CloseAllPositionsAsync($"KillSwitch:{reason}", ct);
+        var remaining = _positionManager.GetOpenPositions().Count;
+        _killSwitchCloseStatus = remaining > 0 ? "UNPROTECTED_OR_OPEN" : "ALL_CLOSED";
+        TradeLog.KillSwitchCloseResult(closed, total, remaining, _killSwitchCloseStatus);
+        if (remaining > 0)
+        {
+            _logger.LogCritical("KILL-SWITCH UNPROTECTED_OR_OPEN: осталось {Remaining} позиций; ручной разбор обязателен", remaining);
+        }
+        await PersistRiskStateAsync(ct);
+        return closed;
     }
 
     /// <summary>
@@ -1687,25 +1793,53 @@ public sealed class TradingEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// P0.6: явный сброс kill-switch (после разбора причины). UI-флоу сброса — остаток пункта;
-    /// Resume сам по себе kill-switch НЕ снимает.
+    /// P0.2: явный сброс kill-switch. Не обнуляет peak/day_start.
+    /// Запрещён, если лимит всё ещё пробит или остались открытые позиции.
     /// </summary>
-    public void ResetKillSwitch()
+    public async Task<bool> ResetKillSwitchAsync(string operatorReason, CancellationToken ct = default)
     {
+        if (!IsKillSwitchEngaged)
+        {
+            TradeLog.KillSwitchResetDenied("not-engaged");
+            return false;
+        }
+
+        var openCount = _positionManager.GetOpenPositions().Count;
+        if (openCount > 0 || _killSwitchCloseStatus == "UNPROTECTED_OR_OPEN")
+        {
+            TradeLog.KillSwitchResetDenied($"UNPROTECTED_OR_OPEN open={openCount}");
+            _logger.LogWarning("KILL-SWITCH-RESET-DENIED: остались открытые позиции или незавершённое аварийное закрытие");
+            return false;
+        }
+
+        if (!_riskManager.DrawdownTracker.IsTradingAllowed)
+        {
+            var reason = _riskManager.DrawdownTracker.IsMaxDrawdownHit ? "MaxDrawdown" : "DailyLoss";
+            TradeLog.KillSwitchResetDenied($"risk-limit-still-breached:{reason}");
+            _logger.LogWarning("KILL-SWITCH-RESET-DENIED: лимит риска всё ещё пробит ({Reason})", reason);
+            return false;
+        }
+
         if (Interlocked.Exchange(ref _killSwitchEngaged, 0) == 1)
-            _logger.LogWarning("KILL-SWITCH: сброшен вручную — входы снова разрешены");
+        {
+            _killSwitchCloseStatus = "RESET";
+            TradeLog.KillSwitchReset(operatorReason);
+            _logger.LogWarning("KILL-SWITCH-RESET: {Reason} — входы снова разрешены; peak/day_start сохранены", operatorReason);
+            await PersistRiskStateAsync(ct);
+            return true;
+        }
+        return false;
     }
 
     /// <summary>Пишет срез баланса/просадки в logs/trades-*.log.</summary>
     private void LogBalance()
     {
         var tracker = _riskManager.DrawdownTracker;
-        var equity = tracker.CurrentBalance + _positionManager.GetOpenPositions().Sum(p => p.UnrealizedPnL);
-
+        var snapshot = _accountSnapshot;
         TradeLog.Balance(
             _config.Trading.PaperTradingMode ? "PAPER" : _restClient.EnvironmentName,
-            tracker.CurrentBalance,
-            equity,
+            snapshot?.FreeCashQuote ?? 0m,
+            snapshot?.EquityQuote ?? tracker.CurrentEquity,
             tracker.CurrentDrawdownPercent * 100m);
     }
 

@@ -1,4 +1,6 @@
-﻿using System.Text.Json;
+﻿using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using AITradingSystem.Core.Models.Trading;
 using AITradingSystem.Core.RiskManagement;
 using Microsoft.Extensions.Logging;
@@ -13,6 +15,7 @@ public sealed class JsonStateRepository : IStateRepository
     private readonly string _positionsPath;
     private readonly string _peakBalancePath;
     private readonly string _riskStatePath;
+    private readonly string _riskStateDirectory;
     private readonly ILogger<JsonStateRepository> _logger;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -28,6 +31,7 @@ public sealed class JsonStateRepository : IStateRepository
 
         _positionsPath = Path.Combine(directoryPath, "positions.json");
         _peakBalancePath = Path.Combine(directoryPath, "peak_balance.json");
+        _riskStateDirectory = directoryPath;
         _riskStatePath = Path.Combine(directoryPath, "risk_state.json");
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
@@ -145,5 +149,47 @@ public sealed class JsonStateRepository : IStateRepository
         }
 
         return null;
+    }
+
+    /// <summary>P0.1: отдельный файл на (environment, account_id, quote_asset).</summary>
+    public async Task SaveRiskStateAsync(DrawdownState state, string environment, string accountId, string quoteAsset, CancellationToken ct = default)
+    {
+        try
+        {
+            var scoped = state with { Environment = environment, AccountId = accountId, QuoteAsset = quoteAsset };
+            var json = JsonSerializer.Serialize(scoped, _jsonOptions);
+            var path = ScopedRiskStatePath(environment, accountId, quoteAsset);
+            var tmp = path + ".tmp";
+            await File.WriteAllTextAsync(tmp, json, ct);
+            File.Move(tmp, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка сохранения scoped состояния риск-трекера");
+        }
+    }
+
+    /// <summary>P0.1: scoped-загрузка. Legacy risk_state.json/peak_balance.json не мигрируются автоматически.</summary>
+    public async Task<DrawdownState?> LoadRiskStateAsync(string environment, string accountId, string quoteAsset, CancellationToken ct = default)
+    {
+        var path = ScopedRiskStatePath(environment, accountId, quoteAsset);
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var json = await File.ReadAllTextAsync(path, ct);
+            return JsonSerializer.Deserialize<DrawdownState>(json, _jsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка загрузки scoped состояния риск-трекера");
+            return null;
+        }
+    }
+
+    private string ScopedRiskStatePath(string environment, string accountId, string quoteAsset)
+    {
+        var key = $"{environment.Trim().ToUpperInvariant()}|{accountId.Trim()}|{quoteAsset.Trim().ToUpperInvariant()}";
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16].ToLowerInvariant();
+        return Path.Combine(_riskStateDirectory, $"risk_state_{hash}.json");
     }
 }

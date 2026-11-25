@@ -294,4 +294,43 @@ public static class TradeLog
         Ch.Information("BALANCE [{Mode}] cash={Cash} equity={Equity} drawdown={Drawdown}% ",
             mode, cash, equity, drawdownPercent.ToString("F2", CultureInfo.InvariantCulture));
     }
+
+    /// <summary>P0.1: машинно-читаемый срез капитала для risk-аудита.</summary>
+    public static void RiskSnapshot(string environment, string accountId, string quoteAsset,
+        decimal equity, decimal free, decimal locked, decimal peak, decimal dayStart,
+        decimal drawdownPercent, decimal dailyPnl, string source, bool valuationComplete)
+    {
+        Ch.Information(
+            "RISK-SNAPSHOT env={Env} account={Account} quote={Quote} equity={Equity} free={Free} locked={Locked} peak={Peak} day_start={DayStart} drawdown={Drawdown} daily_pnl={DailyPnl} source={Source} valuation_complete={Complete}",
+            environment, accountId, quoteAsset, equity, free, locked, peak, dayStart,
+            drawdownPercent.ToString("F4", CultureInfo.InvariantCulture), dailyPnl, source, valuationComplete);
+    }
+
+    /// <summary>P0.2: аудит kill-switch.</summary>
+    public static void KillSwitchEngaged(string reason, decimal equityAtEngage, bool requiresManualReset)
+    {
+        Ch.Warning("KILL-SWITCH-ENGAGED reason={Reason} equity_at_engage={Equity} requires_manual_reset={Manual}",
+            reason, equityAtEngage, requiresManualReset);
+    }
+
+    public static void KillSwitchCloseResult(int closed, int total, int remaining, string status)
+    {
+        Ch.Warning("KILL-SWITCH-CLOSE-RESULT closed={Closed} total={Total} remaining={Remaining} status={Status}",
+            closed, total, remaining, status);
+    }
+
+    public static void KillSwitchReset(string operatorReason)
+    {
+        Ch.Warning("KILL-SWITCH-RESET operator_reason={Reason}", operatorReason);
+    }
+
+    public static void KillSwitchResetDenied(string reason)
+    {
+        Ch.Warning("KILL-SWITCH-RESET-DENIED reason={Reason}", reason);
+    }
+
+    public static void KillSwitchRestored(string reason, string closeStatus)
+    {
+        Ch.Warning("KILL-SWITCH-RESTORED reason={Reason} close_status={Status}", reason, closeStatus);
+    }
 }

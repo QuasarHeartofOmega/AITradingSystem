@@ -150,14 +150,16 @@ public partial class TradingViewModel : ObservableObject
 	}
 
 	[RelayCommand]
-	private void ResetKillSwitch()
+	private async Task ResetKillSwitchAsync()
 	{
 		var confirm = MessageBox.Show(
-			"Сбросить kill-switch и снова разрешить новые входы?\n\nУбедитесь, что причина пробития лимита разобрана.",
+			"Сбросить kill-switch и снова разрешить новые входы?\n\nУбедитесь, что причина пробития лимита разобрана, позиции закрыты, а лимит риска больше не пробит.",
 			"Сброс kill-switch", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 		if (confirm != MessageBoxResult.Yes) return;
-		_engine.ResetKillSwitch();
-		PanicStatusText = "Kill-switch сброшен. Новые входы снова разрешены после Resume/Старт.";
+		var ok = await _engine.ResetKillSwitchAsync("UI manual reset");
+		PanicStatusText = ok
+			? "Kill-switch сброшен. Новые входы снова разрешены после Resume/Старт."
+			: "Сброс kill-switch запрещён: остались позиции или лимит риска всё ещё пробит.";
 	}
 
 	/// <summary>

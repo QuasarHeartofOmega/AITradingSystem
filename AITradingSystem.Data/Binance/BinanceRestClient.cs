@@ -86,6 +86,11 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
     public string EnvironmentName => _config.ResolvedEnvironment.ToString();
     public bool HasApiKeys => !string.IsNullOrWhiteSpace(_config.EffectiveEncryptedApiKey) && !string.IsNullOrWhiteSpace(_config.EffectiveEncryptedApiSecret);
 
+    /// <summary>P0.1: SHA-256 fingerprint API-ключа; сам ключ не логируется и не сохраняется.</summary>
+    public string AccountId => string.IsNullOrWhiteSpace(_apiKey)
+        ? "no-api-key"
+        : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(_apiKey)))[..16].ToLowerInvariant();
+
     public async Task<Dictionary<string, decimal>> GetAllPricesAsync(CancellationToken ct = default)
     {
         var prices = await SendRequestAsync<List<BinanceTickerPrice>>(

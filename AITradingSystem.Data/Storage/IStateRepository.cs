@@ -38,4 +38,10 @@ public interface IStateRepository
     /// есть только legacy peak_balance.json — снимок «только пик» (CurrentBalance = 0).
     /// </summary>
     Task<DrawdownState?> LoadRiskStateAsync(CancellationToken ct = default);
+
+    /// <summary>P0.1: risk-state изолирован по (environment, account_id, quote_asset).</summary>
+    Task SaveRiskStateAsync(DrawdownState state, string environment, string accountId, string quoteAsset, CancellationToken ct = default);
+
+    /// <summary>P0.1: scoped-загрузка не наследует legacy unscoped peak между окружениями.</summary>
+    Task<DrawdownState?> LoadRiskStateAsync(string environment, string accountId, string quoteAsset, CancellationToken ct = default);
 }

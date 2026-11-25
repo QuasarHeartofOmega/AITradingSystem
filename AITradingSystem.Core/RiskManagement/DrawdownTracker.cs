@@ -9,12 +9,25 @@ namespace AITradingSystem.Core.RiskManagement;
 /// </summary>
 public sealed record DrawdownState
 {
+    public string Environment { get; init; } = string.Empty;
+    public string AccountId { get; init; } = string.Empty;
+    public string QuoteAsset { get; init; } = "USDT";
+    public decimal? FreeCashQuote { get; init; }
+    public decimal CumulativeExternalCashFlow { get; init; }
     public decimal PeakBalance { get; init; }
     public decimal DayStartBalance { get; init; }
     public DateTime DayStartUtc { get; init; }
     public decimal MaxDrawdownPercent { get; init; }
     public decimal CurrentBalance { get; init; }
     public DateTime SavedAtUtc { get; init; }
+
+    /// <summary>P0.2: kill-switch переживает рестарт в том же scoped risk-state.</summary>
+    public bool KillSwitchEngaged { get; init; }
+    public string KillSwitchReason { get; init; } = string.Empty;
+    public DateTime KillSwitchEngagedAtUtc { get; init; }
+    public decimal KillSwitchEquityAtEngage { get; init; }
+    public bool KillSwitchRequiresManualReset { get; init; } = true;
+    public string KillSwitchCloseStatus { get; init; } = string.Empty;
 }
 
 /// <summary>
@@ -30,7 +43,10 @@ public sealed class DrawdownTracker
     private DateTime _currentDay;
     private Func<DateTime> _exchangeUtcNow;
 
+    /// <summary>P0.1: mark-to-market equity, не свободный cash.</summary>
     public decimal CurrentBalance { get; private set; }
+    public decimal CurrentEquity => CurrentBalance;
+    public decimal CumulativeExternalCashFlow { get; private set; }
 
     /// <summary>P1.7: старт текущего риск-дня для дневного лимита символа.</summary>
     public decimal DayStartBalance => _dayStartBalance;
@@ -62,8 +78,11 @@ public sealed class DrawdownTracker
         _exchangeUtcNow = utcNow ?? throw new ArgumentNullException(nameof(utcNow));
     }
 
+    /// <summary>P0.1: обновить risk-метрики от mark-to-market equity.</summary>
+    public void UpdateEquity(decimal equity) => UpdateBalance(equity);
+
     /// <summary>
-    /// Обновить баланс.
+    /// Обновить баланс. P0.1: аргумент обязан быть equity, а не free cash.
     /// </summary>
     public void UpdateBalance(decimal newBalance)
     {
@@ -97,10 +116,24 @@ public sealed class DrawdownTracker
     }
 
     /// <summary>
+    /// P0.1: депозит/вывод/трансфер корректирует baseline, а не торговый PnL.
+    /// Положительный amount = ввод капитала, отрицательный = вывод.
+    /// </summary>
+    public void RegisterExternalCashFlow(decimal amount)
+    {
+        if (amount == 0m) return;
+        _peakBalance = Math.Max(0m, _peakBalance + amount);
+        _dayStartBalance = Math.Max(0m, _dayStartBalance + amount);
+        CumulativeExternalCashFlow += amount;
+        UpdateBalance(Math.Max(0m, CurrentBalance + amount));
+    }
+
+    /// <summary>
     /// P0.4: снимок состояния для персиста.
     /// </summary>
     public DrawdownState CaptureState() => new()
     {
+        CumulativeExternalCashFlow = CumulativeExternalCashFlow,
         PeakBalance = _peakBalance,
         DayStartBalance = _dayStartBalance,
         DayStartUtc = _currentDay,
@@ -119,6 +152,7 @@ public sealed class DrawdownTracker
     {
         ArgumentNullException.ThrowIfNull(state);
 
+        CumulativeExternalCashFlow = state.CumulativeExternalCashFlow;
         if (state.PeakBalance > 0)
             _peakBalance = state.PeakBalance;
 

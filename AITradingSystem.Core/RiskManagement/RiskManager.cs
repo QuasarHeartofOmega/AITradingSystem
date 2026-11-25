@@ -143,8 +143,11 @@ public sealed class RiskManager
         return true;
     }
 
+    /// <summary>P0.1: обновить risk-метрики от mark-to-market equity.</summary>
+    public void UpdateEquity(decimal equity) => _drawdownTracker.UpdateEquity(equity);
+
     /// <summary>
-    /// Обновить баланс после сделки.
+    /// Обновить баланс после сделки. Аргумент должен быть equity.
     /// </summary>
     public void UpdateBalance(decimal newBalance)
     {

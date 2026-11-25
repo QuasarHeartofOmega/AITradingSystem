@@ -1,7 +1,7 @@
 # PLAN-PROFIT-ENGINE — исправленный план превращения AITradingSystem в проверяемый торговый движок
 
 **Дата редакции:** 2026-11-26  
-**Статус:** активный план; runtime-аудит выполнен по предоставленным логам, код-исправления ещё не внесены  
+**Статус:** активный план; P0.1 и P0.2 код-изменения внесены локально, без сборок/тестовых прогонов; runtime-приёмка P0.1/P0.2 не выполнена  
 **Базовый документ:** `docs/history/PLAN-PROFIT-ENGINE.md` сохранён как история  
 **Ограничение аудита:** без сборок, тестовых прогонов и новых ордеров  
 **Главный вывод:** за 6 ч 47 м торговых решений получено 501 AI-предложение, 20 BUY, 0 отправленных ордеров, 0 филлов, 0 закрытых сделок. Прибыльность не доказана; сначала нужно починить учёт капитала, данные, журнал исходов и исполняемость.
@@ -84,28 +84,69 @@
 
 **Проблема:** `AvailableUSDT` используется как баланс для просадки, а затем из него вычитается капитал в позициях. При открытой позиции это может выглядеть как потеря денег.
 
+**Статус после локальных правок:** код внесён; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
+
 **Задачи:**
 
-- `[ ]` Ввести `AccountSnapshot`: `equity_quote`, `free_cash_quote`, `locked_cash_quote`, `position_notional_quote`, `unrealized_pnl_quote`, `account_id`, `environment`, `as_of_utc`.
-- `[ ]` `DrawdownTracker` обновлять только от mark-to-market equity, не от свободного USDT.
-- `[ ]` `GetFreeCash` брать из биржевого free/locked или из отдельного cash ledger, не вычитать notional из equity повторно.
-- `[ ]` Депозиты/выводы/трансферы корректировать baseline, а не считать торговым PnL.
-- `[ ]` Risk-state хранить по `(environment, account_id, quote_asset)`; не переносить пик Live в Demo и наоборот.
-- `[ ]` Логировать `RISK-SNAPSHOT`: equity, free, locked, peak, day_start, drawdown, daily_pnl, source.
+- `[~]` Ввести `AccountSnapshot`: `equity_quote`, `free_cash_quote`, `locked_cash_quote`, `position_notional_quote`, `unrealized_pnl_quote`, `account_id`, `environment`, `as_of_utc`.
+  - Добавлен `AITradingSystem.Core/Models/Trading/AccountSnapshot.cs` и `AITradingSystem.Services/Trading/AccountSnapshotService.cs`.
+  - Live/demo equity оценивает все положительные активы счёта; неполная оценка помечается `IsValuationComplete=false` и блокирует входы.
+- `[~]` `DrawdownTracker` обновлять только от mark-to-market equity, не от свободного USDT.
+  - Добавлен `UpdateEquity`; `TradingEngine` обновляет риск от `AccountSnapshot.EquityQuote`.
+- `[~]` `GetFreeCash` брать из биржевого free/locked или из отдельного cash ledger, не вычитать notional из equity повторно.
+  - `GetFreeCash()` теперь берёт `FreeCashQuote` из снимка; paper использует отдельный `_paperFreeCash` ledger.
+- `[~]` Депозиты/выводы/трансферы корректировать baseline, а не считать торговым PnL.
+  - Добавлены `DrawdownTracker.RegisterExternalCashFlow` и `TradingEngine.RegisterExternalCashFlowAsync`; автоматическое распознавание биржевых депозитов/выводов ещё не подключено.
+- `[~]` Risk-state хранить по `(environment, account_id, quote_asset)`; не переносить пик Live в Demo и наоборот.
+  - `JsonStateRepository` получил scoped save/load; legacy unscoped state не мигрируется автоматически в scoped.
+  - `IBinanceRestClient.AccountId` / `BinanceRestClient.AccountId` даёт не-секретный SHA-256 fingerprint API-ключа; paper account id задаётся `TradingConfig.PaperTradingAccountId`.
+- `[~]` Логировать `RISK-SNAPSHOT`: equity, free, locked, peak, day_start, drawdown, daily_pnl, source.
+  - Добавлен `TradeLog.RiskSnapshot`; вызывается при обновлении снимка капитала.
+
+**Изменённые файлы P0.1:**
+
+- `AITradingSystem.Core/Models/Trading/AccountSnapshot.cs` — новый снимок капитала.
+- `AITradingSystem.Services/Trading/AccountSnapshotService.cs` — построение live/demo и paper снимков.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — equity/free-cash интеграция, scoped risk-state, paper cash ledger, `RISK-SNAPSHOT`.
+- `AITradingSystem.Core/RiskManagement/DrawdownTracker.cs` — equity semantics, external cash flow baseline, scoped state fields.
+- `AITradingSystem.Core/RiskManagement/RiskManager.cs` — `UpdateEquity` passthrough.
+- `AITradingSystem.Data/Storage/IStateRepository.cs`, `AITradingSystem.Data/Storage/JsonStateRepository.cs` — scoped risk-state API/реализация.
+- `AITradingSystem.Data/Binance/IBinanceRestClient.cs`, `AITradingSystem.Data/Binance/BinanceRestClient.cs` — `AccountId` fingerprint.
+- `AITradingSystem.Common/Configuration/TradingConfig.cs` — `PaperTradingAccountId`.
+- `AITradingSystem.Common/Logging/LogChannels.cs` — `TradeLog.RiskSnapshot`.
 
 **Критерий:** открытие/закрытие позиции без изменения цены не создаёт ложную просадку; депозит не создаёт ложную прибыль.
+**Осталось для закрытия P0.1:** runtime-проверка критерия, автоматический учёт депозитов/выводов/трансферов из биржевого источника, проверка scoped-миграции и неполной оценки активов.
 
 ### P0.2. Kill-switch: персист, причина, сброс
 
+**Статус после локальных правок:** код внесён; сборки/тесты не запускались; runtime-критерий ещё не подтверждён.
+
 **Задачи:**
 
-- `[ ]` Персистить `kill_switch_engaged`, `reason`, `engaged_at`, `equity_at_engage`, `requires_manual_reset`.
-- `[ ]` При старте, если лимит всё ещё пробит, не разрешать входы до явного reset.
-- `[ ]` Логировать `KILL-SWITCH-ENGAGED`, `KILL-SWITCH-CLOSE-RESULT`, `KILL-SWITCH-RESET`, `KILL-SWITCH-RESET-DENIED`.
-- `[ ]` Reset не должен обнулять peak/day_start автоматически.
-- `[ ]` Если автозакрытие не удалось, статус `UNPROTECTED_OR_OPEN` и алерт, а не тихое продолжение.
+- `[~]` Персистить `kill_switch_engaged`, `reason`, `engaged_at`, `equity_at_engage`, `requires_manual_reset`.
+  - `DrawdownState` расширен полями kill-switch; `TradingEngine.PersistRiskStateAsync` сохраняет их в scoped risk-state.
+- `[~]` При старте, если лимит всё ещё пробит, не разрешать входы до явного reset.
+  - `StartAsync` восстанавливает engaged-состояние из scoped risk-state и логирует `KILL-SWITCH-RESTORED`.
+  - `ResetKillSwitchAsync` запрещает сброс, если лимит риска всё ещё пробит или остались открытые позиции.
+- `[~]` Логировать `KILL-SWITCH-ENGAGED`, `KILL-SWITCH-CLOSE-RESULT`, `KILL-SWITCH-RESET`, `KILL-SWITCH-RESET-DENIED`.
+  - Добавлены методы `TradeLog`; engage/close/reset/denied/restored пишутся в trade-log.
+- `[~]` Reset не должен обнулять peak/day_start автоматически.
+  - `ResetKillSwitchAsync` меняет только kill-switch состояние и персистит risk-state; `DrawdownTracker.ResetDaily` не вызывается.
+- `[~]` Если автозакрытие не удалось, статус `UNPROTECTED_OR_OPEN` и алерт, а не тихое продолжение.
+  - После `CloseAllPositionsAsync` статус становится `UNPROTECTED_OR_OPEN` при остатке позиций и пишется critical alert.
+  - UI-баннер показывает причину и статус закрытия.
+
+**Изменённые файлы P0.2:**
+
+- `AITradingSystem.Core/RiskManagement/DrawdownTracker.cs` — поля kill-switch в `DrawdownState`.
+- `AITradingSystem.Common/Logging/LogChannels.cs` — аудит-события kill-switch.
+- `AITradingSystem.Services/Trading/TradingEngine.cs` — persistence/restore/engage/close-result/guarded reset; snapshot-lock больше не удерживается во время аварийного закрытия.
+- `AITradingSystem.UI/ViewModels/TradingViewModel.cs` — UI reset вызывает guarded async reset.
+- `AITradingSystem.UI/ViewModels/MainViewModel.cs` — баннер показывает причину/статус kill-switch.
 
 **Критерий:** рестарт не «забывает» аварию; оператор видит причину и остаточные позиции.
+**Осталось для закрытия P0.2:** runtime-проверка рестарта после аварии, частичного/неудачного автозакрытия, denied reset и успешного reset без обнуления peak/day_start.
 
 ### P0.3. Market-data recovery: REST-прогрев ≠ живой WS
 

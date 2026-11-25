@@ -258,6 +258,9 @@ public sealed class TradingConfig
     /// </summary>
     public decimal PaperTradingInitialBalance { get; set; } = 10000m;
 
+    /// <summary>P0.1: идентификатор виртуального paper-счёта для изоляции risk-state.</summary>
+    public string PaperTradingAccountId { get; set; } = "default";
+
     /// <summary>
     /// Комиссия симулируемых сделок в paper-режиме (0.001 = 0.1% как на споте Binance).
     /// </summary>
