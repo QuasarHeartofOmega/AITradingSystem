@@ -1,594 +1,585 @@
-# PLAN-PROFIT-ENGINE — превращение AITradingSystem в систему с доказуемым преимуществом
+# PLAN-PROFIT-ENGINE — исправленный план превращения AITradingSystem в проверяемый торговый движок
 
-**Дата:** 2026-11-25
-**Статус:** план создан, задачи не выполнены
-**Заменяет:** `PLAN-ML-LLM-INTEGRATION.md` (удалён), `PLAN-10-10-LIVE-PROFIT.md` (поглощён и удалён)
-**Опирается на:** `SECUPD.md` (P0 7/7, P1 8/8, P2 5/6 — файловые правки), `ACTION-PLAN.md` (закрыт), `changes.md`, `plan.md`, `trdupd.md`
-**Ограничение:** без сборок/прогонов в рамках создания плана
-**Решение по ML:** обучаемых моделей в системе нет. Вероятность считается, а не предсказывается.
-**Решение по LLM:** остаётся, но в роли `VetoOnly` + объяснение, вне критического пути.
+**Дата редакции:** 2026-11-26  
+**Статус:** активный план; runtime-аудит выполнен по предоставленным логам, код-исправления ещё не внесены  
+**Базовый документ:** `docs/history/PLAN-PROFIT-ENGINE.md` сохранён как история  
+**Ограничение аудита:** без сборок, тестовых прогонов и новых ордеров  
+**Главный вывод:** за 6 ч 47 м торговых решений получено 501 AI-предложение, 20 BUY, 0 отправленных ордеров, 0 филлов, 0 закрытых сделок. Прибыльность не доказана; сначала нужно починить учёт капитала, данные, журнал исходов и исполняемость.
 
 ---
 
-## 0. Про «100% доходность»
+## 0. Что изменено относительно исторического плана
 
-Гарантии не существует, и обещать её нельзя. Достижимая цель формулируется в числах, которые можно проверить:
+Исторический план был правильным по направлению — статистика вместо «магии LLM», журнал исходов, EdgeGate, VetoOnly, защита вне LLM. Но runtime-аудит выявил проблемы, которых в нём не было или которые были сформулированы слишком оптимистично:
+
+1. **Equity и free cash смешаны.** `TradingEngine` обновляет `DrawdownTracker` через `AvailableUSDT`, а `GetFreeCash` вычитает из этого баланса ещё и notional открытых позиций. Это может создавать ложную просадку и двойное ограничение кэша.
+2. **Kill-switch и risk-state не имеют достаточной runtime-трассы.** В логе есть отказы, но нет видимых переходов engage/reset, персиста и причины 50% просадки.
+3. **Market-data recovery зацикливается.** `DATA-RECOVERED` чередуется со `stale-kline`; REST-прогрев не доказывает, что WS снова delivering.
+4. **LLM фактически блокирует последовательный цикл.** Среднее 47.25 с на символ, суммарно ~6.57 ч инференса за ~6.78 ч окна решений.
+5. **Post-only и OCO не подтверждены runtime.** План должен начинаться с контролируемого Demo smoke-test, а не со статистики.
+6. **Paper post-only симулирует мгновенный филл.** Это завышает fill probability и делает paper-статистику непригодной для EdgeGate.
+7. **Wilson lower bound по win rate недостаточен для EV.** Нужен нижний доверительный интервал среднего net R, а не только вероятности TP.
+8. **`min_samples=200` не магическое число.** Нужна проверка мощности, ширины интервала, walk-forward и деградации.
+9. **Риск разорения нельзя обещать как «≈0».** Можно ограничивать ставку, убыток и экспозицию; гэпы и stop-limit всё равно дают хвостовой риск.
+10. **Новости и стабильные монеты требуют отдельной политики.** `USDCUSDT`/`FDUSDUSDT` не должны оцениваться как обычный volatile-актив; отсутствие новостей не является ни bullish, ни bearish доказательством.
+
+---
+
+## 1. Целевые метрики без гарантий доходности
 
 | Метрика | Цель | Где считается |
 |---|---|---|
-| `net_expectancy` после всех издержек | ≥ 0.15 R по **нижней границе** | `EdgeEngine` + `BucketTable` |
-| Риск разорения | ≈ 0 при лимитах и просадке | `PortfolioRiskManager`, `DrawdownTracker` |
-| Максимальная просадка | в пределах заданного лимита, дальше kill-switch | `DrawdownTracker` (персист уже есть) |
-| Убыточные периоды | система сама снижает риск и останавливает входы | мониторинг деградации |
-| Время решения на символ | детерминированный путь < 100 ms, LLM вне пути | бюджеты в конфиге |
-| Полнота журнала | 100% решений с причиной отказа | `OutcomeLedger`, «ИТОГ …» уже есть |
-| Доказуемость | ни один вход без `n ≥ min_samples` и `EV_lower > 0` | `ProfitabilityGate` |
+| `net_expectancy_R` | нижняя граница > 0 после всех издержек | `EdgeEngine` + `BucketTable` |
+| `expectancy_lower_bound` | bootstrap/t-интервал по net R, не только Wilson win rate | `EmpiricalEdgeEstimator` |
+| `fill_probability` | отдельно по post-only bucket, горизонт и режим | `ExecutionOutcomeLedger` |
+| `adverse_selection` | движение цены против maker-филла через 1/5/15 мин | `ExecutionQualityMonitor` |
+| `slippage_R` | фактическое отклонение от reference mid/arrival price | `ExecutionQualityMonitor` |
+| `max_drawdown` | в пределах лимита, дальше kill-switch | `DrawdownTracker` |
+| `risk_of_ruin` | оценка по распределению net R и ставке, не гарантия нуля | `CapitalRiskModel` |
+| `decision_latency` | детерминированный путь без LLM; целевой бюджет задаётся конфигом | `DecisionMetrics` |
+| `journal_coverage` | 100% решений имеют `decision_id`, стадию и причину | `OutcomeLedger` |
+| `live_gate` | Live запрещён без runtime-приёмки и положительного edge | `ProfitabilityGate` |
 
-Рост капитала = `expectancy × частота × сайзинг × время`. Удвоение — следствие этих множителей, а не наличие «умной модели». Всё, что ниже, направлено на первый множитель и на то, чтобы четвёртый не обрывался аварией.
-
----
-
-## 1. Что уже сделано и НЕ переделывается
-
-По `SECUPD.md` внесены файловые правки (⚠️ это не runtime-приёмка):
-
-| Блок | Что есть в коде |
-|---|---|
-| P0.1–P0.7 | биржевые стоп-ордера, независимый контур мониторинга, очередь исполнения с приоритетами и идемпотентностью по `clientOrderId`, персист `DrawdownTracker`, реконсиляция + user-data stream, kill-switch, защита от случайного Live |
-| P1.1–P1.8 | slippage-модель в paper, комиссии в R/R и безубытке, округления tick/step/minNotional, целостность данных после реконнекта WS, фильтр ликвидности, обработка 429/-1003 и бюджет весов, портфельный риск, дрейф часов |
-| P2.1–P2.5 | диагностика CALIBRATE/Rejected, убран двойной штраф в промпте, политика уверенности 0.7/0.3, `MinConfidence` из данных, расширенный детект дегенерата |
-| ACTION-PLAN | «ИТОГ {символ}: …» для каждого решения, TP-FIX, релевантность новостей (`News:AllowGeneralNewsFallback=false`) |
-| trdupd/changes | `KvManagedExecutor`, `DegenerateOutputDetector`, Qwen3-сэмплеры, жёсткий think-бюджет, KV-reuse, таймаут 180 с |
-
-**Не сделано:** `SECUPD P2.6` (валидация весов скоринга) и всё, что касается статистического преимущества, событийного veto, ступенчатого допуска и авто-деградации.
-
-Существующие опоры, которые план использует вместо написания с нуля:
-
-```text
-Core/Models/Trading/ScoringCalibration.cs     ReliabilityBin: Trades/Wins/WinRate/ExpectancyR/Gap/Qualifies
-Core/Models/Trading/ConfidenceExpectancy.cs   корзины, sweep порогов, ExpectancyR, fail-safe по MinTrades
-Core/RiskManagement/TradeCostModel.cs         комиссии обеих ног, NetRiskReward, NetPnlPerUnit, BreakEvenPrice
-Services/Analysis/SignalCalibrator.cs         PreScore → EngineScore (направление, prior, компоненты)
-Services/Analysis/ConfidenceThresholdTuner.cs подбор MinConfidence по expectancy
-Data/News/NewsSymbolMapper.cs                 NameToTicker, Bullish/BearishWords, credibility
-Data/Storage/JsonTradeHistoryRepository.cs    история сделок
-Services/Trading/ExecutionQueue.cs            приоритеты, идемпотентность
-```
+Рост капитала = `expectancy × frequency × sizing × time`. Если expectancy не доказана, увеличение частоты или сайзинга только ускоряет убыток.
 
 ---
 
-## 2. Целевой цикл принятия решения
+## 2. Runtime-приёмка E0: что уже подтверждено
 
-```text
-0 ИНФРАСТРУКТУРА   время · rate-limit · реконсиляция · equity · protection · kill-switch · capital stage
-1 ДАННЫЕ           свеча закрыта, не stale, спред/глубина в норме
-2 РЕЖИМ            RegimeRules: подходит ли режим стратегии
-3 СОБЫТИЯ          EventCatalog: delisting/hack/depeg/outage/макро → veto
-4 PreScore         детерминированно: направление + prior + признаки
-5 СТАТИСТИКА       BucketKey → BucketTable → p_lower, n, coverage
-6 EDGE GATE        EV_lower = p_lower·R_tp − (1−p_lower) − costs_R  > порога
-7 LLM VETO         асинхронно, вне пути: может только запретить
-8 ФИЛЬТР           FINAL confidence ≥ MinConfidence (вторичный)
-9 ПОРТФЕЛЬ         exposure · correlation · drawdown · daily loss
-10 САЙЗИНГ         от equity, edge и ATR — детерминированно
-11 ИСПОЛНЕНИЕ      post-only entry → биржевые SL/TP → journal → реконсиляция
-12 МОНИТОР         SL/TP/trailing — не зависит ни от LLM, ни от таблицы
-13 ИСХОД           OutcomeRecord → пересчёт BucketTable → контроль деградации
-```
+Легенда:
 
-Правило: **разрешение = все гейты сказали «да». Любой «нет» = HOLD с причиной в журнале.**
+- `[x]` подтверждено предоставленным runtime-логом;
+- `[~]` частично подтверждено, но есть дефект или неполная трасса;
+- `[ ]` не подтверждено / не наблюдалось.
 
----
+| Блок | Статус | Факт из логов | Что требуется |
+|---|---|---|---|
+| Demo environment | `[x]` | REST `demo-api.binance.com`, режим REAL ORDERS | зафиксировать environment/account id в каждом run |
+| Market WS | `[~]` | 22 стрима подключены; явных disconnect нет | per-symbol freshness, resubscribe, gap metrics |
+| AI load / GPU | `[~]` | Vulkan, 23/41 слоёв, CPU fallback | обновить llama.cpp, измерить latency/CPU/GPU |
+| PreScore / Calibrate / ИТОГ | `[x]` | 502 PreScore, 501 AI, 583 ИТОГ | structured decision journal |
+| Confidence gate | `[x]` | 16 отказов | отделить model conf от engine prior и edge |
+| Risk gate | `[~]` | 4 отказа MaxDrawdown 50% | проверить equity/free-cash/deposit/peak |
+| Kill-switch block | `[~]` | 11 отказов | persist engaged state, engage/reset audit |
+| Market-data fail-closed | `[~]` | 71 отказ, но recovery loops | исправить stale-kline после REST recovery |
+| Order submit / fill | `[ ]` | 0 наблюдаемых | Demo smoke-test post-only и market |
+| OCO SL/TP | `[ ]` | нет постановки/срабатывания | Demo smoke-test обеих ног |
+| Independent protection monitor | `[~]` | MONITOR-START есть | тест во время занятого LLM/паузы/сети |
+| Idempotency | `[ ]` | нет повторной отправки | тест duplicate clientOrderId |
+| Risk-state persistence | `[ ]` | нет RISK-STATE-RESTORED | тест рестарта после убытка/просадки |
+| User-data stream | `[ ]` | 410 POST userDataStream | проверить Demo support/fail-closed |
+| Reconciliation | `[ ]` | нет RECON-SUMMARY | orphan order/OCO/position tests |
+| 429 / -1003 | `[ ]` | не наблюдались | контролируемый weight-budget test |
+| Tick/step/minNotional | `[ ]` | до filters не дошло | тесты на BTTC/STRAX/FLR и dust |
+| Portfolio/symbol/cash caps | `[ ]` | до sizing не дошло | логировать requested/capped quantity |
+| PnL / fees / slippage | `[ ]` | нет закрытых сделок | журнал филлов и net R |
 
-## 3. Роль LLM: где она действительно полезна
-
-### 3.1. Что оставляем
-
-```text
-VetoOnly:
-  распознать новую формулировку новой беды, которой нет в словаре
-  право только запретить вход; молчание не является разрешением
-  асинхронно после закрытия свечи, кэш на символ, бюджет 15–20 с
-  опоздала → вход по символу в этой свече пропущен
-  недоступна → rules-only veto работает, EV-порог строже
-
-Explainer:
-  человекочитаемое «почему отказал/вошёл» для Telegram и UI
-  вызывается ПОСЛЕ решения, на решение не влияет
-```
-
-Почему именно veto: асимметрия. Цена ошибки veto — пропущенная прибыль (ограничена). Цена пропущенного события — −3R…−10R на гэпе, делистинге, депеге (не ограничена). Один предотвращённый катастрофический вход окупает сотню пропущенных мелких.
-
-### 3.2. Что забираем
-
-```text
-предложение действия BUY/SELL как источник входа   → вход только из engine-сетапа
-confidence как вероятность прибыли                → в EV не подставляется
-Hold→Prior / EngineOverride как источник входа     → выключены в Live
-SL/TP, размер, плечо, риск-проценты, kill-switch    → недоступны
-место в критическом пути SL/TP/protection          → исключено
-```
-
-Побочный выигрыш: если LLM не порождает входов, `action_source` один. Бакеты наполняются из исторического replay сразу, а не месяцами живых сделок. LLM сохраняется **и** система становится проверяемой быстро.
-
-### 3.3. Как измеряем пользу
-
-Отклонённые сигналы продолжают считаться в тени: их исходы пишутся отдельно.
-
-```text
-veto_coverage      доля входов, отклонённых LLM
-veto_precision     доля отклонённых, которые были бы убыточными
-avoided_R          сумма предотвращённых убытков в R
-unique_veto        случаи, где правила промолчали, а LLM запретила
-false_veto_cost    упущенная прибыль отклонённых прибыльных
-```
-
-Через 200–300 сигналов видно, зарабатывает LLM деньги или тратит их. Если `avoided_R` не покрывает `false_veto_cost` — роль сжимается до explainer.
+**E0 нельзя считать закрытым.** Сначала закрыть P0-дефекты ниже, затем повторить Demo-приёмку.
 
 ---
 
-## 4. Статистическое ядро вместо ML
+## 3. P0: исправить до любой статистики и Live
 
-### 4.1. BucketKey и оценка
+### P0.1. Разделить equity, free cash, locked и position notional
 
-```text
-BucketKey (3–5 признаков, не 30):
-  symbol_group
-  setup_direction     LONG / FLAT / SHORT из EngineScore.Direction
-  prior_band          корзина EngineScore.PriorConfidence
-  regime              trend / range / panic / low_liquidity
-  atr_quantile        3–4 корзины
-  spread_bucket       2–3 корзины
-  horizon_H
+**Проблема:** `AvailableUSDT` используется как баланс для просадки, а затем из него вычитается капитал в позициях. При открытой позиции это может выглядеть как потеря денег.
 
-p_hat         = k / n
-p_lower_bound = WilsonLower(k, n, z = 1.96)
+**Задачи:**
 
-fallback при n < min_samples:
-  0 полный кортеж → 1 убрать слабый признак → 2 direction×regime → 3 direction
-  ниже min_samples и на уровне 3 → insufficient → вход запрещён
+- `[ ]` Ввести `AccountSnapshot`: `equity_quote`, `free_cash_quote`, `locked_cash_quote`, `position_notional_quote`, `unrealized_pnl_quote`, `account_id`, `environment`, `as_of_utc`.
+- `[ ]` `DrawdownTracker` обновлять только от mark-to-market equity, не от свободного USDT.
+- `[ ]` `GetFreeCash` брать из биржевого free/locked или из отдельного cash ledger, не вычитать notional из equity повторно.
+- `[ ]` Депозиты/выводы/трансферы корректировать baseline, а не считать торговым PnL.
+- `[ ]` Risk-state хранить по `(environment, account_id, quote_asset)`; не переносить пик Live в Demo и наоборот.
+- `[ ]` Логировать `RISK-SNAPSHOT`: equity, free, locked, peak, day_start, drawdown, daily_pnl, source.
 
-границы корзин фиксируются по квантилям train-периода
-признак, дробящий бакеты ниже min_samples, отклоняется
-```
+**Критерий:** открытие/закрытие позиции без изменения цены не создаёт ложную просадку; депозит не создаёт ложную прибыль.
 
-`ReliabilityBin` уже считает всё нужное — обобщается ключ корзины с confidence на `BucketKey` плюс интервальная оценка. Диагностические пороги (`MinTrades=40`, `MinBinTrades=10`) остаются для диагностики; **допуск** требует `min_samples=200` и нижнюю границу.
+### P0.2. Kill-switch: персист, причина, сброс
 
-### 4.2. EV считается явно
+**Задачи:**
 
-```text
-R_tp    = |TP − entry| / |entry − SL|
-costs_R = (fee_entry + fee_exit + spread + expected_slippage) / risk_distance
+- `[ ]` Персистить `kill_switch_engaged`, `reason`, `engaged_at`, `equity_at_engage`, `requires_manual_reset`.
+- `[ ]` При старте, если лимит всё ещё пробит, не разрешать входы до явного reset.
+- `[ ]` Логировать `KILL-SWITCH-ENGAGED`, `KILL-SWITCH-CLOSE-RESULT`, `KILL-SWITCH-RESET`, `KILL-SWITCH-RESET-DENIED`.
+- `[ ]` Reset не должен обнулять peak/day_start автоматически.
+- `[ ]` Если автозакрытие не удалось, статус `UNPROTECTED_OR_OPEN` и алерт, а не тихое продолжение.
 
-EV       = p_hat         · R_tp − (1 − p_hat)         − costs_R
-EV_lower = p_lower_bound · R_tp − (1 − p_lower_bound) − costs_R
-```
+**Критерий:** рестарт не «забывает» аварию; оператор видит причину и остаточные позиции.
 
-Источник издержек — `TradeCostModel`. Никакой модели здесь нет и быть не должно.
+### P0.3. Market-data recovery: REST-прогрев ≠ живой WS
 
-### 4.3. Валидация весов скоринга (остаток SECUPD P2.6)
+**Проблема:** `DATA-RECOVERED` повторяется 101 раз, но `stale-kline` продолжается для ENJ/STRAX/FDUSD/DASH.
 
-`ScoringCalibration` уже выдаёт вердикты `Dead / Contradicts / Confirmed / Neutral`. Не хватает решения по ним:
+**Задачи:**
 
-```text
-Dead        → вес обнуляется по явному флагу, не молча
-Contradicts → компонент исключается из prior, событие логируется
-Confirmed   → остаётся
-Insufficient→ ничего не меняется
-Изменение весов — только через версионированный артефакт и откат
-```
+- `[ ]` Разделить `history_reloaded` и `stream_live`.
+- `[ ]` После REST recovery требовать свежий WS tick по символу в течение `N` секунд.
+- `[ ]` Если WS молчит: resubscribe symbol/stream, затем reconnect, затем quarantine.
+- `[ ]` Не писать `DATA-RECOVERED` как «входы разрешены», пока не подтверждён live tick и стакан.
+- [ ] Логировать `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-WS-RESUBSCRIBE`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE`.
+- `[ ]` Счётчики: stale_blocks, recovery_attempts, recovery_success, mean_time_to_live.
+
+**Критерий:** нет бесконечного цикла recovered → stale; символ либо жив, либо явно карантинирован.
+
+### P0.4. User-data stream и реконсиляция fail-closed
+
+**Проблема:** `410 POST /userDataStream`; дальнейшая работа stream/recon не подтверждена.
+
+**Задачи:**
+
+- `[ ]` Явно проверить поддержку user-data stream в Demo/Testnet/Live.
+- `[ ]` Если stream обязателен для режима, при недоступности запретить новые входы.
+- `[ ]` Если разрешён fallback polling, задать интервал и логировать `EXECUTION-MODE=POLLING-FALLBACK`.
+- `[ ]` Реконсиляция должна писать `RECON-START`, `RECON-SUMMARY`, `RECON-FAIL`, `RECON-ADOPT`, `RECON-CANCEL`, `PROTECTION-FILL-APPLIED`.
+- `[ ]` При неизвестном состоянии ордера/позиции — freeze entries, не угадывать.
+
+**Критерий:** бот не считает ордер исполненным только потому, что REST-запрос был отправлен.
+
+### P0.5. LLM вне последовательного критического пути
+
+**Проблема:** 14B на RX590 с частичным оффлоадом даёт ~47 с на решение и почти полностью занимает цикл.
+
+**Задачи:**
+
+- `[ ]` Добавить `AI.Enabled` и `AI.Role = Off | Shadow | VetoOnly | Explainer`.
+- `[ ]` Для baseline допустить `Role=Off` или `Shadow`; вход только из engine setup + EdgeGate.
+- `[ ]` Deterministic path не ждёт LLM.
+- `[ ]` Veto вызывается асинхронно на закрытой свече, кэш на `(symbol, candle_close, config_hash)`.
+- `[ ]` Жёсткий бюджет, например 5–15 с; опоздал → veto не применён к уже принятому решению, но событие логируется.
+- `[ ]` Для VetoOnly отключить thinking или использовать меньшую модель; 14B explainer — отдельно.
+- `[ ]` Timeout/parse fail/degenerate не разрешают вход и не блокируют защиту.
+- `[ ]` Метрики: `llm_latency`, `veto_coverage`, `unique_veto`, `avoided_R`, `false_veto_cost`.
+
+**Критерий:** выключение LLM не ломает торговый контур; польза LLM измеряется в R.
+
+### P0.6. Символы и стабильные пары
+
+**Задачи:**
+
+- `[ ]` Явно разделить `volatile_symbols`, `stablecoin_pairs`, `benchmark_symbols`.
+- `[ ]` `USDCUSDT`/`FDUSDUSDT` не анализировать как обычный трендовый актив; либо исключить, либо отдельная depeg/liquidity strategy.
+- `[ ]` `FLRUSDT` и другие unavailable symbols логировать с причиной и не включать в active universe.
+- `[ ]` Запретить BUY, если engine direction = SHORT и нет отдельного reversal setup.
+- `[ ]` В начале сессии логировать effective config hash и active/excluded symbols.
+
+**Критерий:** список анализируемых символов совпадает с торговым смыслом стратегии.
 
 ---
 
-## 5. Новости и события без LLM
+## 4. E1: журнал решений, ордеров и исходов
 
-Текущий дефект: `NewsSymbolMapper.ScoreSentiment` даёт скаляр, стирая тип события. `hack` и `lawsuit` дают похожий минус, хотя первое — немедленный запрет, второе — шум.
+### 4.1. Decision journal
+
+Каждое решение получает `decision_id` и `run_id`. Минимальная запись:
+
+```json
+{
+  "ts_utc": "...",
+  "run_id": "...",
+  "decision_id": "...",
+  "symbol": "BTCUSDT",
+  "candle_close_utc": "...",
+  "stage": "confidence|risk|cash|sizing|filters|liquidity|post-only|exchange|protection|edge|coverage|event|llm-veto|market-data|kill-switch",
+  "outcome": "ALLOW|REJECT|HOLD|ERROR",
+  "reason_code": "...",
+  "reason_text": "...",
+  "engine_direction": "LONG|SHORT|FLAT",
+  "engine_prior": 0.0,
+  "model_action": "BUY|SELL|HOLD|CLOSE|null",
+  "model_confidence": null,
+  "final_confidence": null,
+  "bucket_key": "...",
+  "config_hash": "...",
+  "data_snapshot_hash": "..."
+}
+```
+
+Требования:
+
+- `[ ]` Один финальный исход на `decision_id`.
+- `[ ]` Все ранние return пишут причину, включая cooldown, max positions, no-book, warmup.
+- `[ ]` Отказы до AI и после AI разделены.
+- `[ ]` HOLD без позиции не считается сделкой и не попадает в win rate.
+- `[ ]` Логи человека и machine-readable journal не заменяют друг друга.
+
+### 4.2. Execution journal
+
+События на каждый ордер:
 
 ```text
-Порядок: заголовок → event_type → severity → действие
+INTENT_CREATED
+SUBMIT_REQUESTED
+SUBMIT_ACK / SUBMIT_REJECTED
+ORDER_NEW
+PARTIAL_FILL
+FILLED
+CANCEL_REQUESTED
+CANCELED
+EXPIRED
+REJECTED
+POST_ONLY_REJECTED
+CANCEL_AUDIT
+PROTECTION_INTENT
+PROTECTION_ACK / PROTECTION_REJECTED
+PROTECTION_FILLED
+PROTECTION_REPLACED
+PROTECTION_GONE
+EMERGENCY_CLOSE
+RECON_ADOPT / RECON_CANCEL
+```
 
-BLOCK        delisting · trading halt · exchange outage · depeg · hack/exploit
-REDUCE       regulatory enforcement · macro publication window · UNKNOWN_RISK
-IGNORE       listing · partnership · upgrade (не является разрешением)
+Поля: `client_order_id`, `exchange_order_id`, `list_id`, `side`, `type`, `time_in_force`, `post_only`, `requested_qty`, `rounded_qty`, `limit_price`, `arrival_mid`, `best_bid/ask`, `filled_qty`, `avg_fill_price`, `fee`, `fee_asset`, `latency_ms`, `reject_code`, `cancel_reason`.
+
+### 4.3. Outcome ledger
+
+`OutcomeRecord` должен хранить:
+
+```text
+decision_id, symbol, bucket_key, bucket_level, estimator_version,
+source = replay|shadow|paper|demo|live,
+entry_intent_id, entry_fill_id, exit_fill_id,
+initial_risk_quote, initial_risk_R,
+realized_gross_R, realized_fee_R, realized_slippage_R, realized_net_R,
+exit_reason = TP|SL|TRAILING|BREAKEVEN|AI_CLOSE|MANUAL|EMERGENCY|TIME_STOP|RECON,
+holding_seconds, mae_R, mfe_R,
+protection_confirmed, unprotected_seconds,
+veto_by, event_flags,
+data_snapshot_hash, config_hash
+```
+
+Задачи:
+
+- `[ ]` Сохранять point-in-time признаки на момент сигнала.
+- `[ ]` Запретить future leakage: границы бакетов и веса фиксируются до теста.
+- `[ ]` Неисполненные post-only entry писать как `NO_FILL`, а не как убыток/прибыль.
+- `[ ]` Отменённые/истекшие ордера имеют отдельный исход.
+- `[ ]` Частичные филлы и хвосты после отмены аудируются.
+- `[ ]` Replay должен моделировать очередь/ликвидность консервативно, не считать каждый сигнал исполненным.
+
+---
+
+## 5. E2: BucketTable и статистическое ядро
+
+### 5.1. BucketKey
+
+Начать с малого числа признаков:
+
+```text
+symbol_group
+setup_direction
+regime
+prior_band
+atr_quantile
+spread_bucket
+depth_bucket
+horizon
+execution_type = post_only|market
+```
+
+Правила:
+
+- `[ ]` Границы корзин фиксируются по train-периоду.
+- `[ ]` Признак, дробящий бакеты ниже минимального покрытия, отклоняется.
+- `[ ]` Fallback: полный ключ → убрать слабый признак → direction×regime → direction.
+- `[ ]` Ниже минимального покрытия → `INSUFFICIENT_COVERAGE`, вход запрещён.
+- `[ ]` Версионировать `bucket_definition_hash`, `artifact_hash`, `train_window`, `embargo`.
+
+### 5.2. Оценка edge
+
+Историческая формула `p_lower·R_tp − (1−p_lower) − costs_R` полезна как грубая модель, но недостаточна:
+
+- выходы бывают trailing/breakeven/time-stop/manual;
+- R/R плавает;
+- fill probability < 1;
+- maker-филлы имеют adverse selection;
+- комиссии и проскальзывание уже входят в net R, их нельзя вычитать дважды.
+
+Целевая оценка:
+
+```text
+net_R_i = realized_gross_R_i - fee_R_i - slippage_R_i - gap_penalty_R_i
+EV_hat = mean(net_R_i)
+EV_lower = lower_confidence_bound(mean(net_R_i), method=bootstrap|t, alpha=0.05)
+```
 
 Дополнительно:
-  дедуп по нормализованному заголовку (одна история из 5 источников ≠ 5 событий)
-  окно свежести + порог credibility источника
-  правила отрицания: denies/rejects/delays/not рядом с ключевым словом меняют знак
-  severity-критичное событие требует 2 независимых источников или анонса биржи
-  макро-календарь по расписанию — парсить нечего
-```
-
-Два заменителя «понимания»:
 
 ```text
-UNKNOWN_RISK: свежая новость + сильные негативные голоса + высокий credibility
-              + тип не распознан → снизить риск или запретить вход
-РЫНОЧНАЯ АНОМАЛИЯ: резкое движение + всплеск объёма + расширение спреда
-              → событие происходит, даже если фид молчит
+win_rate_lower = WilsonLower(k, n)
+fill_probability = filled_intents / submitted_intents
+expected_net_per_intent = fill_probability * EV_per_fill - no_fill_opportunity_cost
 ```
 
-Остаточный риск перефразировки признаётся и покрывается консервативно: система скорее пропустит выгодную сделку, чем войдёт в катастрофу. LLM закрывает часть этого зазора в роли veto.
+Задачи:
+
+- `[ ]` Реализовать `EmpiricalEdgeEstimator` по net R.
+- `[ ]` Wilson оставить для диагностики win rate, не как единственный EV gate.
+- `[ ]` Walk-forward, purged split, embargo.
+- `[ ]` Проверять ширину интервала и стабильность по окнам.
+- `[ ]` `min_samples` задавать по мощности/ширине интервала, не магическим 200.
+- `[ ]` Reliability/Brier/ECE считать отдельно для engine prior, model confidence и bucket probability.
+- `[ ]` Закрыть SECUPD P2.6: `Dead/Contradicts` веса исключаются только через версионированный артефакт.
 
 ---
 
-## 6. Исполнение: чего не хватает поверх сделанного
+## 6. E3: EdgeGate и запрет недоказанного Live
 
-Сделано: биржевые стопы, очередь с идемпотентностью, округления, ликвидность, 429-бюджет, реконсиляция.
-
-Не сделано:
+Порядок гейтов:
 
 ```text
-post-only entry с контролем жизни ордера:
-  таймаут жизни, отмена при уходе цены, запрет догоняющего market-входа
-подтверждение защиты:
-  вход не считается состоявшимся, пока биржа не подтвердила SL/TP
-crash-safe:
-  восстановление незавершённых намерений после падения (частично есть в ExecutionQueue)
-гэп через stop-limit:
-  учёт риска гэпа в costs_R и в решении о типе стопа
-таблицы исполнения (счётчики, не модели):
-  fill_probability, expected_slippage, adverse_selection по бакетам size×depth×vol
+0 infrastructure: clock, rate-limit, account snapshot, recon, kill-switch
+1 data: closed candle, fresh kline, fresh book
+2 symbol policy: volatile/stable/benchmark, direction alignment
+3 regime rules
+4 event veto / blackout
+5 deterministic setup + PreScore
+6 BucketTable coverage
+7 EdgeGate: EV_lower > threshold, interval width acceptable
+8 optional LLM VetoOnly
+9 confidence secondary filter
+10 portfolio risk / correlation / daily loss
+11 sizing: equity, risk, ATR, cash, symbol cap, portfolio cap
+12 filters: tick/step/minQty/minNotional
+13 liquidity: spread/depth/notional ratio
+14 execution: post-only lifecycle
+15 protection: OCO confirmed
+16 monitor and outcome ledger
 ```
+
+Задачи:
+
+- `[ ]` `ProfitabilityGate` до сайзинга.
+- `[ ]` Запрет входа при `insufficient coverage`, `stale table`, широком интервале, `EV_lower <= threshold`.
+- `[ ]` `AI.MinConfidence` вторичен и не заменяет edge.
+- `[ ]` Live запрещён, пока E0 не закрыт и edge не доказан на Demo/shadow.
+- `[ ]` Каждый отказ имеет `reason_code` и числовые поля.
+- `[ ]` Сравнивать old gate (`MinConfidence`) и new gate (`EV_lower`) в shadow.
 
 ---
 
-## 7. Капитал и риск разорения
+## 7. E4: новости, события и режимы
+
+Текущий скалярный sentiment стирает тип события. Нужен каталог:
 
 ```text
-сайзинг: от equity (не от свободного USDT), от edge и ATR, с потолком на сделку
-лимиты: на символ, на актив, на коррелированную группу, суммарная экспозиция
-просадка: DrawdownTracker (персист есть) → throttle → kill-switch
-дневной убыток: отдельный лимит и остановка
-риск разорения: оценка по expectancy, дисперсии и размеру ставки; запрет конфигураций, где он не пренебрежимо мал
-ступени капитала: минимальная → следующая только после N сделок и удержания expectancy
-запрет «улучшения» без данных: увеличение риска после серии убытков, снятие лимитов вручную в Live
+BLOCK: delisting, trading halt, exchange outage, depeg, hack/exploit
+REDUCE: regulatory enforcement, macro window, unknown risk
+IGNORE: listing, partnership, upgrade — не является разрешением на вход
 ```
+
+Задачи:
+
+- `[ ]` `config/event-catalog.json`: типы, severity, keywords, negation, actions.
+- `[ ]` Дедуп по нормализованному заголовку.
+- `[ ]` Окно свежести и credibility.
+- `[ ]` Критичное событие: 2 независимых источника или официальный анонс биржи/эмитента.
+- `[ ]` Макро-календарь и blackout-окна без парсинга новостей.
+- `[ ]` Рыночная аномалия: движение + объём + спред.
+- `[ ]` Для stablecoin pairs отдельный depeg-контур.
+- `[ ]` LLM не является единственным детектором критичного события.
+- `[ ]` Prompt injection: новости — недоверенный текст, не инструкции.
+
+Критерий: событийный запрет работает без LLM и объясним одной строкой.
 
 ---
 
-## 8. Надёжность и поставка
+## 8. E5: LLM VetoOnly / Shadow / Off
 
-```text
-headless trading service: торговля не зависит от открытого окна WPF
-fail-closed: критическая зависимость недоступна → новые входы запрещены, защита работает
-секреты: DPAPI (есть), запрет ключей и полных дампов аккаунта в логах и промптах
-воспроизводимая поставка: версии нативных DLL зафиксированы (llama.cpp ≥ b9892 из-за Vulkan-мусора)
-runtime-приёмка: всё, что в SECUPD помечено ✅, проверено на Demo, а не только в коде
-наблюдаемость: метрики гейтов, отказов, latency, деградации; алерты в Telegram
-```
+Задачи:
 
----
-
-## 9. Данные и журнал
-
-```text
-TradeRecord расширяется: BucketKey, bucket_level, estimator_version,
-                         initial_risk, realized_costs, source (replay|paper|live), veto_by
-OutcomeLedger поверх ITradeHistoryRepository
-point-in-time snapshots признаков на момент сигнала, запрет future leakage
-исторический replay engine-сетапа: тысячи исходов вместо десятков живых сделок
-тень отклонённых: исходы сигналов, запрещённых veto, считаются отдельно
-разделение диагностики и допуска: разные пороги, разные отчёты
-```
-
----
-
-## 10. Этапы
-
-Легенда: `[ ]` не сделано, `[x]` сделано, `⚠️` требует внешнего решения (Windows/GPU/Binance).
-
-## E0. Runtime-приёмка уже внесённого
-
-**Задачи:**
-
-- `[ ]` Прогнать Demo и подтвердить фактическую работу биржевых стопов, независимого монитора, реконсиляции и kill-switch.
-- `[ ]` Подтвердить идемпотентность очереди по `clientOrderId` при повторной отправке.
-- `[ ]` Подтвердить персист просадки после перезапуска.
-- `[ ]` Подтвердить округления tick/step/minNotional на реальных символах.
-- `[ ]` Подтвердить бюджет весов и поведение при 429/-1003.
-- `[ ]` Зафиксировать baseline: сколько сигналов, сколько отказов и на какой стадии.
-- `[ ]` Обновить `SECUPD.md`: файловые ✅ перевести в runtime-подтверждённые или откатить статус.
-
-**Критерий:**
-
-```text
-Известно, что реально работает, а не что записано в трекере.
-Есть baseline решений, с которым сравнивать новый гейт.
-```
-
----
-
-## E1. Журнал исходов и point-in-time
-
-**Задачи:**
-
-- `[ ]` Добавить `OutcomeRecord` и `IOutcomeLedger` поверх `ITradeHistoryRepository`.
-- `[ ]` Расширить `TradeRecord`: `BucketKey`, `initial_risk`, `realized_costs`, `source`, `veto_by`.
-- `[ ]` Сохранять point-in-time признаки на момент сигнала.
-- `[ ]` Реализовать исторический replay `PreScore` + правила стратегии.
-- `[ ]` Записать консервативные издержки для replay и фактические для paper/live.
-- `[ ]` Учесть неисполненные и отменённые entry.
-- `[ ]` Проверить наполненность планируемых бакетов, отклонить дробящие признаки.
-
-**Критерий:**
-
-```text
-Частоты можно посчитать, а не угадать. Известно, какие бакеты наполнены.
-```
-
----
-
-## E2. Статистическое ядро
-
-**Задачи:**
-
-- `[ ]` Реализовать `WilsonBounds`.
-- `[ ]` Реализовать `BucketKey`, `BucketDefinition`, `BucketTable` как версионируемый артефакт.
-- `[ ]` Обобщить агрегацию `ScoringCalibration` с корзин confidence на `BucketKey`.
-- `[ ]` Реализовать иерархический fallback и `EmpiricalEdgeEstimator`.
-- `[ ]` Реализовать offline-пересчёт по расписанию, версионирование и откат.
-- `[ ]` Walk-forward, purged split, embargo; проверка покрытия частоты интервалом.
-- `[ ]` Reliability/Brier/ECE по бакетам; отдельная reliability по LLM confidence как диагностика.
-- `[ ]` Закрыть `SECUPD P2.6`: решения по вердиктам `Dead/Contradicts`, версионирование весов.
-- `[ ]` Зафиксировать `min_samples`, `z`, границы корзин, `artifact_hash`.
-
-**Критерий:**
-
-```text
-Оценщик даёт консервативную вероятность с известным n или честно отказывает.
-Веса скоринга меняются по данным и откатываются, а не на глаз.
-```
-
----
-
-## E3. Edge Gate и запрет убыточного Live
-
-**Задачи:**
-
-- `[ ]` Реализовать `costs_R` на `TradeCostModel` с учётом гэпа и проскальзывания.
-- `[ ]` Реализовать `EdgeEngine`: `EV` и `EV_lower` явными формулами.
-- `[ ]` Реализовать `ProfitabilityGate` и встроить до сайзинга.
-- `[ ]` Запретить вход при `insufficient coverage`, `stale table`, широком интервале.
-- `[ ]` Запретить вход при `EV_lower <= 0`.
-- `[ ]` Оставить `AI.MinConfidence` вторичным фильтром.
-- `[ ]` Запретить Live целиком, если преимущество не доказано (режим Paper/Demo).
-- `[ ]` Логировать причину каждого отказа одной строкой «ИТОГ …».
-
-**Критерий:**
-
-```text
-Ни один вход не проходит без положительного EV по нижней границе.
-Уверенность LLM не является достаточным основанием для входа.
-```
-
----
-
-## E4. События, режим, аномалии
-
-**Задачи:**
-
-- `[ ]` Создать `config/event-catalog.json`: типы, severity, ключевые слова, действия.
-- `[ ]` Реализовать `RuleBasedEventVeto` поверх `NewsSymbolMapper` и `NewsAggregator`.
-- `[ ]` Добавить дедуп по нормализованному заголовку и окно свежести.
-- `[ ]` Добавить правила отрицания и требование двух источников для критичных событий.
-- `[ ]` Реализовать `UNKNOWN_RISK` через голоса толпы и credibility.
-- `[ ]` Реализовать макро-календарь и blackout-окна.
-- `[ ]` Реализовать `RegimeRules` и запрет входа при несовместимом режиме.
-- `[ ]` Реализовать детектор рыночной аномалии (движение + объём + спред).
-- `[ ]` Логировать каждый veto с типом события и источником.
-
-**Критерий:**
-
-```text
-Событийный запрет работает без LLM и объясним одной строкой лога.
-```
-
----
-
-## E5. LLM в роли VetoOnly
-
-**Задачи:**
-
-- `[ ]` Ввести `AI.Role = VetoOnly | Off | Explainer` и `AI.Enabled`.
-- `[ ]` Игнорировать предложение входа от LLM: вход только из engine-сетапа.
-- `[ ]` Выключить `Hold→Prior` и `EngineOverride` как источник входа в Live.
-- `[ ]` Переписать промпт: задача — найти причину запретить, а не оценить вероятность.
-- `[ ]` Добавить в контракт `veto`, `veto_reason`, `event_type`, `risk_flags`, `invalidation`.
-- `[ ]` Строгая валидация схемы; битый JSON/дегенерат/таймаут не разрешают вход.
-- `[ ]` Асинхронный вызов после закрытия свечи, кэш на символ, бюджет 15–20 с.
-- `[ ]` Убедиться, что путь SL/TP/protection не ждёт LLM.
-- `[ ]` Реализовать explainer отдельно от решения (пост-фактум текст для Telegram/UI).
+- `[ ]` `AI.Role` и `AI.Enabled`.
+- `[ ]` Вход только из engine setup; LLM BUY не создаёт ордер.
+- `[ ]` `Hold→Prior` и `EngineOverride` не являются источником входа в Live.
+- `[ ]` Контракт veto: `veto`, `veto_reason`, `event_type`, `risk_flags`, `invalidation`.
+- `[ ]` Строгая JSON-схема; битый JSON/дегенерат/timeout не разрешают вход.
+- `[ ]` Асинхронный вызов, кэш, бюджет, отмена по устареванию свечи.
+- `[ ]` SL/TP/protection никогда не ждут LLM.
+- `[ ]` Explainer вызывается после решения.
 - `[ ]` Тень отклонённых: считать исходы veto-сигналов.
-- `[ ]` Метрики `veto_precision`, `avoided_R`, `unique_veto`, `false_veto_cost`.
-- `[ ]` Проверить устойчивость к prompt injection в новостях.
+- `[ ]` Метрики: `veto_precision`, `avoided_R`, `unique_veto`, `false_veto_cost`, `llm_latency`.
+- `[ ]` Если `avoided_R <= false_veto_cost` на достаточной выборке — роль сжимается до explainer/off.
 
-**Критерий:**
-
-```text
-LLM может только запретить и объяснить. Её польза измеряется в R, а не в вере.
-Задержка LLM не влияет на защитный путь и не блокирует другие символы.
-```
+Критерий: LLM может только запретить и объяснить; её польза измерена в R.
 
 ---
 
-## E6. Исполнение
+## 9. E6: исполнение, post-only и защита
 
-**Задачи:**
+### 9.1. Post-only lifecycle
 
-- `[ ]` Post-only entry с таймаутом жизни и отменой при уходе цены.
+Текущий код:
+
+- ставит `LIMIT_MAKER`;
+- ждёт `OrderFillTimeoutSeconds`;
+- отменяет остаток;
+- не догоняет market-входом.
+
+Но runtime не подтвердил это, а paper симулирует мгновенный филл.
+
+Задачи:
+
+- `[ ]` Demo smoke-test: успешный maker fill, post-only reject, timeout cancel, partial fill, cancel race.
+- `[ ]` Отмена при уходе цены/спреда за допустимый коридор, не только по таймауту.
 - `[ ]` Запрет догоняющего market-входа после отмены.
-- `[ ]` Подтверждение биржевой защиты как условие состоявшегося входа.
-- `[ ]` Crash-safe восстановление незавершённых намерений.
-- `[ ]` Учёт риска гэпа через stop-limit в `costs_R`.
-- `[ ]` Таблицы `fill_probability` и `expected_slippage` по бакетам.
-- `[ ]` Мониторинг качества исполнения: серия ошибок → пауза.
+- `[ ]` Частичный филл защищается немедленно; остаток отменяется и аудируется.
+- `[ ]` `fill_probability` считать по submitted intents, а не по AI-сигналам.
+- `[ ]` Paper post-only моделировать очередь/вероятность филла, а не мгновенное исполнение.
+- `[ ]` Метрики: `time_to_fill`, `fill_ratio`, `post_only_reject_rate`, `cancel_rate`, `expired_rate`.
 
-**Критерий:**
+### 9.2. Adverse selection и slippage
+
+Для каждого maker-филла:
 
 ```text
-Позиция не остаётся без защиты ни при отказе сети, ни при падении процесса.
-Издержки в EV соответствуют фактическим, а не оптимистичным.
+arrival_mid
+fill_price
+mid_after_1m / 5m / 15m
+adverse_selection_R = side_sign * (mid_after - fill_price) / initial_risk
+slippage_vs_arrival = side_sign * (fill_price - arrival_mid) / initial_risk
 ```
+
+Задачи:
+
+- `[ ]` Таблицы `fill_probability`, `expected_slippage`, `adverse_selection` по bucket `size×depth×vol×spread`.
+- `[ ]` EdgeGate использует ожидаемые издержки исполнения, а не только комиссию.
+- `[ ]` Серия плохих филлов → пауза symbol/execution mode.
+
+### 9.3. Защита
+
+Задачи:
+
+- `[ ]` Вход не считается состоявшимся для статистики, пока OCO не подтверждена.
+- `[ ]` Если OCO не поставлена: аварийное закрытие или quarantine, в зависимости от режима.
+- `[ ]` Crash-safe intent journal: восстановить незавершённый entry/protection после падения.
+- `[ ]` Учитывать гэп через stop-limit: stop может не исполниться по limit.
+- `[ ]` `unprotected_seconds` и `protection_missing` — метрики и алерты.
+- `[ ]` Тест: LLM занята, UI закрыт, сеть моргнула, процесс упал — защита/реконсиляция восстанавливают состояние.
+
+Критерий: позиция не остаётся неуправляемой; издержки в EV соответствуют фактическим.
 
 ---
 
-## E7. Капитал и риск разорения
+## 10. E7: капитал, сайзинг и риск разорения
 
-**Задачи:**
+Задачи:
 
-- `[ ]` Сайзинг от equity, edge и ATR с потолком на сделку.
-- `[ ]` Лимиты на символ, актив, коррелированную группу, суммарную экспозицию.
+- `[ ]` Сайзинг от equity, initial risk, ATR и edge; не от свободного USDT как equity.
+- `[ ]` Явный журнал: `requested_qty`, `risk_qty`, `cash_cap_qty`, `symbol_cap_qty`, `portfolio_cap_qty`, `correlation_cap_qty`, `rounded_qty`, `final_qty`.
+- `[ ]` Лимиты: символ, актив, коррелированная группа, суммарная экспозиция, max open positions.
 - `[ ]` Throttle и kill-switch по просадке и дневному убытку.
-- `[ ]` Оценка риска разорения и запрет конфигураций с недопустимым значением.
-- `[ ]` Ступени капитала с условиями перехода и понижения.
-- `[ ]` Запрет ручного снятия лимитов в Live и увеличения риска после убытков.
+- `[ ]` Loss-streak pause и symbol daily loss limit подтверждаются runtime.
+- `[ ]` Оценка риска разорения по распределению net R, ставке и хвостовым сценариям.
+- `[ ]` Ступени капитала: минимальная → следующая только после N сделок и удержания expectancy.
+- `[ ]` Запрет увеличения риска после убытков и ручного снятия лимитов в Live без отдельного audit flow.
 
-**Критерий:**
-
-```text
-Ни одна серия убытков не приводит к разорению: система снижает риск и останавливается.
-```
+Критерий: система снижает риск и останавливается при деградации; нельзя обещать нулевой риск разорения.
 
 ---
 
-## E8. Надёжность и поставка
+## 11. E8: надёжность, поставка, безопасность
 
-**Задачи:**
+Задачи:
 
 - `[ ]` Headless-режим: торговля не зависит от окна WPF.
 - `[ ]` Fail-closed для критических зависимостей.
-- `[ ]` Проверить отсутствие ключей и полных дампов аккаунта в логах и промптах.
-- `[ ]` Зафиксировать версии нативных DLL (llama.cpp ≥ b9892).
-- `[ ]` Воспроизводимая поставка и понятный откат версии.
-- `[ ]` Метрики гейтов, отказов, latency и деградации; алерты в Telegram.
-- `[ ]` Обновить `README.md`: режимы, риски, что означает Demo против Paper.
-
-**Критерий:**
-
-```text
-Падение UI, сети или модели не превращается в неуправляемую позицию.
-Поставку можно повторить и откатить.
-```
+- `[ ]` Секреты: DPAPI, маскирование, запрет полных дампов аккаунта в логах/промптах.
+- `[ ]` Зафиксировать версии нативных DLL; для AMD Polaris/RX590 обновить llama.cpp до версии с исправлением кластерного мусора.
+- `[ ]` Воспроизводимая поставка и откат версии.
+- `[ ]` Метрики гейтов, отказов, latency, деградации; алерты в Telegram.
+- `[ ]` Effective config hash в каждом run.
+- `[ ]` README и assessment обновляются после каждой runtime-приёмки.
 
 ---
 
-## E9. Shadow → Live ramp-up → авто-деградация
+## 12. E9: Shadow → Demo acceptance → Live ramp-up
 
-**Задачи:**
+Этапы:
 
-- `[ ]` Shadow: новый гейт рядом со старым, без влияния на ордера.
-- `[ ]` Сравнить old (`MinConfidence`) и new (`EV_lower`) по net expectancy.
-- `[ ]` Измерить долю отказов по coverage и влияние на частоту сделок.
-- `[ ]` Измерить расхождение replay-издержек и фактических.
-- `[ ]` Live только на минимальной ступени капитала.
-- `[ ]` Мониторить наполненность бакетов, расхождение `p` и факта, expectancy decay.
-- `[ ]` Авто-снижение риска и авто-запрет входов при потере преимущества.
+1. **Replay/shadow:** engine setup + BucketTable + EdgeGate без ордеров.
+2. **Demo execution acceptance:** post-only, OCO, cancel, partial, recon, kill-switch, risk-state, 429-budget.
+3. **Demo edge validation:** достаточное покрытие, положительный `EV_lower`, стабильность walk-forward.
+4. **Live minimum capital:** только если Demo acceptance закрыт и edge не деградировал.
+5. **Auto-degradation:** снижение риска/запрет входов при потере edge, росте slippage/adverse selection, ошибках исполнения.
+
+Задачи:
+
+- `[ ]` Shadow сравнивает old/new gate по net expectancy и частоте.
+- `[ ]` Измерять долю отказов coverage и влияние на frequency.
+- `[ ]` Измерять расхождение replay-издержек и фактических.
+- `[ ]` Мониторить наполненность бакетов, расхождение p и факта, expectancy decay.
 - `[ ]` Пересчёт таблиц по расписанию, approval по хешу, откат версии.
 - `[ ]` Переход на следующую ступень только по факту удержания expectancy.
 
-**Критерий:**
+---
+
+## 13. События, необходимые для BucketTable / EdgeGate
+
+Минимальный набор:
 
 ```text
-Система не торгует по устаревшей статистике и не масштабирует убыток.
+DECISION_CREATED
+GATE_RESULT
+PRE_SCORE_SNAPSHOT
+BUCKET_ASSIGNED
+EDGE_ESTIMATE
+LLM_VETO_RESULT
+SIZING_BREAKDOWN
+ORDER_INTENT
+ORDER_SUBMIT
+ORDER_STATUS
+ORDER_FILL
+ORDER_CANCEL
+ORDER_EXPIRE
+ORDER_REJECT
+PROTECTION_STATUS
+POSITION_OPEN
+POSITION_UPDATE
+POSITION_CLOSE
+OUTCOME_RECORDED
+RISK_SNAPSHOT
+KILL_SWITCH
+RECONCILIATION
+DATA_HEALTH
+EXECUTION_QUALITY
 ```
+
+Без этих событий нельзя честно посчитать:
+
+- coverage бакетов;
+- fill probability;
+- expected slippage;
+- adverse selection;
+- net expectancy;
+- вклад LLM;
+- частоту и причины отказов;
+- деградацию преимущества.
 
 ---
 
-## 11. Runtime-гейты
-
-| Гейт | Условие | Действие при нарушении |
-|---|---|---|
-| Infrastructure | время, rate-limit, реконсиляция, equity | запрет новых входов |
-| Protection | биржевая защита подтверждена | аварийное закрытие / запрет входов |
-| Kill-switch | не сработал | остановка |
-| Capital | капитал на разрешённой ступени | понижение / остановка |
-| Data | свеча закрыта, не stale | запрет входа |
-| Liquidity | спред/глубина допустимы | запрет входа |
-| Regime | режим совместим со стратегией | запрет входа по символу |
-| Event | нет BLOCK-события и blackout | запрет входа |
-| Coverage | `n ≥ min_samples`, таблица свежа | запрет входа |
-| Edge | `EV_lower > порога` | запрет входа |
-| LLM veto | `veto = false` | запрет входа |
-| Confidence | `FINAL ≥ MinConfidence` | запрет входа |
-| Portfolio | лимиты, correlation, drawdown, daily loss | запрет / throttle / kill-switch |
-| Execution | нет серии ошибок исполнения | пауза / остановка |
-
----
-
-## 12. Что создать, переписать, удалить
-
-### Создать
+## 14. Критерии готовности
 
 ```text
-Core/Models/Trading/BucketKey.cs · BucketDefinition.cs · BucketTable.cs
-Core/Models/Trading/WilsonBounds.cs · EdgeEstimate.cs · OutcomeRecord.cs
-Services/Analysis/EmpiricalEdgeEstimator.cs · EstimatorRegistry.cs
-Services/Analysis/EdgeEngine.cs · ProfitabilityGate.cs · StalenessMonitor.cs
-Services/Analysis/RegimeRules.cs · EventCatalog.cs · RuleBasedEventVeto.cs
-Services/Analysis/MarketAnomalyDetector.cs · MacroCalendar.cs
-Services/Analysis/LlmVetoService.cs · DecisionExplainer.cs
-Data/Storage/JsonOutcomeLedger.cs · JsonBucketTableRepository.cs
-config/event-catalog.json
-```
-
-### Переписать
-
-```text
-Services/Trading/TradingEngine.cs        порядок гейтов, BucketKey, EV до сайзинга
-Services/AI/PromptBuilder.cs             задача «найти причину запретить», новые поля
-Services/AI/QwenModel.cs                 строгая схема, veto, асинхронный контур
-Services/Analysis/SignalCalibrator.cs    PreScore — источник признаков; confidence не вероятность
-Services/Analysis/SentimentAnalyzer.cs   структурированные события вместо только текста
-Core/Models/Trading/ScoringCalibration.cs агрегация по BucketKey, решения по вердиктам весов
-Core/Models/Trading/TradeRecord.cs       поля бакета, издержек, источника, veto_by
-Core/Models/Trading/TradingSignal.cs     Veto/VetoReason/EventType/RiskFlags
-Common/Configuration/AIConfig.cs         Role, бюджеты, кэш; секции Edge и Events
-```
-
-### Удалить / не создавать
-
-```text
-Обучение любых моделей, ONNX, Python, champion/challenger, retrain-pipeline
-LLM как источник входа и как источник вероятности
-Hold→Prior и EngineOverride как источник входа в Live
-Скалярный sentiment как основание решения (заменён типом события)
-Обещания гарантированной доходности в UI и документации
-```
-
-### Файлы планов
-
-```text
-Удалены:  PLAN-ML-LLM-INTEGRATION.md (и .orig), PLAN-10-10-LIVE-PROFIT.md (поглощён), plann.md (дубликат plan.md)
-Оставлены: SECUPD.md (трекер внесённого), ACTION-PLAN.md (закрыт), plan.md (история),
-           changes.md (журнал), trdupd.md (обоснование Qwen-пакета), README.md
-Новый:     PLAN-PROFIT-ENGINE.md (этот файл) — единственный активный план
-```
-
----
-
-## 13. Критерии готовности
-
-```text
-Всё из SECUPD подтверждено на Demo, а не только в коде.
-Журнал исходов наполнен, replay даёт тысячи записей, бакеты известны.
-Оценщик даёт p, нижнюю границу и n; при нехватке данных отказывает.
-EV и EV_lower считаются явно на TradeCostModel.
-Ни один вход не проходит без EV_lower > порога и достаточной выборки.
-Событийный veto и режимные правила работают без LLM.
-LLM работает как VetoOnly и explainer, её польза измерена в R.
-Защитный путь не зависит ни от LLM, ни от статистики.
-Позиция никогда не остаётся без биржевой защиты.
-Риск разорения пренебрежимо мал, ступени капитала работают.
-Деградация преимущества автоматически снижает риск и запрещает входы.
+E0 закрыт на Demo, а не только в коде.
+Equity/free-cash/deposit accounting проверен.
+Kill-switch переживает рестарт и имеет audit trail.
+Market-data recovery не зацикливается.
+User-data/recon подтверждены или включён явный polling fallback.
+Журнал решений и исходов покрывает 100% decision_id.
+Post-only fill/cancel/partial/reject подтверждены.
+OCO SL/TP/trailing/emergency close подтверждены.
+BucketTable версионирована, coverage известна.
+EV_lower считается по net R, а не только по win rate.
+Ни один Live-вход не проходит без coverage и положительного edge.
+LLM вне критического пути; её польза измерена или роль отключена.
+Защита не зависит от LLM и статистики.
+Риск разорения оценён, лимиты и деградация работают.
 Поставка воспроизводима, версии зафиксированы, откат возможен.
-В системе нет обучаемых моделей и нет обещаний гарантированной прибыли.
+Нет обещаний гарантированной прибыли.
 ```
 
 ---
 
-## 14. Итог
+## 15. Итог
 
-Правила ставят запреты. Счётчик собственных исходов даёт консервативную вероятность. LLM добавляет право запретить и человеческое объяснение. Движок разрешает только при положительном матожидании по нижней границе. Риск считает размер и останавливает систему. Execution ставит защиту и подтверждает её. Исход возвращается в счётчик.
-
-Это не «100% доходность». Это система, которая не платит за неподтверждённые убеждения и не разоряется, пока накапливает доказательства.
+Сначала сделать систему **наблюдаемой и исполняемой**, затем **статистически проверяемой**, и только потом масштабировать капитал. Текущий baseline показывает не прибыльность, а отсутствие исполненных входов и несколько инфраструктурных/учётных дефектов. Главный приоритет — не «ещё одна модель», а корректный капитал, живой рынок, журнал исходов, post-only/OCO acceptance и EdgeGate по net R.
