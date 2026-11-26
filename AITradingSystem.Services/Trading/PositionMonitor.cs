@@ -229,6 +229,9 @@ public sealed class PositionMonitor : IAsyncDisposable
             if (ct.IsCancellationRequested)
                 break;
 
+            if (position.NeedsManualDustReview)
+                continue;
+
             var hasTick = _ticks.TryGetValue(position.Symbol, out var tick);
             var freshTick = hasTick &&
                             (!_lastProcessedTickUtc.TryGetValue(position.Symbol, out var processed) ||
@@ -274,6 +277,8 @@ public sealed class PositionMonitor : IAsyncDisposable
                     return;
 
                 position = live;
+                if (position.NeedsManualDustReview)
+                    return;
                 _lastCheckUtc[position.Id] = DateTime.UtcNow;
                 Interlocked.Increment(ref _checksProcessed);
 

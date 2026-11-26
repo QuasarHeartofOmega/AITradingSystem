@@ -45,17 +45,16 @@ public class DustPolicyTests
     // === PlanClose: dust-маршруты ===
 
     [Fact]
-    public void PlanClose_BelowStepSize_SellDust_GoesMarketWithExactQuantity()
+    public void PlanClose_BelowStepSize_SellDust_Rejects_NoFilterExemption()
     {
-        // 0.04 при stepSize 0.1 округляется в ноль — обычный ордер невозможен.
+        // 0.04 при stepSize 0.1 округляется в ноль — ordinary MARKET тоже будет отклонён.
         var plan = DustPolicy.PlanClose(
             OrderSide.Sell, positionQuantity: 0.04m, referencePrice: 100m,
             stepSize: 0.1m, minQty: 0.01m, minNotional: 5m,
             iocEnabled: true, dustMarketCloseEnabled: true);
 
-        Assert.Equal(DustPolicy.DustCloseRoute.DustMarketSell, plan.Route);
-        // Full-balance exemption срабатывает только при продаже ТОЧНОГО остатка — без округления.
-        Assert.Equal(0.04m, plan.Quantity);
+        Assert.Equal(DustPolicy.DustCloseRoute.Reject, plan.Route);
+        Assert.Contains("ручной аудит", plan.Reason);
     }
 
     [Fact]
@@ -70,7 +69,7 @@ public class DustPolicyTests
     }
 
     [Fact]
-    public void PlanClose_BelowMinQty_SellDust_GoesMarket()
+    public void PlanClose_BelowMinQty_SellDust_Rejects()
     {
         // 0.5 кратна stepSize 0.1, но ниже minQty 1 — LIMIT/обычный MARKET будут отклонены.
         var plan = DustPolicy.PlanClose(
@@ -78,12 +77,11 @@ public class DustPolicyTests
             stepSize: 0.1m, minQty: 1m, minNotional: 5m,
             iocEnabled: true, dustMarketCloseEnabled: true);
 
-        Assert.Equal(DustPolicy.DustCloseRoute.DustMarketSell, plan.Route);
-        Assert.Equal(0.5m, plan.Quantity);
+        Assert.Equal(DustPolicy.DustCloseRoute.Reject, plan.Route);
     }
 
     [Fact]
-    public void PlanClose_BelowMinNotional_SellDust_GoesMarket()
+    public void PlanClose_BelowMinNotional_SellDust_Rejects()
     {
         // Объём формально валиден (2 >= minQty 1), но нотариал 2×2=4 < minNotional 5.
         var plan = DustPolicy.PlanClose(
@@ -91,8 +89,7 @@ public class DustPolicyTests
             stepSize: 0.1m, minQty: 1m, minNotional: 5m,
             iocEnabled: true, dustMarketCloseEnabled: true);
 
-        Assert.Equal(DustPolicy.DustCloseRoute.DustMarketSell, plan.Route);
-        Assert.Equal(2m, plan.Quantity);
+        Assert.Equal(DustPolicy.DustCloseRoute.Reject, plan.Route);
     }
 
     [Fact]
@@ -105,7 +102,7 @@ public class DustPolicyTests
             iocEnabled: true, dustMarketCloseEnabled: true);
 
         Assert.Equal(DustPolicy.DustCloseRoute.Reject, plan.Route);
-        Assert.Contains("BUY", plan.Reason);
+        Assert.Contains("ручной аудит", plan.Reason);
     }
 
     [Fact]
@@ -117,6 +114,17 @@ public class DustPolicyTests
 
         Assert.Equal(DustPolicy.DustCloseRoute.IocLimit, plan.Route);
         Assert.Equal(10.55m, plan.Quantity);
+    }
+
+    [Fact]
+    public void PlanClose_XrpDust_WithMarketFilters_StillRejectsBelowMinNotional()
+    {
+        var plan = DustPolicy.PlanClose(
+            OrderSide.Sell, 0.0247m, 0.954m, 0.1m, 0.1m, 5m,
+            iocEnabled: false, dustMarketCloseEnabled: true,
+            marketStepSize: 0m, marketMinQty: 0m, applyMinNotionalToMarket: true);
+        Assert.Equal(DustPolicy.DustCloseRoute.Reject, plan.Route);
+        Assert.Contains("MARKET_LOT_SIZE", plan.Reason);
     }
 
     // === ClassifyCancelResidual: аудит «отменённый остаток vs фактический филл» ===

@@ -10,10 +10,10 @@ namespace AITradingSystem.Core.Models.Trading;
 /// Такой остаток возникает при округлении защиты к stepSize («хвост» OCO),
 /// после частичных филлов и при подхвате сиротских балансов (P0.5).
 ///
-/// Единственный штатный выход на споте Binance — MARKET SELL всего остатка базового
-/// актива: биржа пропускает его мимо LOT_SIZE/MIN_NOTIONAL (full-balance exemption).
-/// Для BUY-закрытия (покрытие шорта) такого исключения нет — на споте шорты и так
-/// запрещены (AllowShort=false), поэтому BUY-dust отклоняется и уходит в ручной аудит.
+/// Обычный спотовый ордер не получает «full-balance exemption»: MARKET SELL ниже
+/// LOT_SIZE/MARKET_LOT_SIZE или применимого MIN_NOTIONAL/NOTIONAL будет отклонён.
+/// Такой остаток нельзя автоматически закрыть через /api/v3/order; он помечается для
+/// ручного аудита/конвертации пыли, а не отправляется в бесконечный цикл отказов.
 ///
 /// Класс чистый (без I/O) — решения тестируются без сети и биржи.
 /// </summary>
@@ -28,7 +28,7 @@ public static class DustPolicy
         /// <summary>MARKET без cap (аварийный выход или выключенный slippage-guard).</summary>
         Market = 1,
 
-        /// <summary>Dust: MARKET SELL точного объёма (full-balance exemption), LIMIT невозможен.</summary>
+        /// <summary>Legacy-маршрут; больше не используется: ordinary MARKET не обходит фильтры.</summary>
         DustMarketSell = 2,
 
         /// <summary>Закрытие невозможно — остаток слишком мал/сторона не поддерживает dust-маршрут.</summary>
@@ -37,8 +37,8 @@ public static class DustPolicy
 
     /// <summary>
     /// Решение по закрытию: маршрут, объём к отправке и причина отказа.
-    /// Для <see cref="DustCloseRoute.DustMarketSell"/> объём — ТОЧНЫЙ остаток позиции
-    /// (не округлённый): full-balance exemption срабатывает только при продаже всего остатка.
+    /// Dust-остаток ниже фильтров возвращается как <see cref="DustCloseRoute.Reject"/>;
+    /// автоматическая отправка заведомо невалидного MARKET запрещена.
     /// </summary>
     public sealed record ClosePlan(DustCloseRoute Route, decimal Quantity, string? Reason);
 
@@ -76,31 +76,28 @@ public static class DustPolicy
         decimal minQty,
         decimal minNotional,
         bool iocEnabled,
-        bool dustMarketCloseEnabled)
+        bool dustMarketCloseEnabled,
+        decimal marketStepSize = 0m,
+        decimal marketMinQty = 0m,
+        bool applyMinNotionalToMarket = true)
     {
         if (positionQuantity <= 0m)
             return new ClosePlan(DustCloseRoute.Reject, positionQuantity, "объём позиции <= 0");
 
-        var rounded = RoundDownToStep(positionQuantity, stepSize);
-
-        // Dust: округлённый объём меньше шага, minQty или minNotional — обычный ордер
-        // (и LIMIT, и MARKET не «на весь остаток») биржа отклонит.
+        // LIMIT/OCO используют LOT_SIZE; MARKET — MARKET_LOT_SIZE, если он задан.
+        var effectiveStep = iocEnabled ? stepSize : (marketStepSize > 0m ? marketStepSize : stepSize);
+        var effectiveMinQty = iocEnabled ? minQty : (marketMinQty > 0m ? marketMinQty : minQty);
+        var rounded = RoundDownToStep(positionQuantity, effectiveStep);
+        var notionalApplies = iocEnabled || applyMinNotionalToMarket;
         var isDust = rounded <= 0m
-            || (minQty > 0m && rounded < minQty)
-            || (minNotional > 0m && referencePrice > 0m && rounded * referencePrice < minNotional);
+            || (effectiveMinQty > 0m && rounded < effectiveMinQty)
+            || (notionalApplies && minNotional > 0m && referencePrice > 0m && rounded * referencePrice < minNotional);
 
         if (isDust)
         {
-            if (closeSide == OrderSide.Sell && dustMarketCloseEnabled)
-                return new ClosePlan(
-                    DustCloseRoute.DustMarketSell, positionQuantity,
-                    "dust: остаток ниже stepSize/minQty/minNotional — MARKET SELL всего остатка (full-balance exemption)");
-
             return new ClosePlan(
                 DustCloseRoute.Reject, Math.Max(rounded, 0m),
-                closeSide == OrderSide.Sell
-                    ? "dust: остаток ниже фильтров, dust-закрытие MARKET отключено (Trading:DustMarketCloseEnabled=false) — нужен ручной аудит"
-                    : "dust: BUY-закрытие остатка ниже фильтров на споте невозможно (full-balance exemption только для SELL) — нужен ручной аудит");
+                $"dust: остаток {positionQuantity} ниже фильтров {(iocEnabled ? "LOT_SIZE" : "MARKET_LOT_SIZE")}/minNotional — ordinary MARKET не обходит фильтры; нужен ручной аудит/конвертация пыли");
         }
 
         return iocEnabled
@@ -136,7 +133,7 @@ public static class DustPolicy
     /// <summary>
     /// P1.3: «хвост» защиты — насколько объём OCO (после округления к stepSize)
     /// меньше объёма позиции. Хвост не защищён биржевыми ногами; после срабатывания
-    /// ноги он становится dust-остатком и закрывается маршрутом DustMarketSell.
+    /// ноги он становится dust-остатком и уходит в ручной аудит, а не в невалидный MARKET.
     /// </summary>
     public static decimal ProtectionTail(decimal positionQuantity, decimal protectionQuantity)
     {

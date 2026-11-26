@@ -337,10 +337,9 @@ public sealed class TradingConfig
     public bool EmergencyMarketExitBypassSlippageCap { get; set; } = true;
 
     /// <summary>
-    /// P1.3: dust-закрытие — MARKET SELL всего остатка базового актива, когда остаток ниже
-    /// stepSize/minQty/minNotional (Binance spot пропускает такой MARKET SELL мимо фильтров
-    /// LOT_SIZE/MIN_NOTIONAL). При выключении dust-остаток не закрывается, а уходит в лог/метрики
-    /// для ручного аудита. BUY-закрытие dust на споте невозможно в любом случае.
+    /// Legacy-совместимость. Ordinary MARKET SELL не обходит фильтры биржи; остаток ниже
+    /// LOT_SIZE/MARKET_LOT_SIZE/NOTIONAL помечается для ручного аудита/конвертации пыли.
+    /// Значение ключа больше не включает заведомо невалидную отправку.
     /// </summary>
     public bool DustMarketCloseEnabled { get; set; } = true;
 

@@ -455,9 +455,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             var bypassCap = emergency && _tradingConfig.EmergencyMarketExitBypassSlippageCap;
             var useIoc = _tradingConfig.MarketExitSlippageGuardEnabled && !bypassCap;
 
-            // P1.3: выбор маршрута закрытия — округление к stepSize и проверка minQty/minNotional
-            // вынесены в DustPolicy. Остаток ниже фильтров (dust) уходит MARKET SELL точного объёма
-            // под full-balance exemption; раньше такое закрытие отклонялось и позиция зависала навсегда.
+            // P1.3: ordinary MARKET не обходит LOT_SIZE/MARKET_LOT_SIZE/NOTIONAL.
+            // Остаток ниже фильтров помечается для ручного аудита и не отправляется на биржу.
             var reference = side == OrderSide.Sell
                 ? currentOrderBook?.BestBid ?? position.CurrentPrice
                 : currentOrderBook?.BestAsk ?? position.CurrentPrice;
@@ -489,13 +488,20 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             var plan = DustPolicy.PlanClose(
                 side, liveQuantity, reference,
                 info?.StepSize ?? 0m, info?.MinQty ?? 0m, info?.MinNotional ?? 0m,
-                useIoc, _tradingConfig.DustMarketCloseEnabled);
+                useIoc, _tradingConfig.DustMarketCloseEnabled,
+                info?.MarketStepSize ?? 0m, info?.MarketMinQty ?? 0m,
+                info?.ApplyMinNotionalToMarket ?? true);
 
             if (plan.Route == DustPolicy.DustCloseRoute.Reject)
             {
                 _logger.LogError("Не удалось закрыть {Symbol}: {Reason} (qty={Quantity})",
                     position.Symbol, plan.Reason, liveQuantity);
                 TradeLog.Rejected(position.Symbol, "close", plan.Reason ?? "quantity после округления <= 0");
+                if ((plan.Reason ?? string.Empty).Contains("dust:", StringComparison.OrdinalIgnoreCase))
+                {
+                    position.MarkDustForManualReview(liveQuantity, plan.Reason ?? "dust below exchange filters");
+                    _metrics?.RecordDustClose(rejected: true);
+                }
                 await RestoreProtectionAfterFailedCloseAsync(position, ct);
                 return null;
             }
@@ -569,6 +575,15 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             }
 
             return validated;
+        }
+        catch (BinanceApiException ex) when (ex.IsOrderFilterFailure)
+        {
+            position.MarkDustForManualReview(position.Quantity, ex.ApiMessage);
+            _metrics?.RecordDustClose(rejected: true);
+            TradeLog.Rejected(position.Symbol, "close-filter",
+                $"биржа отклонила ордер по фильтрам ({ex.ApiMessage}); автоматические повторы остановлены, нужен ручной аудит");
+            _logger.LogError(ex, "Фильтры биржи отклонили закрытие {Symbol}", position.Symbol);
+            return null;
         }
         catch (BinanceApiException ex) when (ex.IsInsufficientBalance)
         {
@@ -794,9 +809,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             return null;
         }
 
-        // P1.3: «хвост» защиты — объём OCO после округления к stepSize может быть меньше объёма
-        // позиции. Хвост не защищён биржевыми ногами; после срабатывания ноги он становится
-        // dust-остатком и закрывается маршрутом DustPolicy.DustMarketSell. Факт — в метрику и лог.
+        // P1.3: «хвост» защиты не покрыт OCO. Если он ниже фильтров ordinary-ордера,
+        // после срабатывания ноги он уйдёт в ручной аудит, а не в невалидный MARKET.
         var protectionTail = DustPolicy.ProtectionTail(position.Quantity, prices.Quantity);
         if (protectionTail > 0m)
         {

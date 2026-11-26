@@ -84,6 +84,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
             Trading.PanicStatusText = $"Kill-switch взведён ({reason}): новые входы заблокированы.";
             UpdateAccountBanner();
         });
+        _engine.OnPartialPositionClosed += trade => RunOnUiThread(() =>
+        {
+            Trading.AddTradeRecord(trade);
+            Dashboard.UpdateMetrics(_metrics);
+        });
         _engine.OnPositionClosed += trade => RunOnUiThread(() =>
         {
             Trading.RemovePosition(trade.Symbol);

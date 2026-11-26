@@ -202,7 +202,8 @@ public sealed class LlmVetoService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _shutdownCts.Cancel();
+        try { _shutdownCts.Cancel(); }
+        catch (ObjectDisposedException) { return; }
         try
         {
             await Task.WhenAll(_tasks.Values).ConfigureAwait(false);

@@ -120,6 +120,9 @@ public sealed class BinanceOrderResponse
     [JsonPropertyName("transactTime")]
     public long TransactTime { get; set; }
 
+    [JsonPropertyName("updateTime")]
+    public long UpdateTime { get; set; }
+
     [JsonPropertyName("price")]
     public string Price { get; set; } = string.Empty;
 
@@ -218,6 +221,15 @@ public sealed class BinanceFill
 /// <summary>
 /// REST API: Account information.
 /// </summary>
+public sealed class BinanceMyTrade
+{
+    [JsonPropertyName("commission")]
+    public string Commission { get; set; } = "0";
+
+    [JsonPropertyName("commissionAsset")]
+    public string CommissionAsset { get; set; } = string.Empty;
+}
+
 public sealed class BinanceTickerPrice
 {
     [JsonPropertyName("symbol")] public string Symbol { get; set; } = string.Empty;
@@ -274,6 +286,8 @@ public sealed class BinanceSymbolInfo
     public decimal StepSize => GetFilterValue("LOT_SIZE", "stepSize");
     public decimal MinQty => GetFilterValue("LOT_SIZE", "minQty");
     public decimal MaxQty => GetFilterValue("LOT_SIZE", "maxQty");
+    public decimal MarketStepSize => GetFilterValue("MARKET_LOT_SIZE", "stepSize");
+    public decimal MarketMinQty => GetFilterValue("MARKET_LOT_SIZE", "minQty");
     public decimal TickSize => GetFilterValue("PRICE_FILTER", "tickSize");
 
     /// <summary>
@@ -286,6 +300,18 @@ public sealed class BinanceSymbolInfo
         {
             var notional = GetFilterValue("NOTIONAL", "minNotional");
             return notional > 0 ? notional : GetFilterValue("MIN_NOTIONAL", "minNotional");
+        }
+    }
+
+    /// <summary>NOTIONAL.applyMinToMarket / MIN_NOTIONAL.applyToMarket.</summary>
+    public bool ApplyMinNotionalToMarket
+    {
+        get
+        {
+            var filter = Filters.FirstOrDefault(f =>
+                string.Equals(f.FilterType, "NOTIONAL", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(f.FilterType, "MIN_NOTIONAL", StringComparison.OrdinalIgnoreCase));
+            return filter?.ApplyMinToMarket ?? filter?.ApplyToMarket ?? true;
         }
     }
 
@@ -339,6 +365,9 @@ public sealed class BinanceFilter
 
     [JsonPropertyName("applyToMarket")]
     public bool ApplyToMarket { get; set; }
+
+    [JsonPropertyName("applyMinToMarket")]
+    public bool ApplyMinToMarket { get; set; }
 }
 
 /// <summary>Ответ сервера на /api/v3/time (синхронизация часов, ошибка -1021).</summary>

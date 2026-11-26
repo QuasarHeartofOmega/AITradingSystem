@@ -28,6 +28,8 @@
                 <DataGridTextColumn Header="Вход" Binding="{Binding EntryPrice, StringFormat={}{0:0.##########}}" Width="130"/>
                 <DataGridTextColumn Header="Текущая" Binding="{Binding CurrentPrice, StringFormat={}{0:0.##########}}" Width="130"/>
                 <DataGridTextColumn Header="PnL" Binding="{Binding UnrealizedPnL, StringFormat={}{0:0.##}}" Width="90"/>
+                <DataGridTextColumn Header="Обновлено UTC" Binding="{Binding UpdatedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="150"/>
+                <DataGridTextColumn Header="Статус" Binding="{Binding DustReviewReason}" Width="220"/>
                 <DataGridTemplateColumn Header="Действие" Width="100"><DataGridTemplateColumn.CellTemplate><DataTemplate>
                     <Button Content="Закрыть" Command="{Binding DataContext.ClosePositionCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}"/>
                 </DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
@@ -71,7 +73,8 @@
                 <DataGridTextColumn Header="Выход" Binding="{Binding ExitPrice, StringFormat={}{0:0.##########}}" Width="130"/>
                 <DataGridTextColumn Header="PnL" Binding="{Binding PnL, StringFormat={}{0:0.##}}" Width="90"/>
                 <DataGridTextColumn Header="Причина" Binding="{Binding ExitReason}" Width="140"/>
-                <DataGridTextColumn Header="Закрыта UTC" Binding="{Binding ClosedAt, StringFormat={}{0:HH:mm:ss}}" Width="100"/>
+                <DataGridTextColumn Header="Кол-во" Binding="{Binding Quantity, StringFormat={}{0:0.########}}" Width="120"/>
+                <DataGridTextColumn Header="Закрыта UTC" Binding="{Binding ClosedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="160"/>
             </DataGrid.Columns>
         </DataGrid>
     </StackPanel></ScrollViewer>

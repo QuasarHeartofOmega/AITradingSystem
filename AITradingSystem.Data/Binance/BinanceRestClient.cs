@@ -518,7 +518,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
         var response = await SendRequestAsync<BinanceOrderResponse>(
             $"/api/v3/order?{query}", HttpMethod.Get, signed: true, ct: ct);
 
-        return MapToOrder(response);
+        return await EnrichOrderCommissionAsync(MapToOrder(response), ct);
     }
 
     /// <summary>P0.3: состояние ордера по clientOrderId — после «Duplicate order sent».</summary>
@@ -528,7 +528,25 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
         var response = await SendRequestAsync<BinanceOrderResponse>(
             $"/api/v3/order?{query}", HttpMethod.Get, signed: true, ct: ct);
 
-        return MapToOrder(response);
+        return await EnrichOrderCommissionAsync(MapToOrder(response), ct);
+    }
+
+    private async Task<Order> EnrichOrderCommissionAsync(Order order, CancellationToken ct)
+    {
+        if (order.ExecutedQuantity <= 0m || order.CommissionByAsset.Count > 0 || order.BinanceOrderId <= 0)
+            return order;
+        var trades = await SendRequestAsync<List<BinanceMyTrade>>(
+            $"/api/v3/myTrades?symbol={order.Symbol.ToUpperInvariant()}&orderId={order.BinanceOrderId}",
+            HttpMethod.Get, signed: true, ct: ct);
+        var fees = trades
+            .GroupBy(t => t.CommissionAsset, StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .ToDictionary(g => g.Key, g => g.Sum(t => ParseDecimal(t.Commission)), StringComparer.OrdinalIgnoreCase);
+        if (fees.Count == 0) return order;
+        order.CommissionByAsset = fees;
+        order.Commission = fees.Values.Sum();
+        order.CommissionAsset = fees.Keys.First();
+        return order;
     }
 
     public async Task<List<Order>> GetOpenOrdersAsync(string? symbol = null, CancellationToken ct = default)
@@ -854,7 +872,11 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
     {
         var executed = ParseDecimal(response.ExecutedQty);
         var quote = ParseDecimal(response.CummulativeQuoteQty);
-        var commission = response.Fills?.Sum(f => ParseDecimal(f.Commission)) ?? 0m;
+        var commissionByAsset = (response.Fills ?? new List<BinanceFill>())
+            .GroupBy(f => f.CommissionAsset, StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .ToDictionary(g => g.Key, g => g.Sum(f => ParseDecimal(f.Commission)), StringComparer.OrdinalIgnoreCase);
+        var commission = commissionByAsset.Values.Sum();
 
         // Если биржа не прислала cummulativeQuoteQty (некоторые площадки/типы),
         // считаем среднюю цену по fills.
@@ -881,8 +903,12 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             CreatedAt = response.TransactTime > 0
                 ? DateTimeExtensions.FromUnixMilliseconds(response.TransactTime)
                 : DateTime.UtcNow,
+            UpdatedAt = response.UpdateTime > 0
+                ? DateTimeExtensions.FromUnixMilliseconds(response.UpdateTime)
+                : null,
             Commission = commission,
-            CommissionAsset = response.Fills?.FirstOrDefault()?.CommissionAsset ?? string.Empty,
+            CommissionAsset = commissionByAsset.Keys.FirstOrDefault() ?? string.Empty,
+            CommissionByAsset = commissionByAsset,
             IsPostOnly = string.Equals(response.Type, "LIMIT_MAKER", StringComparison.OrdinalIgnoreCase)
         };
     }
@@ -953,7 +979,12 @@ public sealed class BinanceApiException : HttpRequestException
         ApiCode == -2010 && ApiMessage.Contains("post only", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Недостаточно средств.</summary>
-    public bool IsInsufficientBalance => ApiCode == -2010 || ApiCode == -1013;
+    public bool IsInsufficientBalance => ApiCode == -2010 ||
+        (ApiCode == -1013 && !IsOrderFilterFailure);
+
+    /// <summary>Нарушение фильтров ордера — это не «недостаточно средств».</summary>
+    public bool IsOrderFilterFailure => ApiCode == -1013 ||
+        ApiMessage.Contains("Filter failure", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Ордер/связка неизвестны бирже: уже исполнены, отменены или сняты по OCO.

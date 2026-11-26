@@ -19,6 +19,10 @@ public sealed class Order
     public decimal FilledQuoteQuantity { get; set; }
     public decimal Commission { get; set; }
     public string CommissionAsset { get; set; } = string.Empty;
+    public Dictionary<string, decimal> CommissionByAsset { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public decimal GetCommission(string asset) =>
+        !string.IsNullOrWhiteSpace(asset) && CommissionByAsset.TryGetValue(asset, out var fee) ? fee : 0m;
     public DateTime CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
     public bool IsPostOnly { get; set; }

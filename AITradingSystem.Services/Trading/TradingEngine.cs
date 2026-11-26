@@ -99,6 +99,8 @@ public sealed class TradingEngine : IAsyncDisposable
     public event Action<TradingSignal>? OnSignalGenerated;
     public event Action<Position>? OnPositionOpened;
     public event Action<TradeRecord>? OnPositionClosed;
+    /// <summary>Частичное закрытие: история/UI обновляются, но позиция остаётся открытой.</summary>
+    public event Action<TradeRecord>? OnPartialPositionClosed;
 
     /// <summary>P0.6/P0.2: kill-switch взведён — новые входы заблокированы до явного сброса.</summary>
     private int _killSwitchEngaged;
@@ -947,14 +949,15 @@ public sealed class TradingEngine : IAsyncDisposable
         var sellableQuantity = executedQuantity;
         if (!_config.Trading.PaperTradingMode &&
             side == OrderSide.Buy &&
-            order.Commission > 0m &&
-            !string.IsNullOrWhiteSpace(order.CommissionAsset) &&
-            SymbolNaming.TrySplit(symbol, _config.Trading.QuoteAssets, out var baseAsset, out _) &&
-            string.Equals(baseAsset, order.CommissionAsset, StringComparison.OrdinalIgnoreCase))
+            SymbolNaming.TrySplit(symbol, _config.Trading.QuoteAssets, out var baseAsset, out _))
         {
-            sellableQuantity = Math.Max(0m, executedQuantity - order.Commission);
-            TradeLog.Decision(symbol, "ENTRY-FEE-NET",
-                $"комиссия в базовом активе: fill={executedQuantity}, fee={order.Commission} {order.CommissionAsset}, sellable={sellableQuantity}");
+            var baseFee = order.GetCommission(baseAsset);
+            if (baseFee > 0m)
+            {
+                sellableQuantity = Math.Max(0m, executedQuantity - baseFee);
+                TradeLog.Decision(symbol, "ENTRY-FEE-NET",
+                    $"комиссия в базовом активе: fill={executedQuantity}, fee={baseFee} {baseAsset}, sellable={sellableQuantity}");
+            }
         }
 
         var actualEntry = order.AverageFillPrice ?? order.Price;
@@ -1526,6 +1529,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             TradeLog.Rejected(position.Symbol, "close", "ордер на закрытие не исполнен — позиция остаётся открытой");
             _logger.LogError("Не удалось закрыть позицию {Symbol}", position.Symbol);
+            await _positionManager.SavePositionsAsync(ct);
             return;
         }
 
@@ -1625,6 +1629,7 @@ public sealed class TradingEngine : IAsyncDisposable
             // Позиция ещё открыта — событие закрытия не шлём (UI иначе уберёт её из списка).
             // Количество в UI обновится само: Position реализует INotifyPropertyChanged.
             _metrics.RecordTrade(trade);
+            OnPartialPositionClosed?.Invoke(trade);
         }
         else
         {
@@ -1847,7 +1852,10 @@ public sealed class TradingEngine : IAsyncDisposable
         if (fullyClosed)
             OnPositionClosed?.Invoke(trade);
         else
+        {
             _metrics.RecordTrade(trade);
+            OnPartialPositionClosed?.Invoke(trade);
+        }
 
         _logger.LogWarning(
             "EXCHANGE-FILL-APPLIED: {Symbol} {Reason} qty={Qty}@{Price}, остаток={Remaining}, без повторного MARKET",

@@ -35,6 +35,9 @@ public sealed class Position : INotifyPropertyChanged
     public decimal InitialStopLoss { get; set; }
     public DateTime OpenedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
+    public bool NeedsManualDustReview { get; set; }
+    public string DustReviewReason { get; set; } = string.Empty;
+    public decimal DustExchangeQuantity { get; set; }
     public string OpeningOrderId { get; set; } = string.Empty;
     public string SignalId { get; set; } = string.Empty;
 
@@ -106,6 +109,19 @@ public sealed class Position : INotifyPropertyChanged
         UpdatedAt = DateTime.UtcNow;
         OnPropertyChanged(nameof(Protection));
         OnPropertyChanged(nameof(HasExchangeProtection));
+    }
+
+    /// <summary>Зафиксировать остаток, который нельзя закрыть ordinary-ордером из-за фильтров.</summary>
+    public void MarkDustForManualReview(decimal exchangeQuantity, string reason)
+    {
+        NeedsManualDustReview = true;
+        DustExchangeQuantity = Math.Max(0m, exchangeQuantity);
+        DustReviewReason = reason ?? string.Empty;
+        UpdatedAt = DateTime.UtcNow;
+        OnPropertyChanged(nameof(NeedsManualDustReview));
+        OnPropertyChanged(nameof(DustReviewReason));
+        OnPropertyChanged(nameof(DustExchangeQuantity));
+        OnPropertyChanged(nameof(UpdatedAt));
     }
 
     /// <summary>
