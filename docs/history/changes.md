@@ -324,3 +324,41 @@ C12 (`PeriodicTimer.WaitForNextTickAsync`). Этот пакет закрывае
 ### Служебные файлы
 - `PLAN.md` — копия плана со статусами задач (A1–A3 ✅).
 - `CHANGES.md` — этот журнал изменений.
+
+---
+
+## P0.8. Залипший REST-запрос останавливал торговлю навсегда (лог 2026-11-26, после 11:47)
+
+### Что видно в логах
+- `11:47:24` `DATA-STALE DASHUSDT` → REST-дозагрузка `klines DASHUSDT` в основном цикле.
+- `11:47:34 / 11:47:44 / 11:47:55` `HTTP RETRY 1..3/4` (таймаут `HttpClient.Timeout` 10 с).
+- `11:47:57.713` `HTTP → GET .../klines?symbol=DASHUSDT...` — **4-я попытка не вернулась никогда**:
+  ни `HTTP ←`, ни `RETRY 4/4`, ни ошибки. Единственный незакрытый запрос из 1724 за остаток сессии.
+- После этого из `trades`/`trading` исчезают `RISK-SNAPSHOT`, `DECISION`, `ИТОГ`, `DATA-*` —
+  до конца лога (**1 ч 50 мин**, 11:47 → 13:38). Живыми остаются только `RECON-*` (polling-fallback,
+  отдельный таймер) и часовой `CONFIDENCE-TUNE`. Процесс жив, REST работает, торговля мертва.
+- Ни `Ошибка в основном цикле`, ни `Основной цикл завершен` в логе нет → цикл не упал, а висит
+  внутри `await` навсегда.
+
+### Причина
+`HttpClient.Timeout` не гарантирует возврата управления: залипание транспорта
+(connect/DNS/чтение тела) может не отреагировать на отмену. Один такой `await`
+в `RecoverMarketDataAsync → ReloadHistoryAsync → GetKlinesAsync` держал весь
+`MainLoopAsync`: анализ, риск-снимок и восстановление данных по всем символам.
+Второй дефект: `catch (OperationCanceledException) { break; }` в цикле принимал
+таймаут за остановку бота — тихий выход без ошибки.
+
+### Исправлено (один шаг)
+- `BinanceRestClient.SendRequestAsync`: жёсткий дедлайн каждой попытки
+  (`HttpTimeoutMs` + 2 с) поверх linked-CTS — `WithHardDeadlineAsync` races the task,
+  поэтому вызывающий код возвращается **даже если транспорт игнорирует отмену**.
+  Брошенная задача наблюдается (не роняет процесс) и освобождает ответ.
+  `TimeoutException`/`OperationCanceledException` без отмены бота → транзиентный сбой:
+  ретрай с backoff, на исчерпании попыток — явная ошибка.
+- `TradingEngine.MainLoopAsync`: `catch (OperationCanceledException) when (ct.IsCancellationRequested)` —
+  выход только по реальной остановке; таймаут больше не убивает цикл.
+- `TradingEngine.RunGuardedPhaseAsync`: `account-refresh`, `market-data-recovery`,
+  `correlation-benchmark` под бюджетом 60 с → `LOOP-PHASE-TIMEOUT` и продолжение цикла.
+  Обход символов (побочные эффекты — ордера) не бросается: `LOOP-STALL` через 30 с.
+- `ReloadHistoryAsync`: ожидание замка восстановления ограничено 15 с
+  (`DATA-RECOVERY-LOCK-BUSY`) — залипшая фаза не держит замок для остальных.

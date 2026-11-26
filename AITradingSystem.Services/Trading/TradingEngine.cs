@@ -624,17 +624,20 @@ public sealed class TradingEngine : IAsyncDisposable
                 {
                     if (DateTime.UtcNow >= _nextAccountRefreshUtc)
                     {
-                        await RefreshAccountSnapshotAsync(ct);
+                        await RunGuardedPhaseAsync("account-refresh", RefreshAccountSnapshotAsync, ct);
                         _nextAccountRefreshUtc = DateTime.UtcNow.AddSeconds(_config.Trading.AccountRefreshIntervalSeconds);
                     }
-                    await RecoverMarketDataAsync(ct);
-                    await EnsureCorrelationBenchmarkAsync(ct);
-                    await ProcessSymbolsAsync(ct);
+                    await RunGuardedPhaseAsync("market-data-recovery", RecoverMarketDataAsync, ct);
+                    await RunGuardedPhaseAsync("correlation-benchmark", EnsureCorrelationBenchmarkAsync, ct);
+                    await ProcessSymbolsGuardedAsync(ct);
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(_config.Trading.AnalysisIntervalSeconds), ct);
             }
-            catch (OperationCanceledException)
+            // P0.8: break только по реальной остановке бота. Таймаут транспорта тоже бросает
+            // OperationCanceledException — раньше он молча завершал цикл («цикл завершен»
+            // в логе при живом процессе), теперь это ошибка итерации, а не конец торговли.
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 break;
             }
@@ -646,6 +649,52 @@ public sealed class TradingEngine : IAsyncDisposable
         }
 
         _logger.LogInformation("Основной цикл завершен");
+    }
+
+    /// <summary>P0.8: бюджет фазы цикла. Залипшая фаза не имеет права остановить торговлю навсегда.</summary>
+    private static readonly TimeSpan MainLoopPhaseBudget = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MainLoopStallWarning = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan RecoveryLockWait = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// P0.8: фаза без побочных торговых эффектов под жёстким бюджетом. Просрочка — громкий
+    /// LOOP-PHASE-TIMEOUT и продолжение цикла (результат фазы игнорируется), а не тихая смерть.
+    /// </summary>
+    private async Task RunGuardedPhaseAsync(string phase, Func<CancellationToken, Task> body, CancellationToken ct)
+    {
+        var task = body(ct);
+        var completed = await Task.WhenAny(task, Task.Delay(MainLoopPhaseBudget, ct));
+        if (completed == task)
+        {
+            await task; // исключения фазы уходят в catch основного цикла
+            return;
+        }
+
+        ct.ThrowIfCancellationRequested();
+        _logger.LogError(
+            "LOOP-PHASE-TIMEOUT {Phase}: фаза не завершилась за {Budget} с — цикл продолжает работу, результат фазы игнорируется",
+            phase, MainLoopPhaseBudget.TotalSeconds);
+        task.ContinueWith(
+            t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// P0.8: обход символов ставит ордера — бросать его на полпути нельзя (риск дубля входа).
+    /// Поэтому здесь только сигнал LOOP-STALL о зависании, ожидание продолжается.
+    /// </summary>
+    private async Task ProcessSymbolsGuardedAsync(CancellationToken ct)
+    {
+        var task = ProcessSymbolsAsync(ct);
+        var completed = await Task.WhenAny(task, Task.Delay(MainLoopStallWarning, ct));
+        if (completed != task && !ct.IsCancellationRequested)
+            _logger.LogWarning(
+                "LOOP-STALL symbols: обход символов длится дольше {Warn} с — торговый контур ждёт (проверить REST/биржу)",
+                MainLoopStallWarning.TotalSeconds);
+
+        await task;
     }
 
     private async Task ProcessSymbolsAsync(CancellationToken ct)
@@ -2305,7 +2354,17 @@ public sealed class TradingEngine : IAsyncDisposable
     /// <summary>P0.3: REST-прогрев истории. Успех пишет DATA-REST-RELOAD, а не «входы разрешены».</summary>
     private async Task ReloadHistoryAsync(string symbol, CancellationToken ct)
     {
-        await _marketDataRecoveryLock.WaitAsync(ct);
+        // P0.8: ожидание замка восстановления тоже ограничено — иначе одна залипшая фаза
+        // держит замок и основной цикл стоит вечно.
+        if (!await _marketDataRecoveryLock.WaitAsync(RecoveryLockWait, ct))
+        {
+            _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
+            _logger.LogWarning(
+                "DATA-RECOVERY-LOCK-BUSY {Symbol}: замок восстановления занят дольше {Wait} с; повтор через {Retry} с",
+                symbol, RecoveryLockWait.TotalSeconds, _config.Trading.MarketDataRecoveryRetrySeconds);
+            return;
+        }
+
         try
         {
             if (!_pendingMarketDataRecovery.ContainsKey(symbol) || !_wsClient.IsConnected)

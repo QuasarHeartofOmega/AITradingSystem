@@ -683,13 +683,32 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             var fullUrl = $"{absoluteBase.TrimEnd('/')}{url}";
             var sw = Stopwatch.StartNew();
 
+            // P0.8: жёсткий дедлайн попытки поверх HttpClient.Timeout.
+            // Timeout покрывает не все фазы транспорта (connect/DNS/чтение тела могут
+            // проигнорировать отмену): 26.11 11:47:57 klines DASHUSDT ушёл в 4-ю попытку
+            // и не вернулся НИКОГДА — вместе с ним навсегда встал весь основной цикл.
+            // Дедлайн гарантирует, что вызывающий контур получит управление обратно.
+            var attemptBudget = TimeSpan.FromMilliseconds(_config.HttpTimeoutMs);
+            var hardDeadline = attemptBudget + HardDeadlineGrace;
+
             try
             {
                 using var request = new HttpRequestMessage(method, new Uri(fullUrl));
                 ExchangeLog.Request(method.Method, fullUrl);
 
-                using var response = await _httpClient.SendAsync(request, ct);
-                var content = await response.Content.ReadAsStringAsync(ct);
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                attemptCts.CancelAfter(hardDeadline);
+
+                using var response = await WithHardDeadlineAsync(
+                    _httpClient.SendAsync(request, attemptCts.Token), hardDeadline, ct, endpoint);
+
+                var bodyBudget = hardDeadline - sw.Elapsed;
+                if (bodyBudget <= TimeSpan.Zero)
+                    throw new TimeoutException(
+                        $"{endpoint}: дедлайн попытки {hardDeadline.TotalMilliseconds:F0} мс исчерпан до чтения тела");
+
+                var content = await WithHardDeadlineAsync(
+                    response.Content.ReadAsStringAsync(attemptCts.Token), bodyBudget, ct, $"{endpoint} (body)");
                 sw.Stop();
 
                 ExchangeLog.Response(method.Method, fullUrl, (int)response.StatusCode,
@@ -770,7 +789,9 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             {
                 throw;
             }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+            catch (Exception ex) when (!ct.IsCancellationRequested &&
+                                       ex is HttpRequestException or TimeoutException or JsonException
+                                           or OperationCanceledException)
             {
                 sw.Stop();
                 lastError = ex;
@@ -789,6 +810,41 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
 
         throw lastError ?? new InvalidOperationException($"Запрос {endpoint} не выполнен");
     }
+
+    /// <summary>P0.8: запас поверх HttpClient.Timeout — время на корректную отмену транспорта.</summary>
+    private static readonly TimeSpan HardDeadlineGrace = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// P0.8: жёсткий дедлайн поверх задачи. В отличие от HttpClient.Timeout срабатывает даже
+    /// если транспорт залип и не реагирует на отмену: вызывающий код всегда получает управление
+    /// и может ретраить/продолжить цикл. Брошенная задача досчитывается в фоне, её исключение
+    /// наблюдается (не роняет процесс), залипший ответ освобождается.
+    /// </summary>
+    private static async Task<T> WithHardDeadlineAsync<T>(
+        Task<T> task, TimeSpan deadline, CancellationToken ct, string operation)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(deadline, ct)).ConfigureAwait(false);
+        if (completed == task)
+            return await task.ConfigureAwait(false);
+
+        // Отмена бота — не таймаут: пробрасываем как есть.
+        ct.ThrowIfCancellationRequested();
+        ObserveAbandoned(task);
+        throw new TimeoutException(
+            $"{operation}: жёсткий дедлайн {deadline.TotalMilliseconds:F0} мс истёк (транспорт не ответил на отмену)");
+    }
+
+    private static void ObserveAbandoned<T>(Task<T> task) =>
+        task.ContinueWith(
+            t =>
+            {
+                _ = t.Exception;
+                if (t.IsCompletedSuccessfully && t.Result is IDisposable disposable)
+                    disposable.Dispose();
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     private TimeSpan GetRetryDelay(int attempt, HttpResponseMessage response)
     {
