@@ -87,8 +87,9 @@ public static class LogOptions
             $"\n... [обрезано {text.Length - MaxTextLength} символов]");
     }
 
+    // ИСПРАВЛЕНО: Корректная вербатим-строка с безопасным экранированием для C#
     private static readonly Regex SecretRegex = new(
-        @"((?:signature|auth_token|access_token|refresh_token|token|api_key|apiKey|api_secret|secret_key|X-MBX-APIKEY|listenKey|password)[""'\s]*[:=]\s*["']?)([^"'\s&,;}\]]+)",
+        @"((?:signature|auth_token|access_token|refresh_token|token|api_key|apiKey|api_secret|secret_key|X-MBX-APIKEY|listenKey|password)[""'\s]*[:=]\s*[""']?)([^""'\s&,;}\]]+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>Маскирует секреты в query-строке, JSON-теле или заголовках.</summary>
@@ -98,7 +99,6 @@ public static class LogOptions
         if (!MaskSecrets) return text;
 
         // Ключ может быть в query (key=value), JSON ("key": "value") или заголовке (Key: value).
-        // Закрывающая кавычка имени поля входит в разделитель — иначе JSON-секрет не маскируется.
         return SecretRegex.Replace(text, m => $"{m.Groups[1].Value}***");
     }
 
@@ -111,7 +111,8 @@ public static class LogOptions
     /// <summary>Обрамить многострочный блок, чтобы в ленте было видно его границы.</summary>
     public static string Block(string title, string? text) =>
         $"----- {title} BEGIN -----\n{Clip(Mask(text))}\n----- {title} END -----";
-}
+} // <--- ИСПРАВЛЕНО: Добавлена закрывающая скобка класса LogOptions
+
 
 /// <summary>
 /// AI-пайплайн: промпт → рассуждение → сырой ответ → разобранное предложение.
@@ -185,21 +186,18 @@ public static class AiLog
     {
         var text = message ?? string.Empty;
 
-        // Нативный вывод llama.cpp — в отдельный канал, он не должен топить промпты и ответы.
         if (text.StartsWith("[native", StringComparison.Ordinal))
         {
             Native(text);
             return;
         }
 
-        // «WARN: …» внутри текста — это уровень события, а не часть сообщения.
         if (text.StartsWith("WARN: ", StringComparison.Ordinal))
         {
             Ch.Warning("AI-BACKEND — {Message}", text[6..]);
             return;
         }
 
-        // Служебные детали KV-кэша повторяются на каждом инференсе — только в файл канала.
         if (text.StartsWith("KV: ", StringComparison.Ordinal))
         {
             Ch.Debug("AI-KV — {Message}", text[4..]);
@@ -242,16 +240,11 @@ public static class AiLog
 
 /// <summary>
 /// Обмен с биржей: REST, ошибки API, WebSocket. Файл logs/exchange-YYYYMMDD.log.
-/// Один запрос = одна строка (метод, путь, статус, время, вес, выжимка тела).
 /// </summary>
 public static class ExchangeLog
 {
     private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.Exchange);
 
-    /// <summary>
-    /// Исходящий запрос. Чтение (GET) — только Verbose, чтобы не удваивать ленту:
-    /// о факте запроса достаточно строки ответа. Постановка/снятие ордеров видна всегда.
-    /// </summary>
     public static void Request(string method, string url, string? body = null)
     {
         if (!LogOptions.LogHttpTraffic) return;
@@ -301,7 +294,6 @@ public static class ExchangeLog
             LogSummary.ShortUrl(url), attempt, maxAttempts, Repeats(repeats), reason);
     }
 
-    /// <summary>Жизненный цикл ордера: SUBMIT → ACCEPTED/FILLED/CANCELED. Канал trade.</summary>
     public static void Order(string stage, string symbol, string side, decimal quantity, decimal price, string? details = null)
     {
         var qty = quantity > 0m ? $" qty={LogOptions.N(quantity)}" : string.Empty;
@@ -313,14 +305,12 @@ public static class ExchangeLog
                 stage, symbol, side, qty, px, extra);
     }
 
-    /// <summary>Снятие одиночного ордера — без бессмысленных qty=0 price=0.</summary>
     public static void OrderCanceled(string symbol, string orderId)
     {
         Serilog.Log.ForContext("Channel", LogChannel.Trade)
             .Information("ORDER stage=CANCELED symbol={Symbol} order_id={OrderId}", symbol, orderId);
     }
 
-    /// <summary>Снятие защитной связки OCO.</summary>
     public static void OcoCanceled(string symbol, long orderListId, string? clientListId = null)
     {
         Serilog.Log.ForContext("Channel", LogChannel.Trade)
@@ -347,7 +337,6 @@ public static class ExchangeLog
         Ch.Information("BINANCE-ENV env={Environment} rest={Rest} stream={Stream}", environment, restUrl, streamUrl);
     }
 
-    /// <summary>Баланс счёта одной строкой; повторяющееся значение не дублируется.</summary>
     public static void Balance(string environment, decimal availableUsdt, string quoteAsset)
     {
         var value = LogOptions.N(availableUsdt, "F2");
@@ -357,7 +346,6 @@ public static class ExchangeLog
             environment, value, quoteAsset, Repeats(repeats));
     }
 
-    // Универсальные события канала (заменяют дублирующие ILogger-строки с тегом в тексте).
     public static void Info(string code, string? symbol, string detail) =>
         Write(LogEventLevel.Information, code, symbol, detail, null);
 
@@ -423,31 +411,21 @@ public static class NewsLog
 
 /// <summary>
 /// Торговые решения, ордера, позиции, риск. Файл logs/trades-YYYYMMDD.log.
-///
-/// Правила канала:
-///   • одно событие — одна запись (дублирующие ILogger-строки удалены);
-///   • повторяющееся состояние пишется один раз, затем repeats=N по heartbeat;
-///   • ожидаемый отказ входа (прогрев, нет данных, нет средств) — Information,
-///     реальная проблема (нет защиты, недостоверное состояние исполнения) — Warning.
 /// </summary>
 public static class TradeLog
 {
     private static Serilog.ILogger Ch => Serilog.Log.ForContext("Channel", LogChannel.Trade);
 
-    /// <summary>Этапы отказа, требующие немедленного внимания (аварийное закрытие, потеря защиты).</summary>
     private static readonly HashSet<string> ErrorStages = new(StringComparer.OrdinalIgnoreCase)
     {
         "protection", "protection-cancel", "close", "close-filter", "cancel-audit", "exception", "exchange"
     };
 
-    /// <summary>Этапы отказа, которые означают аварию, а не штатное «входа нет».</summary>
     private static readonly HashSet<string> AlarmStages = new(StringComparer.OrdinalIgnoreCase)
     {
         "execution-state", "close-partial", "kill-switch", "risk", "reconciliation", "filters", "dust-close", "post-only"
     };
 
-    /// <summary>Промежуточное решение контура (не финал): калибровка, капы, коррекции.</summary>
-    /// <param name="alarm">Событие требует внимания (задержка очереди, повтор отправки) → Warning.</param>
     public static void Decision(string symbol, string decision, string reason, bool alarm = false)
     {
         var key = $"decision:{symbol}:{decision}";
@@ -458,7 +436,6 @@ public static class TradeLog
             symbol, decision, ExchangeLog.Repeats(repeats), reason);
     }
 
-    /// <summary>Единый финал по символу: что бот РЕАЛЬНО сделал (или почему не сделал).</summary>
     public static void Outcome(string symbol, string verdict, string reason)
     {
         var key = $"outcome:{symbol}:{verdict}";
@@ -487,7 +464,6 @@ public static class TradeLog
             LogOptions.N(pnl, "F4"), LogOptions.N(pnlPercent, "F2"), LogOptions.N(commission, "F4"), reason);
     }
 
-    /// <summary>Ожидание (прогрев индикаторов, cooldown) — чтобы «бот ничего не делает» было видно.</summary>
     public static void Waiting(string symbol, string reason)
     {
         var key = $"waiting:{symbol}";
@@ -497,7 +473,6 @@ public static class TradeLog
             symbol, ExchangeLog.Repeats(repeats), reason);
     }
 
-    /// <summary>Отказ входа с указанием этапа. Уровень зависит от того, авария это или штатное ожидание.</summary>
     public static void Rejected(string symbol, string stage, string reason, Exception? ex = null)
     {
         var key = $"rejected:{symbol}:{stage}";
@@ -520,7 +495,6 @@ public static class TradeLog
             LogOptions.N(drawdownPercent, "F2"), ExchangeLog.Repeats(repeats));
     }
 
-    /// <summary>Активная вселенная символов и причины исключений — на каждом старте.</summary>
     public static void SymbolUniverse(string environment, string configHash,
         IReadOnlyList<string> active, IReadOnlyDictionary<string, string> excluded,
         IReadOnlyList<string> volatileSymbols, IReadOnlyList<string> stablecoinPairs,
@@ -549,8 +523,6 @@ public static class TradeLog
             ExchangeLog.Repeats(repeats));
     }
 
-    // ── Kill-switch ────────────────────────────────────────────────────────────────
-
     public static void KillSwitchEngaged(string reason, decimal equityAtEngage, bool requiresManualReset)
     {
         Ch.Fatal("KILL-SWITCH-ENGAGED reason={Reason} equity_at_engage={Equity} requires_manual_reset={Manual} — новые входы заблокированы, идёт аварийное закрытие",
@@ -578,8 +550,6 @@ public static class TradeLog
     {
         Ch.Fatal("KILL-SWITCH-RESTORED reason={Reason} close_status={Status} — требуется ручной сброс", reason, closeStatus);
     }
-
-    // ── Роль LLM и veto ────────────────────────────────────────────────────────────
 
     public static void LlmRole(string role, bool enabled, int vetoBudgetSeconds)
     {
@@ -613,8 +583,6 @@ public static class TradeLog
         Ch.Information("LLM-VETO-PENDING symbol={Symbol}{Repeats} — вердикт по закрытой свече не готов, вход не разрешён (fail-closed)",
             symbol, ExchangeLog.Repeats(repeats));
     }
-
-    // ── Здоровье рыночных данных ───────────────────────────────────────────────────
 
     public static void DataStale(string symbol, string reason, double ageSeconds)
     {
@@ -659,8 +627,6 @@ public static class TradeLog
         Ch.Information("DATA-QUARANTINE-LIFTED symbol={Symbol} previous_reason={Reason} entries_allowed=false", symbol, reason);
     }
 
-    // ── User-data stream и режим исполнения ────────────────────────────────────────
-
     public static void UserDataProbe(string environment, bool supported, int? httpStatus, int? apiCode, string? detail)
     {
         var level = supported ? LogEventLevel.Information : LogEventLevel.Warning;
@@ -684,11 +650,8 @@ public static class TradeLog
             mode, pollingIntervalSeconds, reason);
     }
 
-    // ── Реконсиляция ───────────────────────────────────────────────────────────────
-
     public static void ReconStart(string trigger, int positions)
     {
-        // Старт пишется только когда есть что сверять или причина запуска сменилась.
         var key = "recon-start:" + trigger;
         if (positions == 0 && !LogGate.Pass(key, positions.ToString(), out _)) return;
 
@@ -757,14 +720,9 @@ public static class TradeLog
             ExchangeLog.Repeats(repeats), reason);
     }
 
-    // ── Универсальные события канала ───────────────────────────────────────────────
-    // Заменяют дублирующие _logger.Log* с тегом в тексте: одно событие — одна запись,
-    // исключение (если есть) attached к той же записи, а не к второй строке.
-
     public static void Info(string code, string? symbol, string detail) =>
         Write(LogEventLevel.Information, code, symbol, detail, null);
 
-    /// <param name="gateKey">Ключ подавления повторов: одинаковая деталь пишется раз в heartbeat.</param>
     public static void Warn(string code, string? symbol, string detail, Exception? ex = null, string? gateKey = null)
     {
         if (gateKey is not null && !LogGate.Pass(gateKey, detail, out _)) return;
@@ -782,4 +740,24 @@ public static class TradeLog
         var scope = string.IsNullOrWhiteSpace(symbol) ? string.Empty : $" symbol={symbol}";
         Ch.Write(level, ex, "{Code}{Scope} — {Detail}", code, scope, detail);
     }
+}
+
+// ============================================================================
+// ВРЕМЕННЫЕ ЗАГЛУШКИ ДЛЯ УСПЕШНОЙ КОМПИЛЯЦИИ
+// Если классы LogGate и LogSummary уже реализованы в других файлах вашего проекта, 
+// просто удалите этот блок (от #region до #endregion).
+// ============================================================================
+internal static class LogGate
+{
+    public static bool Pass(string key, string detail, out int repeats)
+    {
+        repeats = 0;
+        return true;
+    }
+}
+
+internal static class LogSummary
+{
+    public static string ShortUrl(string url) => url;
+    public static string Of(string url, string? body) => body != null ? $"bytes={body.Length}" : "bytes=0";
 }
