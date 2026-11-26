@@ -960,7 +960,10 @@ public sealed class BinanceApiException : HttpRequestException
     /// Для cancel это не ошибка — защиты на бирже больше нет.
     /// </summary>
     public bool IsUnknownOrderOrList =>
-        ApiCode == -2011 || ApiMessage.Contains("Unknown order", StringComparison.OrdinalIgnoreCase);
+        ApiCode == -2011 ||
+        ApiCode == -2013 ||
+        ApiMessage.Contains("Unknown order", StringComparison.OrdinalIgnoreCase) ||
+        ApiMessage.Contains("Order does not exist", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// P0.3: «Duplicate order sent» — ордер с этим clientOrderId уже принят биржей.

@@ -463,24 +463,6 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                 : currentOrderBook?.BestAsk ?? position.CurrentPrice;
             if (reference <= 0m) reference = position.EntryPrice;
 
-            var plan = DustPolicy.PlanClose(
-                side, position.Quantity, reference,
-                info?.StepSize ?? 0m, info?.MinQty ?? 0m, info?.MinNotional ?? 0m,
-                useIoc, _tradingConfig.DustMarketCloseEnabled);
-
-            if (plan.Route == DustPolicy.DustCloseRoute.Reject)
-            {
-                _logger.LogError("Не удалось закрыть {Symbol}: {Reason} (qty={Quantity})",
-                    position.Symbol, plan.Reason, position.Quantity);
-                TradeLog.Rejected(position.Symbol, "close", plan.Reason ?? "quantity после округления <= 0");
-                return null;
-            }
-
-            var quantity = plan.Quantity;
-            isDustClose = plan.Route == DustPolicy.DustCloseRoute.DustMarketSell;
-            if (isDustClose)
-                useIoc = false; // dust невозможно выставить лимитным ордером — только MARKET всего остатка.
-
             // P0.1: сначала снимаем OCO — иначе базовый актив заблокирован защитными ногами
             // и MARKET-закрытие получит -2010 «недостаточно средств».
             if (!await CancelProtectionAsync(position, ct))
@@ -489,6 +471,39 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     "Закрытие {Symbol}: защитную OCO снять не удалось — MARKET может быть отклонён по заблокированному объёму",
                     position.Symbol);
             }
+
+            // Live SELL: нельзя отправлять gross-объём позиции, если часть базового актива
+            // ушла на комиссию или уже заблокирована/продана. Берём свежий free-баланс биржи.
+            var liveQuantity = position.Quantity;
+            if (!_tradingConfig.PaperTradingMode && side == OrderSide.Sell)
+            {
+                liveQuantity = await GetLiveSellableQuantityAsync(position, info, ct);
+                if (liveQuantity <= 0m)
+                {
+                    TradeLog.Rejected(position.Symbol, "close",
+                        "free-баланс базового актива на бирже = 0 — нечего закрывать; позиция требует реконсиляции");
+                    return null;
+                }
+            }
+
+            var plan = DustPolicy.PlanClose(
+                side, liveQuantity, reference,
+                info?.StepSize ?? 0m, info?.MinQty ?? 0m, info?.MinNotional ?? 0m,
+                useIoc, _tradingConfig.DustMarketCloseEnabled);
+
+            if (plan.Route == DustPolicy.DustCloseRoute.Reject)
+            {
+                _logger.LogError("Не удалось закрыть {Symbol}: {Reason} (qty={Quantity})",
+                    position.Symbol, plan.Reason, liveQuantity);
+                TradeLog.Rejected(position.Symbol, "close", plan.Reason ?? "quantity после округления <= 0");
+                await RestoreProtectionAfterFailedCloseAsync(position, ct);
+                return null;
+            }
+
+            var quantity = plan.Quantity;
+            isDustClose = plan.Route == DustPolicy.DustCloseRoute.DustMarketSell;
+            if (isDustClose)
+                useIoc = false; // dust невозможно выставить лимитным ордером — только MARKET всего остатка.
 
             var exitLimitPrice = 0m;
 
@@ -742,8 +757,36 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         if (info == null && !_tradingConfig.PaperTradingMode)
             _logger.LogWarning("Фильтры {Symbol} недоступны — защитные ноги отправляются без округления", position.Symbol);
 
+        // Live OCO SELL защищаем только реально доступный net-объём базового актива.
+        var protectionQuantity = position.Quantity;
+        if (!_tradingConfig.PaperTradingMode && position.Side == OrderSide.Buy)
+        {
+            try
+            {
+                protectionQuantity = await GetLiveSellableQuantityAsync(position, info, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Не удалось получить free-баланс для защиты {Symbol}", position.Symbol);
+                TradeLog.Rejected(position.Symbol, "protection",
+                    "не удалось получить free-баланс базового актива — OCO не ставится вслепую");
+                return null;
+            }
+
+            if (protectionQuantity <= 0m)
+            {
+                TradeLog.Rejected(position.Symbol, "protection",
+                    "free-баланс базового актива на бирже = 0 — OCO нечего защищать; нужна реконсиляция");
+                return null;
+            }
+        }
+
         if (!ProtectiveOrderPricing.TryBuild(
-                position.Side, position.Quantity, stopLoss, position.TakeProfit, referencePrice,
+                position.Side, protectionQuantity, stopLoss, position.TakeProfit, referencePrice,
                 info?.TickSize ?? 0m, info?.StepSize ?? 0m, info?.MinQty ?? 0m, info?.MinNotional ?? 0m,
                 _tradingConfig.ProtectionLimitSlippage, out var prices, out var error) || prices == null)
         {
@@ -1030,6 +1073,41 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             _logger.LogWarning(ex, "Не удалось получить фильтры символа {Symbol}", symbol);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Live SELL: объём, который реально можно отправить на биржу прямо сейчас.
+    /// position.Quantity может быть gross-fill или содержать уже проданный/заблокированный остаток;
+    /// authoritative источник для спота — free-баланс базового актива из GET /api/v3/account.
+    /// </summary>
+    private async Task<decimal> GetLiveSellableQuantityAsync(
+        Position position, BinanceSymbolInfo? info, CancellationToken ct)
+    {
+        if (_tradingConfig.PaperTradingMode || position.Side != OrderSide.Buy)
+            return position.Quantity;
+
+        string baseAsset;
+        if (!string.IsNullOrWhiteSpace(info?.BaseAsset))
+            baseAsset = info!.BaseAsset;
+        else if (SymbolNaming.TrySplit(position.Symbol, _tradingConfig.QuoteAssets, out var parsedBase, out _))
+            baseAsset = parsedBase;
+        else
+        {
+            _logger.LogWarning("Не удалось определить базовый актив {Symbol} — live SELL использует объём позиции", position.Symbol);
+            return position.Quantity;
+        }
+
+        var balance = await _binanceClient.GetAccountBalanceAsync(ct);
+        var free = balance.Assets.TryGetValue(baseAsset, out var asset) ? asset.Free : 0m;
+        var sellable = Math.Max(0m, Math.Min(position.Quantity, free));
+
+        if (sellable < position.Quantity)
+        {
+            TradeLog.Decision(position.Symbol, "LIVE-BALANCE-CAP",
+                $"объём позиции {position.Quantity} ограничен free-балансом {baseAsset}: free={free}, sendable={sellable}");
+        }
+
+        return sellable;
     }
 
     private static Order CreatePaperOrder(

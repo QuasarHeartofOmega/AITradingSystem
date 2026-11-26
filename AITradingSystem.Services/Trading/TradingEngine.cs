@@ -941,6 +941,22 @@ public sealed class TradingEngine : IAsyncDisposable
 
         // 9. Позиция открывается на ФАКТИЧЕСКИ исполненный объём и цену.
         var executedQuantity = order.ExecutedQuantity > 0 ? order.ExecutedQuantity : quantity;
+
+        // Spot: комиссия может удерживаться в базовом активе (например XRP).
+        // ExecutedQuantity — gross fill; продавать/защищать можно только net после комиссии.
+        var sellableQuantity = executedQuantity;
+        if (!_config.Trading.PaperTradingMode &&
+            side == OrderSide.Buy &&
+            order.Commission > 0m &&
+            !string.IsNullOrWhiteSpace(order.CommissionAsset) &&
+            SymbolNaming.TrySplit(symbol, _config.Trading.QuoteAssets, out var baseAsset, out _) &&
+            string.Equals(baseAsset, order.CommissionAsset, StringComparison.OrdinalIgnoreCase))
+        {
+            sellableQuantity = Math.Max(0m, executedQuantity - order.Commission);
+            TradeLog.Decision(symbol, "ENTRY-FEE-NET",
+                $"комиссия в базовом активе: fill={executedQuantity}, fee={order.Commission} {order.CommissionAsset}, sellable={sellableQuantity}");
+        }
+
         var actualEntry = order.AverageFillPrice ?? order.Price;
         if (actualEntry <= 0)
             actualEntry = signal.EntryPrice.Value;
@@ -963,7 +979,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             Symbol = symbol,
             Side = side,
-            Quantity = executedQuantity,
+            Quantity = sellableQuantity,
             EntryPrice = actualEntry,
             CurrentPrice = referencePrice,
             StopLoss = stopLoss,
