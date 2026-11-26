@@ -1440,11 +1440,23 @@ public sealed class TradingEngine : IAsyncDisposable
         return excluded;
     }
 
+    /// <summary>
+    /// Знаков после запятой у шага цены. Считаем арифметически, а не через строку:
+    /// decimal.ToString("G29") для tick &lt;= 1e-5 даёт научную нотацию ("1E-05"), точки в ней нет,
+    /// и старый разбор возвращал 0 знаков. Дальше entry округлялся до целого: DOGE 0.15 → 0,
+    /// TryUpgrade молча выходил, и пара вечно печатала HOLD при prior выше порога.
+    /// </summary>
     private static int TickDecimals(decimal tick)
     {
-        var text = tick.ToString("G29", CultureInfo.InvariantCulture).TrimEnd('0');
-        var dot = text.IndexOf('.');
-        return dot < 0 ? 0 : Math.Clamp(text.Length - dot - 1, 0, 12);
+        if (tick <= 0m) return 0;
+        var decimals = 0;
+        var scaled = tick;
+        while (decimals < 12 && scaled != decimal.Truncate(scaled))
+        {
+            scaled *= 10m;
+            decimals++;
+        }
+        return decimals;
     }
     private int GetPriceDecimals(string symbol) =>
         _symbolPrecision.TryGetValue(symbol, out var precision) ? precision.PriceDecimals

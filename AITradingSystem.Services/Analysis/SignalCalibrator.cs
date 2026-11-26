@@ -418,7 +418,11 @@ public sealed class SignalCalibrator
             return;
         }
         if (ctx.Price <= 0m)
+        {
+            TradeLog.Rejected(signal.Symbol, "engine-prices",
+                $"нет корректной цены для расчёта входа (price={ctx.Price}) — сетап остался HOLD");
             return;
+        }
 
         var atr = ctx.AtrAbsolute > 0m ? ctx.AtrAbsolute : ctx.Price * 0.01m;
         var risk = atr * Math.Max(0.1m, ctx.StopLossAtrMultiplier);
@@ -440,7 +444,13 @@ public sealed class SignalCalibrator
         }
 
         if (stop <= 0m || target <= 0m || entry <= 0m)
+        {
+            // Молчаливый return здесь выглядел как «движок решил HOLD», хотя это отказ расчёта цен.
+            TradeLog.Rejected(signal.Symbol, "engine-prices",
+                $"цены входа обнулились: price={ctx.Price}, price_decimals={decimals}, atr={atr}, " +
+                $"entry={entry}, sl={stop}, tp={target} — проверь tickSize/PriceDecimals символа и множитель SL");
             return;
+        }
 
         signal.Action = action;
         signal.EntryPrice = entry;
