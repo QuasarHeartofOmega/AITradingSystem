@@ -665,7 +665,7 @@ public sealed class TradingEngine : IAsyncDisposable
         ct.ThrowIfCancellationRequested();
         TradeLog.Error("LOOP-PHASE-TIMEOUT", null,
             $"phase={phase} budget_s={LogOptions.N(MainLoopPhaseBudget.TotalSeconds)} — результат фазы игнорируется, цикл продолжает работу");
-        task.ContinueWith(
+        _ = task.ContinueWith(
             t => _ = t.Exception,
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,

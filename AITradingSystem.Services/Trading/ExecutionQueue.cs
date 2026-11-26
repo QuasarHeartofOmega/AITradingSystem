@@ -562,7 +562,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
 
             TradeLog.Decision(item.Symbol, "QUEUE-RETRY",
                 $"{item.Priority}: попытка {item.Attempts}/{maxAttempts} — {error.Message}; " +
-                $"повтор через {LogOptions.N(delay)} мс, ключ {item.Key ?? "-"}", alarm: true);
+                $"повтор через {LogOptions.N(delay.TotalMilliseconds)} мс, ключ {item.Key ?? "-"}", alarm: true);
 
             // Разбудить диспетчер, когда backoff истечёт (и сразу — освободились слоты).
             _ = Task.Delay(delay, CancellationToken.None).ContinueWith(

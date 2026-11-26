@@ -87,7 +87,7 @@ public static class LogOptions
             $"\n... [обрезано {text.Length - MaxTextLength} символов]");
     }
 
-    // ИСПРАВЛЕНО: Корректная вербатим-строка с безопасным экранированием для C#
+    // Ключи/подписи в query, JSON и заголовках. Verbatim-строка: кавычка удваивается, \s остаётся как есть.
     private static readonly Regex SecretRegex = new(
         @"((?:signature|auth_token|access_token|refresh_token|token|api_key|apiKey|api_secret|secret_key|X-MBX-APIKEY|listenKey|password)[""'\s]*[:=]\s*[""']?)([^""'\s&,;}\]]+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -108,10 +108,24 @@ public static class LogOptions
     /// <inheritdoc cref="N(double,string)"/>
     public static string N(decimal value, string format = "0.########") => value.ToString(format, CultureInfo.InvariantCulture);
 
+    /// <summary>Целое в инвариантной культуре. Отдельная перегрузка снимает неоднозначность N(long) между double и decimal.</summary>
+    public static string N(long value, string format = "F0") => value.ToString(format, CultureInfo.InvariantCulture);
+
+    /// <inheritdoc cref="N(long,string)"/>
+    public static string N(int value, string format = "F0") => value.ToString(format, CultureInfo.InvariantCulture);
+
+    /// <summary>Nullable-значения: отсутствие цены/метрики печатается как «-», а не как 0.</summary>
+    public static string N(decimal? value, string format = "0.########") =>
+        value.HasValue ? N(value.Value, format) : "-";
+
+    /// <summary>Nullable double: null печатается как «-».</summary>
+    public static string N(double? value, string format = "F0") =>
+        value.HasValue ? N(value.Value, format) : "-";
+
     /// <summary>Обрамить многострочный блок, чтобы в ленте было видно его границы.</summary>
     public static string Block(string title, string? text) =>
         $"----- {title} BEGIN -----\n{Clip(Mask(text))}\n----- {title} END -----";
-} // <--- ИСПРАВЛЕНО: Добавлена закрывающая скобка класса LogOptions
+}
 
 
 /// <summary>
@@ -740,24 +754,4 @@ public static class TradeLog
         var scope = string.IsNullOrWhiteSpace(symbol) ? string.Empty : $" symbol={symbol}";
         Ch.Write(level, ex, "{Code}{Scope} — {Detail}", code, scope, detail);
     }
-}
-
-// ============================================================================
-// ВРЕМЕННЫЕ ЗАГЛУШКИ ДЛЯ УСПЕШНОЙ КОМПИЛЯЦИИ
-// Если классы LogGate и LogSummary уже реализованы в других файлах вашего проекта, 
-// просто удалите этот блок (от #region до #endregion).
-// ============================================================================
-internal static class LogGate
-{
-    public static bool Pass(string key, string detail, out int repeats)
-    {
-        repeats = 0;
-        return true;
-    }
-}
-
-internal static class LogSummary
-{
-    public static string ShortUrl(string url) => url;
-    public static string Of(string url, string? body) => body != null ? $"bytes={body.Length}" : "bytes=0";
 }
