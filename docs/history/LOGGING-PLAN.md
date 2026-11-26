@@ -1,6 +1,9 @@
 # Аудит логов AITradingSystem (шаг 1)
 
-Репозиторий: `QuasarHeartofOmega/AITradingSystem` @ `0c53c0a`.
+**Статус плана:** шаги 2–7 внесены в код/документацию. Основной пакет — commit `a847563` (`2611252`); завершение — текущие правки поверх него (см. «Завершение плана» ниже).
+**Проверка:** компиляция, сборки, тестовые прогоны, GPU-инференс и новые ордера не выполнялись. Runtime-приёмка на Demo и новый замер объёма логов остаются внешними шагами.
+
+Репозиторий: `QuasarHeartofOmega/AITradingSystem`. Исходный аудит: `0c53c0a`.
 Материал: реальные логи из `docs/history/logs.zip` (26.11.2026, ~1 час работы, Demo, 8 символов, AI role=Shadow).
 
 ## Замеры
@@ -36,3 +39,59 @@
 - **Шаг 7. Документация и настройки.** `docs/LOGGING.md`: карта каналов, словарь кодов событий, уровни, примеры строк; дефолты `LoggingConfig` и `appsettings.json`, приведение `tools/watch_logs.py` к новому формату.
 
 Оценка эффекта: объём логов ~48 МБ/час → ~1–2 МБ/час без потери диагностической информации; каждое торговое решение читается одной строкой с причиной.
+
+---
+
+## Завершение плана
+
+### Что уже было в последнем commit `a847563`
+
+Проверены `git log -1 --stat` и diff `HEAD^..HEAD`. Commit уже изменил 16 файлов:
+
+- `Common/Configuration/LoggingConfig.cs` — новые ключи `HttpBodyMode`, `StateHeartbeatSeconds`, `LogNativeAiOutput`, дефолт `ExcludeDiagnosticsFromMainLog=true`.
+- `Common/Logging/LogChannels.cs` — структурные каналы, уровни, подавление повторов, сводки, отдельный `ai-native`.
+- `Common/Logging/LogFormat.cs` — `UnifiedLogFormatter` и `LogGate`.
+- `Common/Logging/LogSummary.cs` — компактные выжимки HTTP-тел.
+- `Common/Logging/Logger.cs` — единые приёмники, маршрутизация каналов, тихий `ai-native`.
+- `Data/Binance/BinanceRestClient.cs`, `BinanceWebSocketClient.cs` — перевод биржевых событий в `ExchangeLog`, вес лимитов в ответе.
+- `Services/AI/GgmlNative.cs`, `QwenModel.cs` — нативный лог отдельно, AI-блоки.
+- `Services/Trading/ExecutionQueue.cs`, `OrderExecutor.cs`, `PositionMonitor.cs`, `ReconciliationService.cs`, `TradingEngine.cs` — устранение дублей и структурные торговые события.
+- `UI/appsettings.json` — новые ключи и ротация 25 МБ / 14 файлов.
+- `docs/history/LOGGING-PLAN.md` — сам аудит.
+
+### Что завершено поверх commit
+
+- **Шаг 2, контракт:** маскирование секретов исправлено для JSON (`"signature":"..."`), query и заголовков; все текстовые блоки проходят маскирование до обрезки. Режим `HttpBodyMode` нормализуется без учёта регистра. HTTP-ответ получил код `HTTP-RESP`, новостной ответ — `NEWS-RESP`.
+- **Шаг 3, дубли:** удалён пустой остаточный блок после `KILL-SWITCH-CLOSE-RESULT`; из сообщения async-veto убран служебный маркер `P0.5`.
+- **Шаг 4, exchange:** сводки тел и вес лимитов уже внесены commit; режимы `Summary|Full|Off` документированы и согласованы с `LogHttpBodies`.
+- **Шаг 5, шум:** `LogGate` и heartbeat уже внесены commit; `trades` теперь уважает `MinimumLevel` не ниже `Information`.
+- **Шаг 6, AI:** в `AI-PROMPT/RESPONSE/THINKING/SIGNAL` добавлены метаданные модели, backend, роли, контекста и токенов; отдельный код `AI-GENERATION` вместо прозы `AI GEN` внутри `AI-BACKEND`. Нативные строки маскируются и обрезаются.
+- **Шаг 7, документация и настройки:** создан `docs/LOGGING.md` (карта каналов, формат, уровни, словарь кодов, настройки, примеры, просмотр и приватность). Дефолты `LoggingConfig` приведены к `appsettings.json`: 25 МБ, 14 файлов, `MaxTextLength=8000`. `tools/watch_logs.py` понимает новый формат, многострочные события, `ai-native`, суточную/размерную ротацию и `NO_COLOR`.
+- **Маршрутизация:** при `SeparateChannelFiles=false` диагностика больше не может быть одновременно исключена из общего лога и потеряна; `ai-native` остаётся тихим. `LOGGER-START` перечисляет реальные каналы.
+
+### Изменённые файлы завершения
+
+```text
+AITradingSystem.Common/Configuration/LoggingConfig.cs
+AITradingSystem.Common/Logging/LogChannels.cs
+AITradingSystem.Common/Logging/Logger.cs
+AITradingSystem.Services/AI/QwenModel.cs
+AITradingSystem.Services/Trading/LlmVetoService.cs
+AITradingSystem.Services/Trading/TradingEngine.cs
+AITradingSystem.UI/appsettings.json
+docs/LOGGING.md
+docs/README.md
+docs/history/LOGGING-PLAN.md
+README.md
+tools/watch_logs.py
+```
+
+### Runtime-приёмка, не выполнявшаяся здесь
+
+- [ ] Demo-прогон: объём `exchange` и `trading` за час, отсутствие полных тел при `Summary`.
+- [ ] Прогрев/ожидание тика: одна строка состояния и `repeats=N` по heartbeat, без WRN-спама.
+- [ ] Реконсиляция: нет дублей `trades`/`trading`, summary только при изменении или heartbeat.
+- [ ] AI: в `ai-*.log` видны PROMPT/THINKING/RESPONSE/GENERATION/SIGNAL; нативный вывод только в `ai-native-*.log`.
+- [ ] Секреты: подписи, API-ключи, токены и listenKey замаскированы в URL/JSON/блоках.
+- [ ] Ротация: суточная и размерная, `watch_logs.py` переходит на новый файл.
+- [ ] `SeparateChannelFiles=false`: диагностика не теряется, `trades` остаётся отдельным.

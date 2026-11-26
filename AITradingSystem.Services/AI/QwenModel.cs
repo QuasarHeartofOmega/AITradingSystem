@@ -683,7 +683,8 @@ public sealed class QwenModel : IAIModel
                     AiLog.Retry(symbol, attempt, lastParseError ?? "invalid JSON");
                 }
 
-                var meta = $"backend={ActiveBackend}, thinking={EffectiveThinking}, " +
+                var meta = $"model={Path.GetFileName(_loadedModelPath)}, backend={ActiveBackend}, role={context.Role}, " +
+                           $"ctx={EffectiveContextSize}, max_tokens={_config.EffectiveMaxTokens}, thinking={EffectiveThinking}, " +
                            $"position={(context.HasPosition ? context.PositionSide ?? "LONG" : "none")}";
                 AiLog.Prompt(symbol, attempt, maxAttempts, currentPrompt, meta);
 
@@ -696,7 +697,10 @@ public sealed class QwenModel : IAIModel
                     lastRawResponse = result.Text;
 
                     LogGenerationDiagnostics(symbol, attempt, result);
-                    AiLog.Response(symbol, attempt, result.Text, LastInferenceTimeMs);
+                    var generationMeta = $"model={Path.GetFileName(_loadedModelPath)}, backend={ActiveBackend}, " +
+                                         $"prompt_tokens={result.PromptTokens}, generated_tokens={result.GeneratedTokens}, " +
+                                         $"think_tokens={result.ThinkTokens}, hit_max_tokens={result.HitMaxTokens}, timed_out={result.TimedOut}";
+                    AiLog.Response(symbol, attempt, result.Text, LastInferenceTimeMs, generationMeta);
 
                     if (result.DegenerateReason != null)
                     {
@@ -722,7 +726,7 @@ public sealed class QwenModel : IAIModel
                     if (!string.IsNullOrWhiteSpace(thinking))
                     {
                         LastThinking = thinking;
-                        AiLog.Thinking(symbol, thinking, LastInferenceTimeMs);
+                        AiLog.Thinking(symbol, thinking, LastInferenceTimeMs, attempt, generationMeta);
                     }
 
                     signal = ParseSignalFromResponse(symbol, result.Text, context, out var parseError);
@@ -737,9 +741,9 @@ public sealed class QwenModel : IAIModel
                         // (после SignalCalibrator). Здесь сырую уверенность модели не трогаем,
                         // иначе движок не сможет отличить «модель не уверена» от «сетап слабый».
                         AiLog.Parsed(symbol, signal.Action.ToString(), signal.Confidence,
-                            $"model_conf={signal.Confidence:0.##}, degenerate={(signal.IsDegenerateConfidence ? "yes" : "no")}, " +
-                            $"entry={signal.EntryPrice}, sl={signal.StopLoss}, tp={signal.TakeProfit}, reason={signal.Reasoning}",
-                            LastInferenceTimeMs);
+                            $"model_conf={LogOptions.N(signal.Confidence, "F2")}, degenerate={(signal.IsDegenerateConfidence ? "yes" : "no")}, " +
+                            $"entry={LogOptions.N(signal.EntryPrice)}, sl={LogOptions.N(signal.StopLoss)}, tp={LogOptions.N(signal.TakeProfit)}, reason={signal.Reasoning}",
+                            LastInferenceTimeMs, generationMeta);
 
 
                         return signal;
@@ -837,10 +841,9 @@ public sealed class QwenModel : IAIModel
 
     private static void LogGenerationDiagnostics(string symbol, int attempt, KvGenerationResult result)
     {
-        AiLog.Backend(
-            $"AI GEN {symbol} attempt={attempt}: generated={result.GeneratedTokens}, think={result.ThinkTokens}, " +
-            $"prompt={result.PromptTokens}, reuse={result.ReusedPrefixTokens}, forcedThinkClose={result.ForcedThinkClose}, " +
-            $"hitMax={result.HitMaxTokens}, timedOut={result.TimedOut}, elapsed={result.ElapsedMs:F0}ms");
+        AiLog.Generation(symbol, attempt, result.PromptTokens, result.GeneratedTokens,
+            result.ThinkTokens, result.ReusedPrefixTokens, result.ForcedThinkClose,
+            result.HitMaxTokens, result.TimedOut, result.ElapsedMs);
     }
 
     /// <summary>

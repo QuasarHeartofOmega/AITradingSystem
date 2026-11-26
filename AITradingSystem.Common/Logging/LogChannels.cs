@@ -58,14 +58,25 @@ public static class LogOptions
     public static bool LogNews { get; set; } = true;
 
     /// <summary>Максимальная длина одного текстового блока в логе (0 = без обрезки).</summary>
-    public static int MaxTextLength { get; set; } = 20000;
+    public static int MaxTextLength { get; set; } = 8000;
 
     /// <summary>Маскировать ключи/подписи/токены в URL и телах.</summary>
     public static bool MaskSecrets { get; set; } = true;
 
     /// <summary>Режим тел HTTP с учётом старого флага LogHttpBodies.</summary>
-    public static string EffectiveHttpBodyMode =>
-        !LogHttpBodies ? "Off" : string.IsNullOrWhiteSpace(HttpBodyMode) ? "Summary" : HttpBodyMode;
+    public static string EffectiveHttpBodyMode
+    {
+        get
+        {
+            if (!LogHttpBodies) return "Off";
+            return HttpBodyMode?.Trim().ToLowerInvariant() switch
+            {
+                "full" => "Full",
+                "off" => "Off",
+                _ => "Summary"
+            };
+        }
+    }
 
     /// <summary>Обрезка длинных текстов для лога.</summary>
     public static string Clip(string? text)
@@ -76,16 +87,19 @@ public static class LogOptions
             $"\n... [обрезано {text.Length - MaxTextLength} символов]");
     }
 
-    /// <summary>Маскирует секреты в query-строке/теле запроса.</summary>
+    private static readonly Regex SecretRegex = new(
+        @"((?:signature|auth_token|access_token|refresh_token|token|api_key|apiKey|api_secret|secret_key|X-MBX-APIKEY|listenKey|password)[""'\s]*[:=]\s*["']?)([^"'\s&,;}\]]+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>Маскирует секреты в query-строке, JSON-теле или заголовках.</summary>
     public static string Mask(string? text)
     {
         if (string.IsNullOrEmpty(text)) return string.Empty;
         if (!MaskSecrets) return text;
 
-        return Regex.Replace(text,
-            @"(signature|auth_token|token|api_key|apiKey|X-MBX-APIKEY|listenKey)([""'\s:=]+)([A-Za-z0-9_\-\.]+)",
-            m => $"{m.Groups[1].Value}{m.Groups[2].Value}***",
-            RegexOptions.IgnoreCase);
+        // Ключ может быть в query (key=value), JSON ("key": "value") или заголовке (Key: value).
+        // Закрывающая кавычка имени поля входит в разделитель — иначе JSON-секрет не маскируется.
+        return SecretRegex.Replace(text, m => $"{m.Groups[1].Value}***");
     }
 
     /// <summary>Число в инвариантной культуре — чтобы логи не зависели от локали машины.</summary>
@@ -96,7 +110,7 @@ public static class LogOptions
 
     /// <summary>Обрамить многострочный блок, чтобы в ленте было видно его границы.</summary>
     public static string Block(string title, string? text) =>
-        $"----- {title} BEGIN -----\n{Clip(text)}\n----- {title} END -----";
+        $"----- {title} BEGIN -----\n{Clip(Mask(text))}\n----- {title} END -----";
 }
 
 /// <summary>
@@ -118,30 +132,41 @@ public static class AiLog
             LogOptions.Block("PROMPT", prompt));
     }
 
-    public static void Response(string symbol, int attempt, string rawResponse, double elapsedMs)
+    public static void Response(string symbol, int attempt, string rawResponse, double elapsedMs, string? meta = null)
     {
         if (!LogOptions.LogAiResponses) return;
 
         Ch.Debug(
-            "AI-RESPONSE symbol={Symbol} attempt={Attempt} elapsed_ms={Elapsed} chars={Chars}\n{Block}",
-            symbol, attempt, LogOptions.N(elapsedMs), rawResponse.Length,
+            "AI-RESPONSE symbol={Symbol} attempt={Attempt} elapsed_ms={Elapsed} chars={Chars} meta={Meta}\n{Block}",
+            symbol, attempt, LogOptions.N(elapsedMs), rawResponse.Length, meta ?? "-",
             LogOptions.Block("RESPONSE", rawResponse));
     }
 
-    public static void Thinking(string symbol, string thinking, double elapsedMs)
+    public static void Thinking(string symbol, string thinking, double elapsedMs, int attempt = 1, string? meta = null)
     {
         if (!LogOptions.LogThinking || string.IsNullOrWhiteSpace(thinking)) return;
 
-        Ch.Debug("AI-THINKING symbol={Symbol} elapsed_ms={Elapsed} chars={Chars}\n{Block}",
-            symbol, LogOptions.N(elapsedMs), thinking.Length, LogOptions.Block("THINKING", thinking));
+        Ch.Debug("AI-THINKING symbol={Symbol} attempt={Attempt} elapsed_ms={Elapsed} chars={Chars} meta={Meta}\n{Block}",
+            symbol, attempt, LogOptions.N(elapsedMs), thinking.Length, meta ?? "-", LogOptions.Block("THINKING", thinking));
     }
 
     /// <summary>Мнение модели после парсинга — ещё не ордер.</summary>
-    public static void Parsed(string symbol, string action, decimal confidence, string json, double elapsedMs)
+    public static void Parsed(string symbol, string action, decimal confidence, string details, double elapsedMs, string? meta = null)
     {
         Ch.Information(
-            "AI-SIGNAL symbol={Symbol} action={Action} confidence={Confidence} elapsed_ms={Elapsed} — мнение модели, не ордер. {Json}",
-            symbol, action, LogOptions.N(confidence, "F2"), LogOptions.N(elapsedMs), LogOptions.Clip(json));
+            "AI-SIGNAL symbol={Symbol} action={Action} confidence={Confidence} elapsed_ms={Elapsed} meta={Meta} — мнение модели, не ордер. {Details}",
+            symbol, action, LogOptions.N(confidence, "F2"), LogOptions.N(elapsedMs), meta ?? "-",
+            LogOptions.Clip(LogOptions.Mask(details)));
+    }
+
+    /// <summary>Счётчики одной генерации: рядом с AI-RESPONSE, без прозы в AI-BACKEND.</summary>
+    public static void Generation(string symbol, int attempt, int promptTokens, int generatedTokens,
+        int thinkTokens, int reusedPrefixTokens, bool forcedThinkClose, bool hitMaxTokens, bool timedOut, double elapsedMs)
+    {
+        Ch.Debug(
+            "AI-GENERATION symbol={Symbol} attempt={Attempt} prompt_tokens={Prompt} generated_tokens={Generated} think_tokens={Think} reused_prefix_tokens={Reused} forced_think_close={Forced} hit_max_tokens={HitMax} timed_out={TimedOut} elapsed_ms={Elapsed}",
+            symbol, attempt, promptTokens, generatedTokens, thinkTokens, reusedPrefixTokens,
+            forcedThinkClose, hitMaxTokens, timedOut, LogOptions.N(elapsedMs));
     }
 
     public static void ParseFailed(string symbol, int attempt, string reason, string? rawResponse)
@@ -205,7 +230,8 @@ public static class AiLog
             ? text[(text.IndexOf(']') + 1)..].TrimStart()
             : text;
 
-        Serilog.Log.ForContext("Channel", LogChannel.AiNative).Write(level, "LLAMA {Line}", payload);
+        Serilog.Log.ForContext("Channel", LogChannel.AiNative)
+            .Write(level, "LLAMA {Line}", LogOptions.Clip(LogOptions.Mask(payload)));
     }
 
     public static void Failure(string symbol, Exception ex, string context)
@@ -255,7 +281,7 @@ public static class ExchangeLog
             _ => " " + LogSummary.Of(url, body)
         };
 
-        Ch.Debug("HTTP {Method} {Url} status={Status} elapsed_ms={Elapsed}{Weight}{Payload}",
+        Ch.Debug("HTTP-RESP {Method} {Url} status={Status} elapsed_ms={Elapsed}{Weight}{Payload}",
             method, LogSummary.ShortUrl(url), statusCode, LogOptions.N(elapsedMs), weight, payload);
     }
 
@@ -368,7 +394,7 @@ public static class NewsLog
     {
         if (!LogOptions.LogNews) return;
 
-        Ch.Information("NEWS provider={Provider} status={Status} items={Count} elapsed_ms={Elapsed}{Sample}",
+        Ch.Information("NEWS-RESP provider={Provider} status={Status} items={Count} elapsed_ms={Elapsed}{Sample}",
             provider, statusCode, count, LogOptions.N(elapsedMs),
             string.IsNullOrEmpty(sample) ? string.Empty : "\n" + LogOptions.Block("NEWS SAMPLE", sample));
     }

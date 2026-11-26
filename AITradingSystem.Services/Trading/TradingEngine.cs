@@ -1962,9 +1962,6 @@ public sealed class TradingEngine : IAsyncDisposable
         var remaining = _positionManager.GetOpenPositions().Count;
         _killSwitchCloseStatus = remaining > 0 ? "UNPROTECTED_OR_OPEN" : "ALL_CLOSED";
         TradeLog.KillSwitchCloseResult(closed, total, remaining, _killSwitchCloseStatus);
-        if (remaining > 0)
-        {
-        }
         await PersistRiskStateAsync(ct);
         return closed;
     }

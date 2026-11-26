@@ -2,7 +2,8 @@ namespace AITradingSystem.Common.Configuration;
 
 /// <summary>
 /// Настройки логирования (FR-8.1).
-/// Каналы: ai (промпты/ответы модели), exchange (HTTP/WS биржи), news, trade.
+/// Каналы: ai, ai-native, exchange, news, trade; прочее — system (общий лог).
+/// Карта каналов, словарь событий и примеры: docs/LOGGING.md.
 /// </summary>
 public sealed class LoggingConfig
 {
@@ -12,10 +13,10 @@ public sealed class LoggingConfig
     public bool WriteToFile { get; set; } = true;
 
     /// <summary>Максимальный размер одного лог-файла в МБ.</summary>
-    public int MaxFileSizeMb { get; set; } = 50;
+    public int MaxFileSizeMb { get; set; } = 25;
 
-    /// <summary>Количество хранимых лог-файлов.</summary>
-    public int RetainedFileCount { get; set; } = 10;
+    /// <summary>Количество хранимых файлов на каждый приёмник (суточные и размерные роли вместе).</summary>
+    public int RetainedFileCount { get; set; } = 14;
 
     /// <summary>
     /// Уровень для «шумных» каналов (HTTP-трафик, сырые ответы модели, промпты).
@@ -67,7 +68,7 @@ public sealed class LoggingConfig
     public bool LogNews { get; set; } = true;
 
     /// <summary>Максимальная длина текстового блока в логе, символов (0 — без обрезки).</summary>
-    public int MaxTextLength { get; set; } = 20000;
+    public int MaxTextLength { get; set; } = 8000;
 
     /// <summary>Маскировать подписи/ключи/токены.</summary>
     public bool MaskSecrets { get; set; } = true;

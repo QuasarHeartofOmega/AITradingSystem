@@ -138,7 +138,7 @@ public sealed class LlmVetoService : IAsyncDisposable
                 $"ошибка LLM: {ex.Message} — fail-closed veto", latency,
                 DateTime.UtcNow, false, role.ToString());
             _metrics.RecordLlmOpinionFailure();
-            _logger.LogWarning(ex, "P0.5: асинхронное мнение LLM по {Symbol} завершилось ошибкой", symbol);
+            _logger.LogWarning(ex, "Асинхронное мнение LLM по {Symbol} завершилось ошибкой", symbol);
         }
         finally
         {

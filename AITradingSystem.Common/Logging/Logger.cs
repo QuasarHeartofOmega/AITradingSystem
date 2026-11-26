@@ -51,6 +51,10 @@ public static class Logger
             var appLevel = ParseLevel(config.MinimumLevel, LogEventLevel.Information);
             var diagLevel = ParseLevel(config.DiagnosticsLevel, LogEventLevel.Debug);
             var globalLevel = (LogEventLevel)Math.Min((int)appLevel, (int)diagLevel);
+            var tradeLevel = (LogEventLevel)Math.Max((int)appLevel, (int)LogEventLevel.Information);
+            // Без отдельных файлов диагностику нельзя одновременно исключить из общего лога —
+            // иначе ai/exchange/news не попадут никуда.
+            var excludeDiagnostics = config.SeparateChannelFiles && config.ExcludeDiagnosticsFromMainLog;
 
             Directory.CreateDirectory(config.LogPath);
 
@@ -78,7 +82,7 @@ public static class Logger
                     .Filter.ByExcluding(e =>
                         IsQuiet(e) ||
                         e.Level < appLevel ||
-                        (config.ExcludeDiagnosticsFromMainLog && IsDiagnostic(e)))
+                        (excludeDiagnostics && IsDiagnostic(e)))
                     .WriteTo.File(
                         formatter: new UnifiedLogFormatter(),
                         path: Path.Combine(config.LogPath, "trading-.log"),
@@ -90,7 +94,7 @@ public static class Logger
 
                 if (config.SeparateChannelFiles)
                 {
-                    AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", LogEventLevel.Information);
+                    AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", tradeLevel);
                     AddChannelFile(loggerConfig, config, LogChannel.Exchange, "exchange-.log", diagLevel);
                     AddChannelFile(loggerConfig, config, LogChannel.Ai, "ai-.log", diagLevel);
                     AddChannelFile(loggerConfig, config, LogChannel.AiNative, "ai-native-.log", diagLevel);
@@ -99,7 +103,7 @@ public static class Logger
                 else
                 {
                     // Один файл торговых событий, если разделение каналов выключено.
-                    AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", LogEventLevel.Information);
+                    AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", tradeLevel);
                 }
             }
 
@@ -113,7 +117,7 @@ public static class Logger
                 "LOGGER-START level={Level} diagnostics={Diagnostics} path={Path} http_bodies={Bodies} state_heartbeat_s={Heartbeat} channels={Channels}",
                 config.MinimumLevel, config.DiagnosticsLevel, Path.GetFullPath(config.LogPath),
                 LogOptions.EffectiveHttpBodyMode, config.StateHeartbeatSeconds,
-                config.SeparateChannelFiles ? "trade/exchange/ai/ai-native/news" : "trade");
+                config.SeparateChannelFiles ? "system/trade/exchange/ai/ai-native/news" : "system/trade");
         }
     }
 

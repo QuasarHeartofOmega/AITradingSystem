@@ -3,6 +3,7 @@
 ## Актуальная настройка
 
 - [SETUP-WINDOWS.md](SETUP-WINDOWS.md) — сборка, запуск, конфигурация, ключи и GPU-бэкенды.
+- [LOGGING.md](LOGGING.md) — каналы логов, формат, уровни, настройки, словарь событий и просмотр.
 
 ## Исторические документы
 
@@ -17,5 +18,6 @@
 | [history/trdupd.md](history/trdupd.md) | План правок Qwen3/Vulkan/KV |
 | [history/PLAN-10-10-LIVE-PROFIT.md](history/PLAN-10-10-LIVE-PROFIT.md) | План доведения до Live; задачи в документе не выполнены |
 | [history/PLAN-ML-LLM-INTEGRATION.md](history/PLAN-ML-LLM-INTEGRATION.md) | План ML/LLM-интеграции; задачи в документе не выполнены |
+| [history/LOGGING-PLAN.md](history/LOGGING-PLAN.md) | Аудит логов и завершённый план реформы логирования |
 
 `plann.md` из исходного архива был точной копией `plan.md` и не включён в подготовленную структуру.
