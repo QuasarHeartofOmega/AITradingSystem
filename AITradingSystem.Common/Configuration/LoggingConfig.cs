@@ -27,7 +27,26 @@ public sealed class LoggingConfig
     public bool SeparateChannelFiles { get; set; } = true;
 
     /// <summary>Не дублировать тела промптов/HTTP в общий лог (только в файлы каналов).</summary>
-    public bool ExcludeDiagnosticsFromMainLog { get; set; } = false;
+    public bool ExcludeDiagnosticsFromMainLog { get; set; } = true;
+
+    /// <summary>
+    /// Что писать вместо тела HTTP-ответа биржи:
+    ///   Summary — одна строка-выжимка (balances/candles/orders/price), по умолчанию;
+    ///   Full    — полное тело с обрезкой по MaxTextLength (для глубокой отладки);
+    ///   Off     — только размер тела.
+    /// Полные тела /account и /ticker/price дают десятки мегабайт в час и не читаются.
+    /// </summary>
+    public string HttpBodyMode { get; set; } = "Summary";
+
+    /// <summary>
+    /// Через сколько секунд повторять в логе неизменившееся состояние (ИТОГ, RECON-SUMMARY,
+    /// DATA-STALE и т.п.) со счётчиком repeats=N. 0 — писать только при изменении,
+    /// -1 — отключить подавление и писать каждое событие.
+    /// </summary>
+    public int StateHeartbeatSeconds { get; set; } = 300;
+
+    /// <summary>Писать нативный вывод llama.cpp/ggml в отдельный файл ai-native-*.log.</summary>
+    public bool LogNativeAiOutput { get; set; } = true;
 
     /// <summary>Логировать полный текст промпта, уходящего в модель.</summary>
     public bool LogPrompts { get; set; } = true;
@@ -76,5 +95,12 @@ public sealed class LoggingConfig
 
         if (MaxTextLength < 0 || MaxTextLength > 1_000_000)
             throw new InvalidOperationException("MaxTextLength должен быть в диапазоне [0; 1000000].");
+
+        var validBodyModes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Summary", "Full", "Off" };
+        if (!validBodyModes.Contains(HttpBodyMode))
+            throw new InvalidOperationException($"Недопустимый HttpBodyMode: {HttpBodyMode} (Summary|Full|Off).");
+
+        if (StateHeartbeatSeconds < -1 || StateHeartbeatSeconds > 86400)
+            throw new InvalidOperationException("StateHeartbeatSeconds должен быть в диапазоне [-1; 86400].");
     }
 }

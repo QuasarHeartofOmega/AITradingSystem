@@ -189,10 +189,9 @@ public sealed class ReconciliationService : IAsyncDisposable
         if (_config.PaperTradingMode || !_rest.HasApiKeys || !_config.UserDataStreamEnabled)
         {
             _executionMode = _config.PaperTradingMode ? "PAPER" : "DISABLED";
-            _logger.LogInformation(
-                "Реконсиляция/user-data stream пропущены: paper={Paper}, ключи={Keys}, включено={Enabled}",
-                _config.PaperTradingMode, _rest.HasApiKeys, _config.UserDataStreamEnabled);
-            TradeLog.ExecutionMode(_executionMode, "paper-or-no-keys-or-disabled", _config.UserDataPollingIntervalSeconds);
+            TradeLog.ExecutionMode(_executionMode,
+                $"paper={_config.PaperTradingMode} keys={_rest.HasApiKeys} enabled={_config.UserDataStreamEnabled}",
+                _config.UserDataPollingIntervalSeconds);
             // Инвентаризация всё равно полезна в live без stream; в paper — нет.
             if (!_config.PaperTradingMode && _rest.HasApiKeys)
                 await ReconcileAsync(ct, "startup-no-stream");
@@ -212,7 +211,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         catch (Exception ex)
         {
             // P0.4: недоступность stream — не «тихое продолжение», а явный режим с политикой fail-closed.
-            _logger.LogWarning(ex, "USER-DATA-FAIL: user-data stream не поднят");
+            TradeLog.Warn("USER-DATA-FAIL", null, "user-data stream не поднят", ex);
             EnterDegradedMode($"start-failed:{ex.GetType().Name}", _cts.Token);
         }
 
@@ -224,7 +223,6 @@ public sealed class ReconciliationService : IAsyncDisposable
     {
         _executionMode = mode;
         TradeLog.ExecutionMode(mode, reason, _config.UserDataPollingIntervalSeconds);
-        _logger.LogWarning("EXECUTION-MODE={Mode}: {Reason}", mode, reason);
     }
 
     /// <summary>
@@ -280,8 +278,6 @@ public sealed class ReconciliationService : IAsyncDisposable
             IsUserDataStreamSupported = false;
             _metrics.RecordUserDataStreamProbe(supported: false);
             TradeLog.UserDataProbe(_rest.EnvironmentName, false, ex.HttpStatus, ex.ApiCode, ex.ApiMessage);
-            _logger.LogWarning("USER-DATA-PROBE: окружение {Env} не поддержало listenKey (http {Http}, code {Code})",
-                _rest.EnvironmentName, ex.HttpStatus, ex.ApiCode);
             throw;
         }
 
@@ -293,8 +289,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         IsUserDataStreamSupported = true;
         _metrics.RecordUserDataStreamProbe(supported: true);
         TradeLog.UserDataProbe(_rest.EnvironmentName, true, null, null, "listenKey+socket ok");
-        _logger.LogInformation("USER-DATA-START: listenKey получен, keepalive каждые {Minutes} мин, health-check каждые {Seconds} с",
-            _config.UserDataKeepAliveMinutes, _config.UserDataStreamHealthCheckSeconds);
+        TradeLog.UserDataStart(_config.UserDataKeepAliveMinutes, _config.UserDataStreamHealthCheckSeconds);
     }
 
     private async Task RecreateListenKeyAsync(CancellationToken ct)
@@ -303,7 +298,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         try
         {
             if (!IsRunning || ct.IsCancellationRequested) return;
-            _logger.LogWarning("USER-DATA-RECREATE: пересоздаю listenKey и переподключаю user-data stream");
+            TradeLog.Warn("USER-DATA-RECREATE", null, "пересоздаю listenKey и переподключаю user-data stream");
             try { await _ws.DisconnectUserDataStreamAsync(); } catch { /* best effort */ }
             if (_listenKey != null)
             {
@@ -317,7 +312,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "USER-DATA-RECREATE-FAIL: не удалось пересоздать listenKey");
+            TradeLog.Error("USER-DATA-RECREATE-FAIL", null, "не удалось пересоздать listenKey", ex);
         }
         finally
         {
@@ -347,7 +342,7 @@ public sealed class ReconciliationService : IAsyncDisposable
             _metrics.RecordReconciliation(report.TotalIssues);
 
             foreach (var finding in report.Findings)
-                _logger.LogWarning("RECON: {Finding}", finding);
+                TradeLog.ReconFinding(finding);
 
             await RemediateAsync(positionsSnapshot, openOrders, openLists, ct, activeEntries);
 
@@ -362,11 +357,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                 report.ExternalOrders, report.ProtectionMissing, unresolved, IsExecutionStateTrusted,
                 report.ActiveEntries, report.SkippedActiveEntryCancels);
 
-            _logger.LogInformation(
-                "RECON-SUMMARY: позиций {Positions}, сиротских OCO {OrphanOco}, сиротских ордеров {OrphanOrders}, " +
-                "внешних ордеров {External}, позиций без защиты {Missing}, неразрешённых {Unresolved}",
-                report.PositionsChecked, report.OrphanOcoLists, report.OrphanOrders,
-                report.ExternalOrders, report.ProtectionMissing, unresolved);
+
 
             return report;
         }
@@ -376,9 +367,8 @@ public sealed class ReconciliationService : IAsyncDisposable
             // P0.4: неизвестное состояние — freeze entries, а не оптимистичное продолжение.
             Interlocked.Increment(ref _unresolvedStateIssues);
             _metrics.RecordReconciliationFailure();
-            TradeLog.ReconFail(trigger, ex.Message);
+            TradeLog.ReconFail(trigger, ex.Message, ex);
             TradeLog.ExecutionStateBlocked("reconciliation-failed");
-            _logger.LogWarning(ex, "RECON-FAIL: реконсиляция не выполнена");
             return null;
         }
     }
@@ -492,7 +482,7 @@ public sealed class ReconciliationService : IAsyncDisposable
     {
         if (_applyExchangeFill is null || _adoptOrphanPosition is null)
         {
-            _logger.LogWarning("RECON: колбэки движка не настроены — только детект, без применения филлов/подхвата");
+            TradeLog.Warn("RECON-CALLBACKS-MISSING", null, "колбэки движка не настроены — только детект, без применения филлов/подхвата");
             return;
         }
 
@@ -533,8 +523,8 @@ public sealed class ReconciliationService : IAsyncDisposable
             {
                 live.SetProtection(null);
                 await _positions.SavePositionsAsync(ct);
-                _logger.LogWarning("RECON: защита {Symbol} OCO#{ListId} сброшена локально — будет переставлена контуром сопровождения",
-                    live.Symbol, prot.OrderListId);
+                TradeLog.Warn("RECON-PROTECTION-DROPPED", live.Symbol,
+                    $"OCO#{prot.OrderListId} сброшена локально — будет переставлена контуром сопровождения");
             }
         }
 
@@ -570,14 +560,12 @@ public sealed class ReconciliationService : IAsyncDisposable
                     await _adoptOrphanPosition(orphan, ct);
                     _metrics.RecordOrphanPositionAdopted();
                     TradeLog.ReconAdopt(orphan.Symbol, orphan.Quantity, orphan.EntryPrice, order.ClientOrderId);
-                    _logger.LogWarning("RECON-ADOPT: подхвачена сиротская позиция {Symbol} {Qty}@{Price} из ордера {ClientId}",
-                        orphan.Symbol, orphan.Quantity, orphan.EntryPrice, order.ClientOrderId);
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _unresolvedStateIssues);
-                    _logger.LogWarning(ex, "RECON-ADOPT-FAIL: не удалось подхватить {Symbol} по {ClientId}", intent.Symbol, intent.ClientOrderId);
+                    TradeLog.Error("RECON-ADOPT-FAIL", intent.Symbol, $"не удалось подхватить позицию по {intent.ClientOrderId}", ex);
                 }
             }
             else if (intent.Operation is nameof(ExecutionPriority.Close))
@@ -594,7 +582,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _unresolvedStateIssues);
-                    _logger.LogWarning(ex, "RECON-CLOSE-FAIL: не удалось применить close-филл {Symbol} {ClientId}", intent.Symbol, intent.ClientOrderId);
+                    TradeLog.Error("RECON-CLOSE-FAIL", intent.Symbol, $"не удалось применить close-филл {intent.ClientOrderId}", ex);
                 }
             }
         }
@@ -684,13 +672,13 @@ public sealed class ReconciliationService : IAsyncDisposable
                         _metrics.RecordOrphanOrderCanceled();
                         TradeLog.ReconCancel(order.Symbol, "order", order.ClientOrderId, "owner-lost-or-untracked-entry");
                     }
-                    _logger.LogWarning("RECON-CANCEL: снят сиротский ордер бота {Symbol} {ClientId}", order.Symbol, order.ClientOrderId);
+
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _unresolvedStateIssues);
-                    _logger.LogWarning(ex, "RECON-CANCEL-FAIL: не удалось снять сиротский ордер {Symbol} {ClientId}", order.Symbol, order.ClientOrderId);
+                    TradeLog.Error("RECON-CANCEL-FAIL", order.Symbol, $"не удалось снять сиротский ордер {order.ClientOrderId}", ex);
                 }
             }
 
@@ -712,13 +700,13 @@ public sealed class ReconciliationService : IAsyncDisposable
                         }, ct);
                     _metrics.RecordOrphanOrderCanceled();
                     TradeLog.ReconCancel(list.Symbol, "oco", list.OrderListId.ToString());
-                    _logger.LogWarning("RECON-CANCEL: снята сиротская OCO#{ListId} {Symbol}", list.OrderListId, list.Symbol);
+
                 }
                 catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList) { }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _unresolvedStateIssues);
-                    _logger.LogWarning(ex, "RECON-CANCEL-FAIL: не удалось снять сиротскую OCO#{ListId} {Symbol}", list.OrderListId, list.Symbol);
+                    TradeLog.Error("RECON-CANCEL-FAIL", list.Symbol, $"не удалось снять сиротскую OCO#{list.OrderListId}", ex);
                 }
             }
         }
@@ -727,10 +715,9 @@ public sealed class ReconciliationService : IAsyncDisposable
     private void OnExecutionReport(ExecutionReport report)
     {
         _metrics.RecordExecutionReport();
-        _logger.LogInformation(
-            "EXEC-REPORT: {Symbol} {Side} {Execution}/{Status} last={LastQty}@{LastPrice} cum={CumQty} id={ClientId}",
-            report.Symbol, report.Side, report.ExecutionType, report.OrderStatus,
-            report.LastQuantity, report.LastPrice, report.CumulativeQuantity, report.ClientOrderId);
+        TradeLog.Info("EXEC-REPORT", report.Symbol,
+            $"side={report.Side} type={report.ExecutionType} status={report.OrderStatus} " +
+            $"last={report.LastQuantity}@{report.LastPrice} cum={report.CumulativeQuantity} client_order_id={report.ClientOrderId}");
 
         if (!report.IsFill || _applyExchangeFill is null || _cts is null) return;
 
@@ -758,8 +745,6 @@ public sealed class ReconciliationService : IAsyncDisposable
                     if (applied)
                     {
                         TradeLog.ProtectionFillApplied(live.Symbol, reason, report.CumulativeQuantity, "user-data-stream");
-                        _logger.LogWarning("PROTECTION-FILLED-APPLIED: {Symbol} {Reason} cum={CumQty} применён к позиции без повторного MARKET",
-                            live.Symbol, reason, report.CumulativeQuantity);
                     }
                 }
                 finally
@@ -770,7 +755,7 @@ public sealed class ReconciliationService : IAsyncDisposable
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "PROTECTION-FILL-APPLY-FAIL: {Symbol} {ClientId}", report.Symbol, report.ClientOrderId);
+                TradeLog.Error("PROTECTION-FILL-APPLY-FAIL", report.Symbol, $"не применён филл {report.ClientOrderId}", ex);
             }
         }, _cts.Token);
     }
@@ -821,7 +806,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "USER-DATA-KEEPALIVE-FAIL: продление не удалось — пересоздаю listenKey");
+                    TradeLog.Warn("USER-DATA-KEEPALIVE-FAIL", null, "продление listenKey не удалось — пересоздаю", ex);
                     await RecreateListenKeyAsync(ct);
                 }
             }
@@ -837,7 +822,7 @@ public sealed class ReconciliationService : IAsyncDisposable
             while (await timer.WaitForNextTickAsync(ct))
             {
                 if (_ws.IsUserDataStreamConnected) continue;
-                _logger.LogWarning("USER-DATA-DOWN: socket не подключён — пересоздаю listenKey и реконсилирую");
+                TradeLog.Warn("USER-DATA-DOWN", null, "socket не подключён — пересоздаю listenKey и реконсилирую");
                 EnterDegradedMode("health-check-socket-down", ct);
                 await RecreateListenKeyAsync(ct);
             }

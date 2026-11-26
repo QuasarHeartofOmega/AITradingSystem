@@ -232,7 +232,6 @@ public sealed class QwenModel : IAIModel
                 "Vulkan: обновите llama.dll/ggml*.dll до llama.cpp >= b9892 (fix #24812: кластерный мусор на AMD Polaris/RX590). " +
                 "Сторож деградации + чистка KV в приложении — временная защита, не замена обновлению DLL.";
             AiLog.Backend("WARN: " + vulkanWarning);
-            _logger.LogWarning("{Warning}", vulkanWarning);
         }
 
         GpuProbe.EnrichFromNative(_logger);
@@ -458,9 +457,6 @@ public sealed class QwenModel : IAIModel
         _loadedModelPath = modelPath;
         _loadedThreads = threads;
 
-        _logger.LogInformation(
-            "Модель загружена. Backend={Backend}, Context={Context}, GpuLayers={Layers}, Threads={Threads}, Thinking={Thinking}",
-            ActiveBackend, ctx, layers, threads, _config.EnableThinking);
 
         AiLog.Backend($"модель загружена: backend={ActiveBackend}, ctx={ctx}, gpuLayers={layers}, " +
                       $"threads={threads}, maxTokens={_config.EffectiveMaxTokens}, thinking={_config.EnableThinking}, " +
@@ -517,7 +513,6 @@ public sealed class QwenModel : IAIModel
         }
 
         LoadWarning = $"Бэкенд {ActiveBackend}, но оффлоад на GPU = 0 — модель фактически считается на CPU";
-        _logger.LogWarning("{Warning}", LoadWarning);
         AiLog.Backend("WARN: " + LoadWarning + " — пробую один рестейдж/перезагрузку");
 
         try
@@ -720,9 +715,6 @@ public sealed class QwenModel : IAIModel
                         lastParseError = "пустой ответ (anti-prompt/EOS)";
                         lastRawResponse = "(пустой ответ модели)";
                         AiLog.ParseFailed(symbol, attempt, lastParseError, result.Text);
-                        _logger.LogWarning(
-                            "Модель вернула пустой ответ для {Symbol} за {Ms:F0} мс (попытка {Attempt}/{Max})",
-                            symbol, LastInferenceTimeMs, attempt, maxAttempts);
                         continue;
                     }
 
@@ -749,16 +741,11 @@ public sealed class QwenModel : IAIModel
                             $"entry={signal.EntryPrice}, sl={signal.StopLoss}, tp={signal.TakeProfit}, reason={signal.Reasoning}",
                             LastInferenceTimeMs);
 
-                        _logger.LogInformation(
-                            "Сигнал для {Symbol}: {Action} (Confidence: {Confidence:P0}, {Time:F0} мс, backend {Backend})",
-                            symbol, signal.Action, signal.Confidence, LastInferenceTimeMs, ActiveBackend);
 
                         return signal;
                     }
 
                     AiLog.ParseFailed(symbol, attempt, parseError ?? "unknown", result.Text);
-                    _logger.LogWarning("Не удалось распарсить JSON ответа модели. Попытка {Attempt}/{Max}: {Error}",
-                        attempt, maxAttempts, parseError);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -771,11 +758,11 @@ public sealed class QwenModel : IAIModel
                     lastException = ex;
                     lastParseError = ex.Message;
                     AiLog.Failure(symbol, ex, $"инференс, попытка {attempt}");
-                    _logger.LogError(ex, "Ошибка инференса для {Symbol}. Попытка {Attempt}", symbol, attempt);
                 }
             }
 
-            _logger.LogError("Все попытки получить валидный сигнал для {Symbol} провалились. Возвращаю Hold.", symbol);
+            AiLog.Warn("AI-EXHAUSTED", symbol,
+                $"все {maxAttempts} попыток не дали валидный сигнал — возвращаю Hold; последняя ошибка: {lastParseError ?? lastException?.Message ?? "-"}");
 
             return new TradingSignal
             {
@@ -944,9 +931,8 @@ public sealed class QwenModel : IAIModel
 
             if (result.TimedOut)
             {
-                _logger.LogWarning(
-                    "Инференс превысил таймаут {Timeout} мс. Использую частичный ответ ({Length} символов).",
-                    _config.InferenceTimeoutMs, result.Text.Length);
+                AiLog.Warn("AI-TIMEOUT", null,
+                    $"timeout_ms={_config.InferenceTimeoutMs} partial_chars={result.Text.Length} — использую частичный ответ");
 
                 if (string.IsNullOrWhiteSpace(result.Text))
                     throw new TimeoutException(
@@ -999,13 +985,13 @@ public sealed class QwenModel : IAIModel
         catch (JsonException ex)
         {
             error = $"ошибка JSON: {ex.Message}";
-            _logger.LogError(ex, "Ошибка парсинга JSON из ответа модели");
+            _logger.LogDebug(ex, "Ошибка парсинга JSON из ответа модели");
             return null;
         }
         catch (Exception ex)
         {
             error = $"ошибка разбора: {ex.Message}";
-            _logger.LogError(ex, "Ошибка парсинга ответа модели");
+            _logger.LogDebug(ex, "Ошибка парсинга ответа модели");
             return null;
         }
     }

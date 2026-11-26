@@ -74,7 +74,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
 
         ExchangeLog.WebSocket("подключение",
             $"{symbolList.Count * 2} стримов, окружение {_config.ResolvedEnvironment}, url {_streamUrl}");
-        _logger.LogInformation("Подключение к WebSocket. Стримов: {Count}", symbolList.Count * 2);
 
         await ConnectInternalAsync(_cts.Token);
         _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
@@ -113,7 +112,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         }
 
         ExchangeLog.WebSocket("resubscribe", $"{string.Join("/", streams)}");
-        _logger.LogInformation("DATA-WS-RESUBSCRIBE: {Streams}", string.Join("/", streams));
     }
 
     private async Task SendControlFrameAsync(ClientWebSocket ws, string method, string[] streams, CancellationToken ct)
@@ -181,19 +179,17 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         {
             await _ws.ConnectAsync(new Uri(_streamUrl!), ct);
             ExchangeLog.WebSocket("подключен", _streamUrl);
-            _logger.LogInformation("WebSocket подключен");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Не удалось подключиться к WebSocket {Url}", _streamUrl);
+            ExchangeLog.Error("WS-CONNECT-FAIL", null, $"url={_streamUrl}", ex);
             throw;
         }
     }
 
     public async Task DisconnectAsync()
     {
-        _logger.LogInformation("Отключение от WebSocket (получено сообщений: {Count}, ошибок парсинга: {Errors})",
-            _messagesReceived, _parseErrors);
+        ExchangeLog.Info("WS-DISCONNECT", null, $"messages={_messagesReceived} parse_errors={_parseErrors}");
 
         // P0.5: user-data socket гасится вместе с рыночным.
         await DisconnectUserDataStreamAsync();
@@ -226,7 +222,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         _cts?.Dispose();
         _cts = null;
 
-        _logger.LogInformation("WebSocket отключен");
     }
 
     private async Task ReceiveLoopAsync(CancellationToken ct)
@@ -244,8 +239,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        ExchangeLog.WebSocket("закрыт сервером", _ws.CloseStatusDescription);
-                        _logger.LogWarning("WebSocket закрыт сервером: {Status}", _ws.CloseStatus);
+                        ExchangeLog.WebSocket("закрыт сервером", $"status={_ws.CloseStatus} {_ws.CloseStatusDescription}");
                         break;
                     }
 
@@ -270,7 +264,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Ошибка в WebSocket receive loop");
+                    ExchangeLog.Error("WS-RECEIVE-FAIL", null, "ошибка цикла приёма рыночного стрима", ex);
                     OnError?.Invoke(ex);
                     break;
                 }
@@ -285,7 +279,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnDisconnected"); }
 
             ExchangeLog.WebSocket("переподключение", $"через {reconnectDelayMs} мс");
-            _logger.LogWarning("Переподключение через {Delay} мс...", reconnectDelayMs);
 
             try
             {
@@ -304,7 +297,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Ошибка переподключения");
+                ExchangeLog.Error("WS-RECONNECT-FAIL", null, "переподключение рыночного стрима не удалось", ex);
                 OnError?.Invoke(ex);
                 reconnectDelayMs = Math.Min(reconnectDelayMs * 2, 60_000);
             }
@@ -365,7 +358,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         {
             _parseErrors++;
             ExchangeLog.WebSocketParseError(json, ex);
-            _logger.LogError(ex, "Ошибка парсинга WebSocket сообщения");
         }
     }
 
@@ -388,7 +380,8 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         if (ohlcv.Close <= 0)
         {
             _parseErrors++;
-            _logger.LogWarning("Некорректная свеча {Symbol}: close={Close}", ohlcv.Symbol, kline.Close);
+            ExchangeLog.Warn("WS-CANDLE-INVALID", ohlcv.Symbol, $"close={kline.Close}",
+                gateKey: "ws-candle-invalid:" + ohlcv.Symbol);
             return;
         }
 
@@ -461,7 +454,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         await ConnectUserInternalAsync(_userCts.Token);
         _userReceiveTask = Task.Run(() => UserReceiveLoopAsync(_userCts.Token), _userCts.Token);
         ExchangeLog.WebSocket("user-data подключен", _config.ResolvedEnvironment.ToString());
-        _logger.LogInformation("User-data stream подключен (окружение {Env})", _config.ResolvedEnvironment);
     }
 
     private async Task ConnectUserInternalAsync(CancellationToken ct)
@@ -517,7 +509,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                     var result = await _userWs.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        _logger.LogWarning("User-data WebSocket закрыт сервером: {Status}", _userWs.CloseStatus);
+                        ExchangeLog.Warn("USER-WS-CLOSED", null, $"status={_userWs.CloseStatus}");
                         break;
                     }
 
@@ -538,7 +530,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                 catch (OperationCanceledException) { return; }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Ошибка в user-data receive loop");
+                    ExchangeLog.Error("USER-WS-RECEIVE-FAIL", null, "ошибка цикла приёма user-data стрима", ex);
                     OnError?.Invoke(ex);
                     break;
                 }
@@ -546,7 +538,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
 
             if (ct.IsCancellationRequested) break;
 
-            _logger.LogWarning("User-data WebSocket: переподключение через {Delay} мс", reconnectDelayMs);
+            ExchangeLog.WebSocket("user-data переподключение", $"через {reconnectDelayMs} мс");
             try
             {
                 await Task.Delay(reconnectDelayMs, ct);
@@ -558,7 +550,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             {
                 // Просроченный listenKey сюда же: пересоздание ключа — остаток P0.5,
                 // пока вызывающий (ReconciliationService) видит ошибку и может перезапустить контур.
-                _logger.LogError(ex, "Ошибка переподключения user-data WebSocket");
+                ExchangeLog.Error("USER-WS-RECONNECT-FAIL", null, "переподключение user-data стрима не удалось", ex);
                 OnError?.Invoke(ex);
                 reconnectDelayMs = Math.Min(reconnectDelayMs * 2, 60_000);
             }
@@ -590,7 +582,6 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         {
             _parseErrors++;
             ExchangeLog.WebSocketParseError(json, ex);
-            _logger.LogError(ex, "Ошибка парсинга user-data сообщения");
         }
     }
 

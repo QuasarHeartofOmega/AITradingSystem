@@ -144,7 +144,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             s.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase));
 
         if (info is null)
-            _logger.LogWarning("Символ {Symbol} не найден в exchangeInfo ({Env})", symbol, EnvironmentName);
+            ExchangeLog.Warn("SYMBOL-NOT-FOUND", symbol, $"нет в exchangeInfo ({EnvironmentName})");
         else
             _logger.LogDebug(
                 "Фильтры {Symbol}: step={Step} tick={Tick} minQty={MinQty} minNotional={MinNotional}",
@@ -195,16 +195,14 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             catch (Exception ex)
             {
                 skipped++;
-                _logger.LogWarning(ex, "Пропущена некорректная свеча {Symbol}", symbol);
+                _logger.LogDebug(ex, "Пропущена некорректная свеча {Symbol}", symbol);
             }
         }
 
         if (skipped > 0)
-            _logger.LogWarning("Klines {Symbol}: пропущено {Skipped} некорректных строк из {Total}",
-                symbol, skipped, response.Count);
+            ExchangeLog.Warn("KLINES-SKIPPED", symbol,
+                $"пропущено {skipped} некорректных строк из {response.Count}");
 
-        _logger.LogDebug("Klines {Symbol} {Interval}: получено {Count} свечей, последняя закрыта={Closed}",
-            symbol, interval, result.Count, result.Count > 0 && result[^1].IsClosed);
 
         return result;
     }
@@ -225,7 +223,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
                 balance.UpdateAsset(b.Asset, free, locked);
         }
 
-        _logger.LogInformation("Баланс {Env}: {Usdt} USDT доступно", EnvironmentName, balance.AvailableUSDT);
+        ExchangeLog.Balance(EnvironmentName, balance.AvailableUSDT, "USDT");
         return balance;
     }
 
@@ -341,7 +339,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
         await SendRequestAsync<BinanceOrderResponse>(
             $"/api/v3/order?{query}", HttpMethod.Delete, signed: true, ct: ct);
 
-        ExchangeLog.Order("CANCELED", symbol, "-", 0m, 0m, $"id={orderId}");
+        ExchangeLog.OrderCanceled(symbol, orderId.ToString(CultureInfo.InvariantCulture));
     }
 
     /// <summary>
@@ -424,7 +422,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             $"/api/v3/orderList?symbol={symbol.ToUpperInvariant()}&{key}",
             HttpMethod.Delete, signed: true, ct: ct);
 
-        ExchangeLog.Order("CANCELED-OCO", symbol, "-", 0m, 0m, $"listId={orderListId} client={listClientOrderId}");
+        ExchangeLog.OcoCanceled(symbol, orderListId, listClientOrderId);
     }
 
     public async Task<List<ProtectiveOrderList>> GetOpenOrderListsAsync(string? symbol = null, CancellationToken ct = default)
@@ -609,12 +607,12 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             _serverTimeOffsetMs = serverTime - localBefore - latency;
             _timeSynced = true;
 
-            _logger.LogInformation("Синхронизация времени с Binance: смещение {Offset} мс (RTT {Rtt} мс)",
-                _serverTimeOffsetMs, localAfter - localBefore);
+            ExchangeLog.Info("TIME-SYNC", null,
+                $"offset_ms={_serverTimeOffsetMs} rtt_ms={localAfter - localBefore}");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Не удалось синхронизировать время с сервером — используем локальные часы");
+            ExchangeLog.Warn("TIME-SYNC-FAIL", null, "используем локальные часы", ex);
             _timeSynced = true; // не блокируем торговлю из-за недоступности /time
         }
         finally
@@ -660,10 +658,11 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             if (throttle > TimeSpan.Zero)
             {
                 _rateLimitMetrics?.RecordWeightThrottle(throttle.TotalMilliseconds, critical);
-                _logger.LogWarning(
-                    "RATE-THROTTLE {Endpoint}: ожидание {Delay:F0} мс (вес {Used}/{Limit}, бан={Banned}, критичный={Critical})",
-                    endpoint, throttle.TotalMilliseconds, WeightBudget.GetUsedWeight(DateTime.UtcNow),
-                    WeightBudget.LimitPerMinute, WeightBudget.IsBanned(DateTime.UtcNow), critical);
+                ExchangeLog.Warn("RATE-THROTTLE", null,
+                    $"endpoint={endpoint} delay_ms={LogOptions.N(throttle.TotalMilliseconds)} " +
+                    $"weight={WeightBudget.GetUsedWeight(DateTime.UtcNow)}/{WeightBudget.LimitPerMinute} " +
+                    $"banned={WeightBudget.IsBanned(DateTime.UtcNow)} critical={critical}",
+                    gateKey: "rate-throttle:" + endpoint);
                 await Task.Delay(throttle, ct);
             }
 
@@ -711,15 +710,17 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
                     response.Content.ReadAsStringAsync(attemptCts.Token), bodyBudget, ct, $"{endpoint} (body)");
                 sw.Stop();
 
-                ExchangeLog.Response(method.Method, fullUrl, (int)response.StatusCode,
-                    sw.Elapsed.TotalMilliseconds, content);
-
                 // P1.6: факт израсходованного веса из заголовка биржи — важнее локальных оценок.
+                int? usedWeightHeader = null;
                 if (TryReadUsedWeight(response, out var usedWeight))
                 {
+                    usedWeightHeader = usedWeight;
                     WeightBudget.ObserveUsedWeight(usedWeight, DateTime.UtcNow);
                     _rateLimitMetrics?.RecordRestWeight(usedWeight, WeightBudget.LimitPerMinute);
                 }
+
+                ExchangeLog.Response(method.Method, fullUrl, (int)response.StatusCode,
+                    sw.Elapsed.TotalMilliseconds, content, usedWeightHeader, WeightBudget.LimitPerMinute);
 
                 if (response.IsSuccessStatusCode)
                 {
@@ -757,10 +758,9 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
 
                     WeightBudget.RegisterBan(rateLimitBackoff, DateTime.UtcNow);
                     _rateLimitMetrics?.RecordRateLimitHit((int)response.StatusCode, apiCode, rateLimitBackoff.TotalMilliseconds);
-                    _logger.LogWarning(
-                        "RATE-LIMIT {Status} code={Code} {Endpoint}: backoff {Backoff:F0} мс, все запросы приостановлены до окончания бана",
-                        (int)response.StatusCode, apiCode?.ToString(CultureInfo.InvariantCulture) ?? "-", endpoint,
-                        rateLimitBackoff.TotalMilliseconds);
+                    ExchangeLog.Warn("RATE-LIMIT", null,
+                        $"status={(int)response.StatusCode} code={apiCode?.ToString(CultureInfo.InvariantCulture) ?? "-"} endpoint={endpoint} " +
+                        $"backoff_ms={LogOptions.N(rateLimitBackoff.TotalMilliseconds)} — все запросы приостановлены до окончания бана");
                 }
 
                 var transient = IsTransient(response.StatusCode, apiCode);
@@ -798,7 +798,7 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
 
                 if (attempt >= maxAttempts)
                 {
-                    _logger.LogError(ex, "Запрос {Endpoint} провалился после {Attempts} попыток", endpoint, attempt);
+                    ExchangeLog.Error("HTTP-FAILED", null, $"endpoint={endpoint} attempts={attempt}", ex);
                     throw;
                 }
 

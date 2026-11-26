@@ -1,6 +1,6 @@
 using Serilog;
+using Serilog.Core;
 using Serilog.Events;
-using Serilog.Filters;
 using AITradingSystem.Common.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -9,16 +9,23 @@ namespace AITradingSystem.Common.Logging;
 /// <summary>
 /// Централизованная инициализация логгера (FR-8.1).
 ///
-/// Схема вывода:
-///   logs/trading-*.log   — общий лог приложения;
-///   logs/ai-*.log        — промпты, сырые ответы модели, рассуждения, распарсенные сигналы;
-///   logs/exchange-*.log  — все REST-запросы/ответы Binance, ошибки API, WebSocket;
-///   logs/news-*.log      — запросы новостных агрегаторов и контекст для модели;
-///   logs/trades-*.log    — торговые решения, ордера, открытие/закрытие позиций, баланс.
+/// Каналы и файлы:
+///   logs/trading-*.log   — общий лог: жизненный цикл, ошибки инфраструктуры, торговые события;
+///   logs/trades-*.log    — только торговые решения/ордера/позиции/риск (канал trade);
+///   logs/exchange-*.log  — REST/WS биржи: одна строка на запрос + выжимка тела;
+///   logs/ai-*.log        — промпты, рассуждения, ответы модели, разобранные предложения;
+///   logs/ai-native-*.log — нативный вывод llama.cpp/ggml (отдельно, чтобы не топил ai-лог);
+///   logs/news-*.log      — новостные провайдеры и контекст для модели.
 ///
-/// «Диагностические» каналы (ai/exchange/news) пишутся на уровне <see cref="LoggingConfig.DiagnosticsLevel"/>
-/// независимо от общего MinimumLevel — чтобы промпт и ответ модели были видны всегда,
-/// а консоль при этом не засорялась.
+/// Правила, которые делают лог разборчивым:
+///   • один формат строки для всех приёмников (<see cref="UnifiedLogFormatter"/>);
+///   • одно событие — одна запись: каналы пишут события, ILogger сервисов — только
+///     жизненный цикл и инфраструктурные ошибки, без дублей тегов;
+///   • повторяющиеся состояния подавляются (<see cref="LogGate"/>) и возвращаются
+///     строкой с repeats=N, а не тысячами одинаковых строк;
+///   • «диагностические» каналы (ai/ai-native/exchange/news) пишутся на уровне
+///     <see cref="LoggingConfig.DiagnosticsLevel"/> в свои файлы и по умолчанию не
+///     попадают ни в консоль, ни в общий лог.
 /// </summary>
 public static class Logger
 {
@@ -30,7 +37,7 @@ public static class Logger
 
     /// <summary>
     /// Инициализирует глобальный логгер Serilog. Повторный вызов переинициализирует
-    /// логгер (например, после смены настроек в UI) вместо выброса исключения.
+    /// логгер (например, после смены настроек в UI).
     /// </summary>
     public static void Initialize(LoggingConfig config)
     {
@@ -52,56 +59,47 @@ public static class Logger
                 .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
                 .MinimumLevel.Override("System", LogEventLevel.Warning)
                 .Enrich.FromLogContext()
-                .Enrich.WithThreadId()
-                .Enrich.WithMachineName()
+                .Enrich.With<DefaultChannelEnricher>()
                 .Enrich.WithProperty("Application", "AITradingSystem");
 
             if (config.WriteToConsole)
             {
                 loggerConfig.WriteTo.Logger(lc => lc
-                    .Filter.ByExcluding(e => IsDiagnostic(e) && GetLevel(e) < appLevel)
+                    .Filter.ByExcluding(e => IsQuiet(e) || (IsDiagnostic(e) && e.Level < appLevel))
                     .WriteTo.Console(
                         restrictedToMinimumLevel: appLevel,
-                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] [{Channel}] {Message:lj}{NewLine}{Exception}"));
+                        formatter: new UnifiedLogFormatter(compactTime: true, showSource: false)));
             }
 
             if (config.WriteToFile)
             {
-                var mainTemplate =
-                    "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [{ThreadId}] [{Channel}] {SourceContext} {Message:lj}{NewLine}{Exception}";
-
-                loggerConfig.WriteTo.Logger(lc =>
-                {
-                    lc.Filter.ByExcluding(e =>
-                        (config.ExcludeDiagnosticsFromMainLog && IsDiagnostic(e)) || GetLevel(e) < appLevel);
-                    lc.WriteTo.File(
+                // Общий лог: всё, кроме тихих/диагностических каналов.
+                loggerConfig.WriteTo.Logger(lc => lc
+                    .Filter.ByExcluding(e =>
+                        IsQuiet(e) ||
+                        e.Level < appLevel ||
+                        (config.ExcludeDiagnosticsFromMainLog && IsDiagnostic(e)))
+                    .WriteTo.File(
+                        formatter: new UnifiedLogFormatter(),
                         path: Path.Combine(config.LogPath, "trading-.log"),
                         rollingInterval: RollingInterval.Day,
                         retainedFileCountLimit: config.RetainedFileCount,
                         fileSizeLimitBytes: (long)config.MaxFileSizeMb * 1024 * 1024,
                         rollOnFileSizeLimit: true,
-                        outputTemplate: mainTemplate,
-                        shared: true);
-                });
+                        shared: true));
 
                 if (config.SeparateChannelFiles)
                 {
-                    AddChannelFile(loggerConfig, config, LogChannel.Ai, "ai-.log", diagLevel);
-                    AddChannelFile(loggerConfig, config, LogChannel.Exchange, "exchange-.log", diagLevel);
-                    AddChannelFile(loggerConfig, config, LogChannel.News, "news-.log", diagLevel);
                     AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", LogEventLevel.Information);
+                    AddChannelFile(loggerConfig, config, LogChannel.Exchange, "exchange-.log", diagLevel);
+                    AddChannelFile(loggerConfig, config, LogChannel.Ai, "ai-.log", diagLevel);
+                    AddChannelFile(loggerConfig, config, LogChannel.AiNative, "ai-native-.log", diagLevel);
+                    AddChannelFile(loggerConfig, config, LogChannel.News, "news-.log", diagLevel);
                 }
                 else
                 {
-                    // Обратная совместимость: один файл торговых событий.
-                    loggerConfig.WriteTo.Logger(lc => lc
-                        .Filter.ByIncludingOnly(Matching.WithProperty("Channel", LogChannel.Trade))
-                        .WriteTo.File(
-                            path: Path.Combine(config.LogPath, "trades-.log"),
-                            rollingInterval: RollingInterval.Day,
-                            retainedFileCountLimit: 30,
-                            restrictedToMinimumLevel: LogEventLevel.Information,
-                            outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} {Message:lj}{NewLine}"));
+                    // Один файл торговых событий, если разделение каналов выключено.
+                    AddChannelFile(loggerConfig, config, LogChannel.Trade, "trades-.log", LogEventLevel.Information);
                 }
             }
 
@@ -112,16 +110,16 @@ public static class Logger
             _initialized = true;
 
             Log.Information(
-                "Логгер инициализирован. Level={Level}, Diagnostics={Diagnostics}, Path={Path}, Channels={Channels}",
+                "LOGGER-START level={Level} diagnostics={Diagnostics} path={Path} http_bodies={Bodies} state_heartbeat_s={Heartbeat} channels={Channels}",
                 config.MinimumLevel, config.DiagnosticsLevel, Path.GetFullPath(config.LogPath),
-                config.SeparateChannelFiles ? "ai/exchange/news/trade" : "trade");
+                LogOptions.EffectiveHttpBodyMode, config.StateHeartbeatSeconds,
+                config.SeparateChannelFiles ? "trade/exchange/ai/ai-native/news" : "trade");
         }
     }
 
     /// <summary>
     /// Подключает Serilog к Microsoft.Extensions.Logging (ILogger&lt;T&gt;).
-    /// Без этого все ILogger-сообщения сервисов уходят в консоль по умолчанию
-    /// и НЕ попадают в файлы логов.
+    /// Без этого сообщения сервисов не попадают в файлы логов.
     /// </summary>
     public static void AttachToLoggingBuilder(ILoggingBuilder builder)
     {
@@ -137,37 +135,29 @@ public static class Logger
         string fileName,
         LogEventLevel channelLevel)
     {
-        // События канала идут в свой файл; всё, что выше общего уровня,
-        // дополнительно остаётся в основном логе (его фильтр настроен отдельно).
         root.WriteTo.Logger(lc => lc
-            .Filter.ByIncludingOnly(e => IsChannel(e, channel) || (channel == LogChannel.Trade && IsTradeContext(e)))
+            .Filter.ByIncludingOnly(e => IsChannel(e, channel))
             .WriteTo.File(
+                formatter: new UnifiedLogFormatter(),
                 path: Path.Combine(config.LogPath, fileName),
                 rollingInterval: RollingInterval.Day,
                 retainedFileCountLimit: config.RetainedFileCount,
                 fileSizeLimitBytes: (long)config.MaxFileSizeMb * 1024 * 1024,
                 rollOnFileSizeLimit: true,
                 restrictedToMinimumLevel: channelLevel,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}",
                 shared: true));
     }
 
     private static bool IsChannel(LogEvent e, string channel) =>
         e.Properties.TryGetValue("Channel", out var value) &&
-        value is ScalarValue scalar &&
-        scalar.Value is string s &&
+        value is ScalarValue { Value: string s } &&
         string.Equals(s, channel, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsDiagnostic(LogEvent e) =>
         IsChannel(e, LogChannel.Ai) || IsChannel(e, LogChannel.Exchange) || IsChannel(e, LogChannel.News);
 
-    private static bool IsTradeContext(LogEvent e) =>
-        e.Properties.TryGetValue("SourceContext", out var value) &&
-        value is ScalarValue scalar &&
-        scalar.Value is string s &&
-        (s.Contains(".Trading.", StringComparison.Ordinal) || s.EndsWith("OrderExecutor", StringComparison.Ordinal));
-
-    private static LogEventLevel GetLevel(LogEvent e) => e.Level;
+    /// <summary>Нативный вывод модели живёт только в своём файле — он не нужен ни в консоли, ни в общем логе.</summary>
+    private static bool IsQuiet(LogEvent e) => IsChannel(e, LogChannel.AiNative);
 
     private static LogEventLevel ParseLevel(string text, LogEventLevel fallback) =>
         Enum.TryParse<LogEventLevel>(text, true, out var level) ? level : fallback;
@@ -177,11 +167,16 @@ public static class Logger
         LogOptions.LogPrompts = config.LogPrompts;
         LogOptions.LogAiResponses = config.LogAiResponses;
         LogOptions.LogThinking = config.LogThinking;
+        LogOptions.LogNativeAiOutput = config.LogNativeAiOutput;
         LogOptions.LogHttpTraffic = config.LogHttpTraffic;
         LogOptions.LogHttpBodies = config.LogHttpBodies;
+        LogOptions.HttpBodyMode = config.HttpBodyMode;
         LogOptions.LogNews = config.LogNews;
         LogOptions.MaxTextLength = config.MaxTextLength;
         LogOptions.MaskSecrets = config.MaskSecrets;
+
+        LogGate.HeartbeatSeconds = config.StateHeartbeatSeconds;
+        LogGate.Reset();
     }
 
     /// <summary>Корректное завершение работы логгера.</summary>
@@ -191,9 +186,21 @@ public static class Logger
         {
             if (!_initialized) return;
 
-            Log.Information("Логгер завершает работу.");
+            Log.Information("LOGGER-STOP");
             Log.CloseAndFlush();
             _initialized = false;
+        }
+    }
+
+    /// <summary>Событие без канала относится к system — чтобы поле [канал] никогда не было пустым.</summary>
+    private sealed class DefaultChannelEnricher : ILogEventEnricher
+    {
+        private static readonly LogEventProperty SystemChannel = new("Channel", new ScalarValue(LogChannel.System));
+
+        public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
+        {
+            if (!logEvent.Properties.ContainsKey("Channel"))
+                logEvent.AddPropertyIfAbsent(SystemChannel);
         }
     }
 }

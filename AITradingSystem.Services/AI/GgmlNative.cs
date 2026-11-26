@@ -347,7 +347,7 @@ public static class GgmlNative
                 4 => "[native DEBUG] ",
                 _ => "[native] "
             };
-            AiLog.Backend(prefix + line);
+            AiLog.Native(prefix + line);
         }
         catch
         {

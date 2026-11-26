@@ -175,9 +175,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
 
         if (restored > 0)
         {
-            _logger.LogInformation(
-                "Журнал исполнения восстановлен: {Restored} ключей, из них {Unresolved} без подтверждения биржи",
-                restored, unresolved);
+            TradeLog.Info("EXEC-JOURNAL-RESTORED", null, $"keys={restored} unresolved={unresolved}");
         }
 
         await _journal.PruneAsync(ttl, ct).ConfigureAwait(false);
@@ -288,8 +286,6 @@ public sealed class ExecutionQueue : IAsyncDisposable
                 if (_completed.TryGetValue(key, out var cached) && !cached.Failed)
                 {
                     ReplayedResults++;
-                    _logger.LogInformation(
-                        "Идемпотентность: {Key} уже исполнен — повторная отправка пропущена ({Symbol})", key, symbol);
                     TradeLog.Decision(symbol, "IDEMPOTENT-REPLAY",
                         $"{key}: результат взят из кэша, ордер повторно не отправляется");
                     hasReplay = true;
@@ -369,9 +365,6 @@ public sealed class ExecutionQueue : IAsyncDisposable
 
         if (result is null)
         {
-            _logger.LogInformation(
-                "Намерение {Key} ({Symbol}) на бирже не найдено — ключ снят, отправка разрешена",
-                intent.ClientOrderId, intent.Symbol);
             TradeLog.Decision(intent.Symbol, "EXEC-INTENT-CLEARED",
                 $"{intent.ClientOrderId}: биржа об ордере не знает — ключ идемпотентности снят");
             return (false, null);
@@ -384,9 +377,6 @@ public sealed class ExecutionQueue : IAsyncDisposable
             ReplayedResults++;
         }
 
-        _logger.LogWarning(
-            "Намерение {Key} ({Symbol}) подтверждено биржей после рестарта — повторная отправка пропущена",
-            intent.ClientOrderId, intent.Symbol);
         TradeLog.Decision(intent.Symbol, "EXEC-INTENT-RESOLVED",
             $"{intent.ClientOrderId}: ордер найден на бирже, берём его состояние вместо повторной отправки");
 
@@ -423,10 +413,9 @@ public sealed class ExecutionQueue : IAsyncDisposable
 
         _cts = new CancellationTokenSource();
         _dispatcher = Task.Run(() => DispatchLoopAsync(_cts.Token));
-        _logger.LogInformation(
-            "Очередь исполнения запущена: параллелизм {Parallel}, TTL идемпотентности {Ttl} с, попыток на операцию {Attempts}, журнал {Journal}",
-            _config.ExecutionQueueMaxParallel, _config.ExecutionIdempotencyTtlSeconds,
-            _config.ExecutionRetryMaxAttempts, _journal != null ? "включён" : "выключен");
+        TradeLog.Info("EXEC-QUEUE-START", null,
+            $"parallel={_config.ExecutionQueueMaxParallel} idempotency_ttl_s={_config.ExecutionIdempotencyTtlSeconds} " +
+            $"attempts={_config.ExecutionRetryMaxAttempts} journal={(_journal != null ? "on" : "off")}");
     }
 
     private async Task DispatchLoopAsync(CancellationToken ct)
@@ -510,11 +499,8 @@ public sealed class ExecutionQueue : IAsyncDisposable
 
         if (waitMs > _config.ExecutionQueueWarnWaitMs)
         {
-            _logger.LogWarning(
-                "Очередь исполнения: {Symbol} {Priority} ждал {Wait:F0} мс (порог {Threshold} мс)",
-                item.Symbol, item.Priority, waitMs, _config.ExecutionQueueWarnWaitMs);
             TradeLog.Decision(item.Symbol, "QUEUE-WAIT",
-                $"{item.Priority} ждал {waitMs:F0} мс при пороге {_config.ExecutionQueueWarnWaitMs} мс");
+                $"{item.Priority} ждал {LogOptions.N(waitMs)} мс при пороге {_config.ExecutionQueueWarnWaitMs} мс", alarm: true);
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(queueToken, item.CallerToken);
@@ -574,11 +560,9 @@ public sealed class ExecutionQueue : IAsyncDisposable
                 await TryJournalAsync(intent).ConfigureAwait(false);
             }
 
-            _logger.LogWarning(
-                "Очередь исполнения: {Symbol} {Priority} попытка {Attempt}/{Max} не удалась ({Error}), повтор через {Delay:F0} мс с тем же clientOrderId {Key}",
-                item.Symbol, item.Priority, item.Attempts, maxAttempts, error.Message, delay, item.Key ?? "-");
             TradeLog.Decision(item.Symbol, "QUEUE-RETRY",
-                $"{item.Priority}: попытка {item.Attempts}/{maxAttempts} — {error.Message}; повтор через {delay:F0} мс, ключ {item.Key ?? "-"}");
+                $"{item.Priority}: попытка {item.Attempts}/{maxAttempts} — {error.Message}; " +
+                $"повтор через {LogOptions.N(delay)} мс, ключ {item.Key ?? "-"}", alarm: true);
 
             // Разбудить диспетчер, когда backoff истечёт (и сразу — освободились слоты).
             _ = Task.Delay(delay, CancellationToken.None).ContinueWith(
@@ -634,7 +618,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Журнал исполнения: не удалось зафиксировать {Key}", intent.ClientOrderId);
+            TradeLog.Error("EXEC-JOURNAL-WRITE-FAIL", intent.Symbol, $"не удалось зафиксировать {intent.ClientOrderId}", ex);
         }
     }
 

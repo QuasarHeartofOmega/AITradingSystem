@@ -152,11 +152,9 @@ public sealed class PositionMonitor : IAsyncDisposable
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _loop = Task.Run(() => LoopAsync(_cts.Token));
 
-        _logger.LogInformation(
-            "Контур сопровождения позиций запущен: тик-интервал {Interval} мс, принудительный обход раз в {Sweep} с, порог задержки {Max} мс",
-            _config.PositionMonitorIntervalMs, _config.PositionMonitorSweepSeconds, _config.PositionMonitorMaxLatencyMs);
-        TradeLog.Decision("-", "MONITOR-START",
-            $"независимый контур: интервал {_config.PositionMonitorIntervalMs} мс, sweep {_config.PositionMonitorSweepSeconds} с");
+        TradeLog.Info("MONITOR-START", null,
+            $"tick_interval_ms={_config.PositionMonitorIntervalMs} sweep_s={_config.PositionMonitorSweepSeconds} " +
+            $"max_latency_ms={_config.PositionMonitorMaxLatencyMs}");
     }
 
     public async Task StopAsync()
@@ -186,9 +184,8 @@ public sealed class PositionMonitor : IAsyncDisposable
         _cts = null;
         _loop = null;
 
-        _logger.LogInformation(
-            "Контур сопровождения остановлен: проверок {Checks}, задержка посл./макс. {Last:F0}/{Max:F0} мс",
-            ChecksProcessed, LastLatencyMs, MaxLatencyMs);
+        TradeLog.Info("MONITOR-STOP", null,
+            $"checks={ChecksProcessed} latency_last_ms={LogOptions.N(LastLatencyMs)} latency_max_ms={LogOptions.N(MaxLatencyMs)}");
     }
 
     private async Task LoopAsync(CancellationToken ct)
@@ -318,16 +315,15 @@ public sealed class PositionMonitor : IAsyncDisposable
                     }
                     else if (FailClosedWithoutProtection)
                     {
-                        _logger.LogError("Позиция {Symbol} без биржевой защиты — аварийное закрытие market", position.Symbol);
                         TradeLog.Rejected(position.Symbol, "protection",
                             "OCO не поставлена: закрываем позицию, чтобы капитал не зависел от живого процесса");
                         closeReason = "NoExchangeProtection";
                     }
                     else
                     {
-                        _logger.LogWarning(
-                            "Позиция {Symbol} без биржевой защиты: работает только локальный SL (Trading:ClosePositionIfProtectionFails=false)",
-                            position.Symbol);
+                        TradeLog.Warn("PROTECTION-LOCAL-ONLY", position.Symbol,
+                            "биржевой защиты нет, работает только локальный SL (Trading:ClosePositionIfProtectionFails=false)",
+                            gateKey: "protection-local-only:" + position.Symbol);
                     }
                 }
 
@@ -393,9 +389,8 @@ public sealed class PositionMonitor : IAsyncDisposable
         if (!await _orderExecutor.UpdateStopLossAsync(position, newStopLoss, ct))
             return;
 
-        _logger.LogInformation(
-            "Trailing Stop обновлён для {Symbol}: {NewSL} (биржевая защита: {Protection})",
-            position.Symbol, newStopLoss, position.Protection?.ToString() ?? "локальный SL");
+        TradeLog.Info("TRAILING-STOP", position.Symbol,
+            $"sl={LogOptions.N(newStopLoss)} protection={position.Protection?.ToString() ?? "локальный SL"}");
 
         // Персистим сразу: подтянутый стоп и id ног должны пережить рестарт (NFR-2.2).
         await _positionManager.SavePositionsAsync(ct);
@@ -434,11 +429,8 @@ public sealed class PositionMonitor : IAsyncDisposable
             return;
 
         _lastLatencyWarningUtc[symbol] = DateTime.UtcNow;
-        _logger.LogWarning(
-            "Сопровождение {Symbol} отстаёт: {Latency:F0} мс от тика до проверки (порог {Threshold} мс)",
-            symbol, latencyMs, _config.PositionMonitorMaxLatencyMs);
         TradeLog.Decision(symbol, "MONITOR-LAG",
-            $"задержка сопровождения {latencyMs:F0} мс > {_config.PositionMonitorMaxLatencyMs} мс");
+            $"задержка сопровождения {LogOptions.N(latencyMs)} мс > {_config.PositionMonitorMaxLatencyMs} мс", alarm: true);
     }
 
     /// <summary>

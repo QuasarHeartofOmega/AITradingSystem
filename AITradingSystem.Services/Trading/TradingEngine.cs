@@ -188,14 +188,12 @@ public sealed class TradingEngine : IAsyncDisposable
                 _config.Trading.VolatileSymbols, _config.Trading.StablecoinPairs, _config.Trading.BenchmarkSymbols);
             var aiRole = _config.AI.ResolvedRole;
             TradeLog.LlmRole(aiRole.ToString(), _config.AI.Enabled, _config.AI.VetoBudgetSeconds);
-            _logger.LogInformation("P0.5: роль LLM={Role}, enabled={Enabled}, config_hash={Hash}",
-                aiRole, _config.AI.Enabled, _configHash);
 
             // P0.5: модель загружается только если роль не Off — детерминированный путь работает без неё.
             if (aiRole != AiRole.Off)
                 await _aiModel.LoadAsync(ct);
             else
-                _logger.LogInformation("P0.5: AI.Role=Off — модель не загружается, вход только из engine setup");
+                TradeLog.Info("LLM-ROLE-OFF", null, "модель не загружается, вход только из engine setup");
 
             // P0.3: ключи идемпотентности из журнала намерений — ДО первой торговой операции.
             // Иначе после рестарта повторное закрытие/защита ушли бы вторым ордером.
@@ -203,13 +201,12 @@ public sealed class TradingEngine : IAsyncDisposable
             var unresolved = _executionQueue.UnresolvedIntents;
             if (unresolved.Count > 0)
             {
-                _logger.LogWarning(
-                    "Незавершённых намерений исполнения: {Count} ({Keys}) — судьба ордеров сверяется с биржей при повторе; полная реконсиляция — P0.5",
-                    unresolved.Count, string.Join(", ", unresolved.Select(i => i.ClientOrderId)));
+                TradeLog.Warn("EXEC-INTENTS-UNRESOLVED", null,
+                    $"count={unresolved.Count} keys={string.Join(",", unresolved.Select(i => i.ClientOrderId))} — судьба ордеров сверяется с биржей при повторе");
             }
             else if (restoredIntents > 0)
             {
-                _logger.LogInformation("Восстановлено ключей идемпотентности: {Count}", restoredIntents);
+                TradeLog.Info("EXEC-KEYS-RESTORED", null, $"count={restoredIntents}");
             }
 
             // Восстановление позиций
@@ -233,9 +230,9 @@ public sealed class TradingEngine : IAsyncDisposable
             if (riskState != null)
             {
                 _riskManager.DrawdownTracker.RestoreState(riskState);
-                _logger.LogInformation(
-                    "RISK-STATE-RESTORED: пик {Peak:F2}, старт дня {DayStart:F2} ({Day:yyyy-MM-dd}), макс. просадка {MaxDd:P2}",
-                    riskState.PeakBalance, riskState.DayStartBalance, riskState.DayStartUtc, riskState.MaxDrawdownPercent);
+                TradeLog.Info("RISK-STATE-RESTORED", null,
+                    $"peak={LogOptions.N(riskState.PeakBalance, "F2")} day_start={LogOptions.N(riskState.DayStartBalance, "F2")} " +
+                    $"day={riskState.DayStartUtc:yyyy-MM-dd} max_drawdown_pct={LogOptions.N(riskState.MaxDrawdownPercent * 100m, "F2")}");
 
                 // P0.2: авария переживает рестарт; входы остаются заблокированными до явного reset.
                 if (riskState.KillSwitchEngaged)
@@ -248,8 +245,6 @@ public sealed class TradingEngine : IAsyncDisposable
                     _killSwitchCloseStatus = string.IsNullOrWhiteSpace(riskState.KillSwitchCloseStatus)
                         ? "UNPROTECTED_OR_OPEN" : riskState.KillSwitchCloseStatus;
                     TradeLog.KillSwitchRestored(_killSwitchReason, _killSwitchCloseStatus);
-                    _logger.LogCritical("KILL-SWITCH-RESTORED: {Reason}; статус закрытия={Status}; требуется ручной сброс",
-                        _killSwitchReason, _killSwitchCloseStatus);
                     OnKillSwitchEngaged?.Invoke(_killSwitchReason);
                 }
             }
@@ -260,10 +255,10 @@ public sealed class TradingEngine : IAsyncDisposable
                 // P0.4: виртуальный баланс переживает рестарт — иначе дневной PnL считался бы с нуля.
                 _paperFreeCash = riskState?.FreeCashQuote
                     ?? (riskState?.CurrentBalance > 0 ? riskState.CurrentBalance : _config.Trading.PaperTradingInitialBalance);
-                _logger.LogInformation("Режим Paper Trading: виртуальный free cash {Cash} USDT ({Source})",
-                    _paperFreeCash,
-                    riskState?.FreeCashQuote.HasValue == true ? "восстановлен из scoped risk-state" :
-                    riskState?.CurrentBalance > 0 ? "миграция legacy equity" : "начальный из конфига");
+                TradeLog.Info("PAPER-BALANCE", null,
+                    $"free_cash={LogOptions.N(_paperFreeCash, "F2")} source=" +
+                    (riskState?.FreeCashQuote.HasValue == true ? "scoped-risk-state" :
+                     riskState?.CurrentBalance > 0 ? "legacy-equity" : "config"));
                 await UpdateRiskSnapshotAsync(_accountSnapshots.CreatePaper(_paperFreeCash), ct);
             }
             else
@@ -280,10 +275,8 @@ public sealed class TradingEngine : IAsyncDisposable
             var allTrades = await _tradeHistory.GetAllTradesAsync(ct);
             _portfolioRisk.RebuildFromHistory(allTrades);
             _metrics.RecordPortfolioLossStreak(_portfolioRisk.ConsecutiveLosses, _portfolioRisk.PauseUntilUtc);
-            _logger.LogInformation(
-                "PORTFOLIO-RISK-RESTORED: сделок {Trades}, серия убытков {Streak}, пауза до {Pause}",
-                allTrades.Count, _portfolioRisk.ConsecutiveLosses,
-                _portfolioRisk.PauseUntilUtc?.ToString("O") ?? "нет");
+            TradeLog.Info("PORTFOLIO-RISK-RESTORED", null,
+                $"trades={allTrades.Count} loss_streak={_portfolioRisk.ConsecutiveLosses} pause_until={_portfolioRisk.PauseUntilUtc?.ToString("O") ?? "-"}");
 
             // Прогрев индикаторов историческими свечами с REST.
             // P1.4: история проверяется на непрерывность/свежесть; при отказе символ уходит в REST-восстановление,
@@ -316,21 +309,20 @@ public sealed class TradingEngine : IAsyncDisposable
                         _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
                         _metrics.RecordMarketDataRecovery(success: true);
                         TradeLog.DataRestReload(symbol, history.Count(k => k.IsClosed), MarketDataLiveConfirmWindow.TotalSeconds);
-                        _logger.LogInformation("История для {Symbol}: REST-прогрев выполнен; входы запрещены до живого WS-тика", symbol);
                     }
                     else
                     {
                         _marketAnalyzer.MarkRecoveryRequired(symbol, reloadReason);
                         EnqueueMarketDataRecovery(symbol, reloadReason, immediate: true);
-                        _logger.LogWarning("История для {Symbol} не прошла проверку целостности: {Reason}; входы заблокированы до восстановления",
-                            symbol, reloadReason);
+                        TradeLog.Warn("DATA-INTEGRITY-FAIL", symbol,
+                            $"{reloadReason}; входы заблокированы до восстановления");
                     }
                 }
                 catch (Exception ex)
                 {
                     _marketAnalyzer.MarkRecoveryRequired(symbol, "rest-startup-failed");
                     EnqueueMarketDataRecovery(symbol, "rest-startup-failed", immediate: true);
-                    _logger.LogWarning(ex, "Не удалось загрузить историю для {Symbol} — входы заблокированы до REST-восстановления", symbol);
+                    TradeLog.Warn("DATA-LOAD-FAIL", symbol, "входы заблокированы до REST-восстановления", ex);
                 }
             }
 
@@ -671,9 +663,8 @@ public sealed class TradingEngine : IAsyncDisposable
         }
 
         ct.ThrowIfCancellationRequested();
-        _logger.LogError(
-            "LOOP-PHASE-TIMEOUT {Phase}: фаза не завершилась за {Budget} с — цикл продолжает работу, результат фазы игнорируется",
-            phase, MainLoopPhaseBudget.TotalSeconds);
+        TradeLog.Error("LOOP-PHASE-TIMEOUT", null,
+            $"phase={phase} budget_s={LogOptions.N(MainLoopPhaseBudget.TotalSeconds)} — результат фазы игнорируется, цикл продолжает работу");
         task.ContinueWith(
             t => _ = t.Exception,
             CancellationToken.None,
@@ -690,9 +681,9 @@ public sealed class TradingEngine : IAsyncDisposable
         var task = ProcessSymbolsAsync(ct);
         var completed = await Task.WhenAny(task, Task.Delay(MainLoopStallWarning, ct));
         if (completed != task && !ct.IsCancellationRequested)
-            _logger.LogWarning(
-                "LOOP-STALL symbols: обход символов длится дольше {Warn} с — торговый контур ждёт (проверить REST/биржу)",
-                MainLoopStallWarning.TotalSeconds);
+            TradeLog.Warn("LOOP-STALL", null,
+                $"обход символов длится дольше {LogOptions.N(MainLoopStallWarning.TotalSeconds)} с — торговый контур ждёт (проверить REST/биржу)",
+                gateKey: "loop-stall");
 
         await task;
     }
@@ -1080,13 +1071,12 @@ public sealed class TradingEngine : IAsyncDisposable
                 !_config.Trading.ExchangeProtectionEnabled ||
                 _config.Trading.PaperTradingMode)
             {
-                _logger.LogWarning(
-                    "Позиция {Symbol} без биржевой защиты: работает только локальный SL (Trading:ClosePositionIfProtectionFails=false)",
-                    symbol);
+                TradeLog.Warn("PROTECTION-LOCAL-ONLY", symbol,
+                    "биржевой защиты нет, работает только локальный SL (Trading:ClosePositionIfProtectionFails=false)",
+                    gateKey: "protection-local-only:" + symbol);
             }
             else
             {
-                _logger.LogError("Позиция {Symbol} без биржевой защиты — аварийное закрытие market", symbol);
                 TradeLog.Rejected(symbol, "protection",
                     "OCO не поставлена: закрываем позицию, чтобы капитал не зависел от живого процесса");
                 await ClosePositionAsync(position, "NoExchangeProtection", ct);
@@ -1115,9 +1105,6 @@ public sealed class TradingEngine : IAsyncDisposable
             _lastPositionReview[symbol] = DateTime.UtcNow;
         }
 
-        _logger.LogInformation(
-            "Открыта позиция: {Symbol} {Side} {Quantity} @ {Entry}, SL: {SL}, TP: {TP}",
-            symbol, position.Side, executedQuantity, actualEntry, stopLoss, takeProfit);
     }
 
     /// <summary>
@@ -1172,11 +1159,15 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             var history = await _restClient.GetKlinesAsync(benchmark, cfg.CandleInterval, cfg.HistoryCandlesCount, ct);
             if (!_marketAnalyzer.TryReloadHistory(benchmark, history, _candleInterval, RequiredClosedCandles, now, out var reason))
-                _logger.LogWarning("PORTFOLIO-CORRELATION: бенчмарк {Symbol} не прошёл проверку истории: {Reason}; входы fail-closed", benchmark, reason);
+                TradeLog.Warn("PORTFOLIO-CORRELATION", benchmark,
+                    $"история бенчмарка не прошла проверку: {reason}; входы fail-closed",
+                    gateKey: "portfolio-correlation:" + benchmark);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "PORTFOLIO-CORRELATION: не удалось обновить бенчмарк {Symbol}; входы fail-closed до восстановления", benchmark);
+            TradeLog.Warn("PORTFOLIO-CORRELATION", benchmark,
+                "не удалось обновить бенчмарк; входы fail-closed до восстановления", ex,
+                gateKey: "portfolio-correlation-fail:" + benchmark);
         }
     }
 
@@ -1379,14 +1370,14 @@ public sealed class TradingEngine : IAsyncDisposable
             {
                 excluded[symbol] = "exchange_info_error:" + ex.GetType().Name;
                 unavailable.Add(symbol);
-                _logger.LogWarning(ex, "Фильтры {Symbol} недоступны; пара отключена до следующего старта", symbol);
+                TradeLog.Warn("SYMBOL-FILTERS-FAIL", symbol, "фильтры недоступны; пара отключена до следующего старта", ex);
             }
         }
         UnavailableSymbols = unavailable;
         ExcludedSymbols = excluded;
         foreach (var symbol in unavailable)
-            _logger.LogWarning("SYMBOL UNAVAILABLE: {Symbol} reason={Reason} environment={Environment}",
-                symbol, excluded[symbol], _restClient.EnvironmentName);
+            TradeLog.Warn("SYMBOL-UNAVAILABLE", symbol,
+                $"reason={excluded[symbol]} env={_restClient.EnvironmentName}");
         _activeSymbols = available;
         if (available.Count == 0)
             throw new InvalidOperationException("Нет доступных торговых пар: " + SymbolUniversePolicy.FormatReasons(excluded));
@@ -1479,7 +1470,7 @@ public sealed class TradingEngine : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "P0.5: асинхронный пересмотр позиции {Symbol} завершился ошибкой", symbol);
+                TradeLog.Warn("LLM-REVIEW-FAIL", symbol, "асинхронный пересмотр позиции завершился ошибкой", ex);
             }
             finally
             {
@@ -1550,9 +1541,8 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             if (_positionManager.GetPositionById(position.Id) is null)
             {
-                _logger.LogInformation(
-                    "Позиция {Symbol} уже закрыта другим контуром — повторное закрытие ({Reason}) пропущено",
-                    position.Symbol, reason);
+                TradeLog.Info("CLOSE-SKIPPED", position.Symbol,
+                    $"позиция уже закрыта другим контуром — повторное закрытие ({reason}) пропущено");
                 return;
             }
 
@@ -1562,7 +1552,7 @@ public sealed class TradingEngine : IAsyncDisposable
 
     private async Task ClosePositionCoreAsync(Position position, string reason, CancellationToken ct, decimal? exitPriceOverride)
     {
-        _logger.LogInformation("Закрытие позиции {Symbol} по причине: {Reason}", position.Symbol, reason);
+        TradeLog.Info("CLOSE-TRIGGER", position.Symbol, reason);
 
         // Фиксируем цену выхода: для SL/TP — уровень срабатывания, для ручного — текущая
         if (exitPriceOverride.HasValue && exitPriceOverride.Value > 0)
@@ -1577,7 +1567,6 @@ public sealed class TradingEngine : IAsyncDisposable
         if (order == null)
         {
             TradeLog.Rejected(position.Symbol, "close", "ордер на закрытие не исполнен — позиция остаётся открытой");
-            _logger.LogError("Не удалось закрыть позицию {Symbol}", position.Symbol);
             await _positionManager.SavePositionsAsync(ct);
             return;
         }
@@ -1685,10 +1674,6 @@ public sealed class TradingEngine : IAsyncDisposable
             OnPositionClosed?.Invoke(trade);
         }
 
-        _logger.LogInformation(
-            "Позиция {Outcome}: {Symbol} PnL: {PnL:F2} ({PnLPct:F2}%), Reason: {Reason}",
-            isPartial ? "закрыта частично" : "закрыта",
-            position.Symbol, trade.NetPnL, trade.PnLPercent, reason);
     }
 
     /// <summary>
@@ -1707,7 +1692,7 @@ public sealed class TradingEngine : IAsyncDisposable
 
             _riskManager.DrawdownTracker.SetExchangeClock(() => DateTime.UtcNow.AddMilliseconds(offsetMs));
             _portfolioRisk.SetExchangeClock(() => DateTime.UtcNow.AddMilliseconds(offsetMs));
-            _logger.LogInformation("Граница риск-дня по часам биржи: смещение {Offset} мс", offsetMs);
+            TradeLog.Info("RISK-DAY-CLOCK", null, $"exchange_time_offset_ms={LogOptions.N(offsetMs)}");
         }
         catch (Exception ex)
         {
@@ -1758,7 +1743,9 @@ public sealed class TradingEngine : IAsyncDisposable
 
             if (!snapshot.IsValuationComplete)
             {
-                _logger.LogWarning("RISK-SNAPSHOT: оценка капитала неполна — входы fail-closed, equity не обновлён");
+                TradeLog.Warn("RISK-VALUATION-INCOMPLETE", null,
+                    "оценка капитала неполна — входы fail-closed, equity не обновлён",
+                    gateKey: "risk-valuation-incomplete");
                 return;
             }
 
@@ -1790,8 +1777,8 @@ public sealed class TradingEngine : IAsyncDisposable
         _riskManager.DrawdownTracker.RegisterExternalCashFlow(amount);
         if (_config.Trading.PaperTradingMode)
             _paperFreeCash += amount;
-        _logger.LogWarning("RISK-CASH-FLOW: amount={Amount} reason={Reason} cumulative={Cumulative}",
-            amount, reason, _riskManager.DrawdownTracker.CumulativeExternalCashFlow);
+        TradeLog.Warn("RISK-CASH-FLOW", null,
+            $"amount={LogOptions.N(amount, "F2")} reason={reason} cumulative={LogOptions.N(_riskManager.DrawdownTracker.CumulativeExternalCashFlow, "F2")}");
         await RefreshAccountSnapshotAsync(ct);
     }
 
@@ -1906,9 +1893,9 @@ public sealed class TradingEngine : IAsyncDisposable
             OnPartialPositionClosed?.Invoke(trade);
         }
 
-        _logger.LogWarning(
-            "EXCHANGE-FILL-APPLIED: {Symbol} {Reason} qty={Qty}@{Price}, остаток={Remaining}, без повторного MARKET",
-            position.Symbol, reason, closedQuantity, trade.ExitPrice, fullyClosed ? 0m : position.Quantity);
+        TradeLog.Warn("EXCHANGE-FILL-APPLIED", position.Symbol,
+            $"reason={reason} qty={LogOptions.N(closedQuantity)}@{LogOptions.N(trade.ExitPrice)} " +
+            $"remaining={LogOptions.N(fullyClosed ? 0m : position.Quantity)} — без повторного MARKET");
         return true;
     }
 
@@ -1942,7 +1929,7 @@ public sealed class TradingEngine : IAsyncDisposable
             if (!protectedOk && _config.Trading.ClosePositionIfProtectionFails &&
                 _config.Trading.ExchangeProtectionEnabled && !_config.Trading.PaperTradingMode)
             {
-                _logger.LogError("RECON-ADOPT: сиротская позиция {Symbol} без защиты — аварийное закрытие", orphan.Symbol);
+                TradeLog.Error("RECON-ADOPT-UNPROTECTED", orphan.Symbol, "сиротская позиция без защиты — аварийное закрытие");
                 await ClosePositionCoreAsync(orphan, "NoExchangeProtection", ct, null);
             }
         }
@@ -1965,7 +1952,6 @@ public sealed class TradingEngine : IAsyncDisposable
             _killSwitchCloseStatus = "CLOSING";
             _metrics.RecordKillSwitch();
             TradeLog.KillSwitchEngaged(reason, _killSwitchEquityAtEngage, _killSwitchRequiresManualReset);
-            _logger.LogCritical("KILL-SWITCH-ENGAGED: {Reason} — новые входы заблокированы, закрываю все позиции", reason);
             Pause(); // если уже Running; в Starting флаг выше всё равно блокирует входы
             OnKillSwitchEngaged?.Invoke(reason);
             await PersistRiskStateAsync(ct);
@@ -1978,7 +1964,6 @@ public sealed class TradingEngine : IAsyncDisposable
         TradeLog.KillSwitchCloseResult(closed, total, remaining, _killSwitchCloseStatus);
         if (remaining > 0)
         {
-            _logger.LogCritical("KILL-SWITCH UNPROTECTED_OR_OPEN: осталось {Remaining} позиций; ручной разбор обязателен", remaining);
         }
         await PersistRiskStateAsync(ct);
         return closed;
@@ -1994,7 +1979,7 @@ public sealed class TradingEngine : IAsyncDisposable
         var open = _positionManager.GetOpenPositions().ToList();
         if (open.Count == 0) return 0;
 
-        _logger.LogWarning("KILL-SWITCH: закрытие {Count} позиций ({Reason})", open.Count, reason);
+        TradeLog.Warn("KILL-SWITCH-CLOSING", null, $"positions={open.Count} reason={reason}");
         var closed = 0;
         foreach (var position in open)
         {
@@ -2007,11 +1992,11 @@ public sealed class TradingEngine : IAsyncDisposable
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "KILL-SWITCH: не удалось закрыть {Symbol} — позиция остаётся под сопровождением", position.Symbol);
+                TradeLog.Error("KILL-SWITCH-CLOSE-FAIL", position.Symbol, "позиция остаётся под сопровождением", ex);
             }
         }
 
-        _logger.LogWarning("KILL-SWITCH: закрыто {Closed}/{Total} позиций ({Reason})", closed, open.Count, reason);
+        TradeLog.Warn("KILL-SWITCH-CLOSED", null, $"closed={closed}/{open.Count} reason={reason}");
         return closed;
     }
 
@@ -2031,7 +2016,6 @@ public sealed class TradingEngine : IAsyncDisposable
         if (openCount > 0 || _killSwitchCloseStatus == "UNPROTECTED_OR_OPEN")
         {
             TradeLog.KillSwitchResetDenied($"UNPROTECTED_OR_OPEN open={openCount}");
-            _logger.LogWarning("KILL-SWITCH-RESET-DENIED: остались открытые позиции или незавершённое аварийное закрытие");
             return false;
         }
 
@@ -2039,7 +2023,6 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             var reason = _riskManager.DrawdownTracker.IsMaxDrawdownHit ? "MaxDrawdown" : "DailyLoss";
             TradeLog.KillSwitchResetDenied($"risk-limit-still-breached:{reason}");
-            _logger.LogWarning("KILL-SWITCH-RESET-DENIED: лимит риска всё ещё пробит ({Reason})", reason);
             return false;
         }
 
@@ -2047,7 +2030,6 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             _killSwitchCloseStatus = "RESET";
             TradeLog.KillSwitchReset(operatorReason);
-            _logger.LogWarning("KILL-SWITCH-RESET: {Reason} — входы снова разрешены; peak/day_start сохранены", operatorReason);
             await PersistRiskStateAsync(ct);
             return true;
         }
@@ -2151,9 +2133,9 @@ public sealed class TradingEngine : IAsyncDisposable
             var spreadPercent = (orderBook.Spread.Value / orderBook.MidPrice.Value) * 100m;
             if (spreadPercent > 0.5m) // Спред более 0.5%
             {
-                _logger.LogWarning(
-                    "Аномально широкий спред на {Symbol}: {SpreadPercent:F3}% (Bid: {Bid}, Ask: {Ask})",
-                    orderBook.Symbol, spreadPercent, orderBook.BestBid, orderBook.BestAsk);
+                TradeLog.Warn("WIDE-SPREAD", orderBook.Symbol,
+                    $"spread_pct={LogOptions.N(spreadPercent, "F3")} bid={LogOptions.N(orderBook.BestBid)} ask={LogOptions.N(orderBook.BestAsk)}",
+                    gateKey: "wide-spread:" + orderBook.Symbol);
             }
         }
     }
@@ -2227,7 +2209,8 @@ public sealed class TradingEngine : IAsyncDisposable
             EnqueueMarketDataRecovery(symbol, "ws-disconnected", immediate: true);
         }
 
-        _logger.LogWarning("MARKET-DATA WS disconnected: входы заблокированы, стакан сброшен, ожидается REST-восстановление после реконнекта");
+        TradeLog.Warn("MARKET-DATA-WS-DOWN", null,
+            "входы заблокированы, стакан сброшен, ожидается REST-восстановление после реконнекта");
     }
 
     /// <summary>P1.4: рыночный WS переподключился —history могла потерять свечи, требуется REST-дозагрузка.</summary>
@@ -2245,7 +2228,8 @@ public sealed class TradingEngine : IAsyncDisposable
             EnqueueMarketDataRecovery(symbol, "ws-reconnected", immediate: true);
         }
 
-        _logger.LogWarning("MARKET-DATA WS reconnected: входы заблокированы до REST-дозагрузки свечей и повторного прогрева");
+        TradeLog.Warn("MARKET-DATA-WS-UP", null,
+            "входы заблокированы до REST-дозагрузки свечей и повторного прогрева");
     }
 
     private void EnqueueMarketDataRecovery(string symbol, string reason, bool immediate = false)
@@ -2359,9 +2343,9 @@ public sealed class TradingEngine : IAsyncDisposable
         if (!await _marketDataRecoveryLock.WaitAsync(RecoveryLockWait, ct))
         {
             _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
-            _logger.LogWarning(
-                "DATA-RECOVERY-LOCK-BUSY {Symbol}: замок восстановления занят дольше {Wait} с; повтор через {Retry} с",
-                symbol, RecoveryLockWait.TotalSeconds, _config.Trading.MarketDataRecoveryRetrySeconds);
+            TradeLog.Warn("DATA-RECOVERY-LOCK-BUSY", symbol,
+                $"замок восстановления занят дольше {LogOptions.N(RecoveryLockWait.TotalSeconds)} с; повтор через {_config.Trading.MarketDataRecoveryRetrySeconds} с",
+                gateKey: "data-recovery-lock-busy:" + symbol);
             return;
         }
 
@@ -2396,8 +2380,9 @@ public sealed class TradingEngine : IAsyncDisposable
             {
                 _metrics.RecordMarketDataRecovery(success: false);
                 _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
-                _logger.LogWarning("DATA-RECOVERY-REJECTED {Symbol}: {Reason}; повтор через {Retry} с",
-                    symbol, reason, _config.Trading.MarketDataRecoveryRetrySeconds);
+                TradeLog.Warn("DATA-RECOVERY-REJECTED", symbol,
+                    $"{reason}; повтор через {_config.Trading.MarketDataRecoveryRetrySeconds} с",
+                    gateKey: "data-recovery-rejected:" + symbol);
             }
         }
         catch (OperationCanceledException)
@@ -2408,8 +2393,8 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             _metrics.RecordMarketDataRecovery(success: false);
             _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow.AddSeconds(_config.Trading.MarketDataRecoveryRetrySeconds);
-            _logger.LogWarning(ex, "DATA-RECOVERY-FAILED {Symbol}; повтор через {Retry} с",
-                symbol, _config.Trading.MarketDataRecoveryRetrySeconds);
+            TradeLog.Warn("DATA-RECOVERY-FAILED", symbol,
+                $"повтор через {_config.Trading.MarketDataRecoveryRetrySeconds} с", ex);
         }
         finally
         {
@@ -2442,7 +2427,7 @@ public sealed class TradingEngine : IAsyncDisposable
             {
                 _marketAnalyzer.NoteResubscribeAttempt(symbol, DateTime.UtcNow, MarketDataLiveConfirmWindow);
                 _nextMarketDataRecoveryAttemptUtc[symbol] = DateTime.UtcNow + MarketDataLiveConfirmWindow;
-                _logger.LogWarning(ex, "DATA-WS-RESUBSCRIBE-FAILED {Symbol}", symbol);
+                TradeLog.Warn("DATA-WS-RESUBSCRIBE-FAILED", symbol, "переподписка на стрим не удалась", ex);
             }
             return;
         }
@@ -2463,7 +2448,7 @@ public sealed class TradingEngine : IAsyncDisposable
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "DATA-WS-RECONNECT-FAILED {Symbol}", symbol);
+                TradeLog.Warn("DATA-WS-RECONNECT-FAILED", symbol, "принудительный реконнект не удался", ex);
             }
         }
 
@@ -2512,7 +2497,7 @@ public sealed class TradingEngine : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "P0.5: не удалось вычислить config hash");
+            _logger.LogWarning(ex, "Не удалось вычислить config hash настроек");
             return "unknown";
         }
     }

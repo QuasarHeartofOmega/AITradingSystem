@@ -91,9 +91,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             try
             {
                 await _binanceClient.CancelOcoAsync(intent.Symbol, 0, intent.ClientOrderId, ct);
-                _logger.LogWarning(
-                    "После рестарта снята незавершённая защитная связка {Key} для {Symbol} — ставим защиту заново",
-                    intent.ClientOrderId, intent.Symbol);
+                TradeLog.Warn("RESTART-PROTECTION-CANCELED", intent.Symbol,
+                    $"снята незавершённая связка {intent.ClientOrderId} — защита будет поставлена заново");
             }
             catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList)
             {
@@ -131,9 +130,6 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         }
         catch (BinanceApiException ex) when (ex.IsDuplicateOrder)
         {
-            _logger.LogWarning(
-                "Биржа сообщила о дубле {ClientOrderId} для {Symbol} — ордер уже принят, повтор не отправляем",
-                clientOrderId, symbol);
             TradeLog.Decision(symbol, "IDEMPOTENT",
                 $"{clientOrderId}: ордер уже на бирже, берём его состояние вместо повторной отправки");
 
@@ -281,7 +277,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         }
         else if (!_tradingConfig.PaperTradingMode)
         {
-            _logger.LogWarning("Фильтры символа {Symbol} недоступны — ордер отправляется без округления", signal.Symbol);
+            TradeLog.Warn("FILTERS-UNAVAILABLE", signal.Symbol, "ордер отправляется без округления",
+                gateKey: "filters-unavailable:" + signal.Symbol);
         }
 
         // === Paper Trading: P1.1 taker-филл по стакану + комиссия; post-only — maker по лимитной цене ===
@@ -375,8 +372,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ошибка размещения ордера для {Symbol}", signal.Symbol);
-            TradeLog.Rejected(signal.Symbol, "exception", ex.Message);
+            TradeLog.Rejected(signal.Symbol, "exception", ex.Message, ex);
             return null;
         }
     }
@@ -389,8 +385,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
     {
         var side = position.Side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy;
 
-        _logger.LogInformation("Закрытие позиции {Symbol}: {Side} {Quantity}",
-            position.Symbol, side, position.Quantity);
+        TradeLog.Info("CLOSE-START", position.Symbol, $"side={side} qty={LogOptions.N(position.Quantity)}");
 
         if (_tradingConfig.PaperTradingMode)
         {
@@ -466,9 +461,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             // и MARKET-закрытие получит -2010 «недостаточно средств».
             if (!await CancelProtectionAsync(position, ct))
             {
-                _logger.LogWarning(
-                    "Закрытие {Symbol}: защитную OCO снять не удалось — MARKET может быть отклонён по заблокированному объёму",
-                    position.Symbol);
+                TradeLog.Warn("CLOSE-PROTECTION-CANCEL-FAIL", position.Symbol,
+                    "защитную OCO снять не удалось — MARKET может быть отклонён по заблокированному объёму");
             }
 
             // Live SELL: нельзя отправлять gross-объём позиции, если часть базового актива
@@ -494,9 +488,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
             if (plan.Route == DustPolicy.DustCloseRoute.Reject)
             {
-                _logger.LogError("Не удалось закрыть {Symbol}: {Reason} (qty={Quantity})",
-                    position.Symbol, plan.Reason, liveQuantity);
-                TradeLog.Rejected(position.Symbol, "close", plan.Reason ?? "quantity после округления <= 0");
+                TradeLog.Rejected(position.Symbol, "close",
+                    $"{plan.Reason ?? "quantity после округления <= 0"} (qty={LogOptions.N(liveQuantity)})");
                 if ((plan.Reason ?? string.Empty).Contains("dust:", StringComparison.OrdinalIgnoreCase))
                 {
                     position.MarkDustForManualReview(liveQuantity, plan.Reason ?? "dust below exchange filters");
@@ -581,8 +574,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             position.MarkDustForManualReview(position.Quantity, ex.ApiMessage);
             _metrics?.RecordDustClose(rejected: true);
             TradeLog.Rejected(position.Symbol, "close-filter",
-                $"биржа отклонила ордер по фильтрам ({ex.ApiMessage}); автоматические повторы остановлены, нужен ручной аудит");
-            _logger.LogError(ex, "Фильтры биржи отклонили закрытие {Symbol}", position.Symbol);
+                $"биржа отклонила ордер по фильтрам ({ex.ApiMessage}); автоматические повторы остановлены, нужен ручной аудит", ex);
+
             return null;
         }
         catch (BinanceApiException ex) when (ex.IsInsufficientBalance)
@@ -593,8 +586,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                 _metrics?.RecordDustClose(rejected: true);
             TradeLog.Rejected(position.Symbol, "close",
                 $"биржа отклонила закрытие: недостаточно средств ({ex.ApiMessage}). " +
-                "Проверьте free-баланс базового актива на счёте — позиция останется открытой и будет пересчитана.");
-            _logger.LogError(ex, "Недостаточно средств для закрытия {Symbol}", position.Symbol);
+                "Проверьте free-баланс базового актива на счёте — позиция останется открытой и будет пересчитана.", ex);
+
             return null;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -605,8 +598,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         {
             if (isDustClose)
                 _metrics?.RecordDustClose(rejected: true);
-            _logger.LogError(ex, "Ошибка закрытия позиции {Symbol}", position.Symbol);
-            TradeLog.Rejected(position.Symbol, "close", ex.Message);
+            TradeLog.Rejected(position.Symbol, "close", ex.Message, ex);
             return null;
         }
     }
@@ -682,16 +674,15 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             position.UpdateTrailingStop(newStopLoss);
             replacement.ReplacedAt = DateTime.UtcNow;
 
-            _logger.LogInformation("Биржевой стоп подтянут для {Symbol}: {Old} → {New} (OCO#{ListId})",
-                position.Symbol, previousStop, newStopLoss, replacement.OrderListId);
+
             TradeLog.Decision(position.Symbol, "TRAILING-REPLACE",
                 $"стоп {previousStop} → {newStopLoss}, OCO#{replacement.OrderListId}");
             return true;
         }
 
         // Новая связка не встала — возвращаем прежний стоп, чтобы не оставить позицию без защиты.
-        _logger.LogError("Cancel/replace OCO для {Symbol} не удался: возвращаем прежний стоп {Stop}",
-            position.Symbol, previousStop);
+        TradeLog.Error("TRAILING-REPLACE-FAIL", position.Symbol,
+            $"cancel/replace OCO не удался — возвращаем прежний стоп {LogOptions.N(previousStop)}");
 
         var restored = await PlaceProtectionAsync(position, previousStop, ct);
         if (restored == null)
@@ -736,8 +727,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         catch (BinanceApiException ex) when (ex.IsUnknownOrderOrList)
         {
             // Связки на бирже уже нет: сработала одна из ног (позицию закрыла биржа) либо отменена ранее.
-            _logger.LogWarning("OCO#{ListId} для {Symbol} на бирже не найдена — вероятно, уже исполнена",
-                protection.OrderListId, position.Symbol);
+
             TradeLog.Decision(position.Symbol, "PROTECTION-GONE",
                 $"OCO#{protection.OrderListId} отсутствует — возможное исполнение биржей, нужна реконсиляция (P0.5)");
             position.SetProtection(null);
@@ -751,9 +741,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Не удалось отменить OCO#{ListId} для {Symbol}",
-                protection.OrderListId, position.Symbol);
-            TradeLog.Rejected(position.Symbol, "protection-cancel", ex.Message);
+            TradeLog.Rejected(position.Symbol, "protection-cancel",
+                $"не удалось отменить OCO#{protection.OrderListId}: {ex.Message}", ex);
             return false;
         }
     }
@@ -770,7 +759,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         var info = await GetSymbolInfoCachedAsync(position.Symbol, ct);
 
         if (info == null && !_tradingConfig.PaperTradingMode)
-            _logger.LogWarning("Фильтры {Symbol} недоступны — защитные ноги отправляются без округления", position.Symbol);
+            TradeLog.Warn("FILTERS-UNAVAILABLE", position.Symbol, "защитные ноги отправляются без округления",
+                gateKey: "filters-unavailable-protection:" + position.Symbol);
 
         // Live OCO SELL защищаем только реально доступный net-объём базового актива.
         var protectionQuantity = position.Quantity;
@@ -786,9 +776,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Не удалось получить free-баланс для защиты {Symbol}", position.Symbol);
                 TradeLog.Rejected(position.Symbol, "protection",
-                    "не удалось получить free-баланс базового актива — OCO не ставится вслепую");
+                    "не удалось получить free-баланс базового актива — OCO не ставится вслепую", ex);
                 return null;
             }
 
@@ -872,8 +861,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Не удалось поставить биржевую защиту OCO для {Symbol}", position.Symbol);
-            TradeLog.Rejected(position.Symbol, "protection", ex.Message);
+            TradeLog.Rejected(position.Symbol, "protection", ex.Message, ex);
             return null;
         }
     }
@@ -999,10 +987,9 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             // продолжить наливаться — расхождение фиксируется в метриках и ловится реконсиляцией P0.5.
             AuditCancelResidual(current);
 
-            _logger.LogWarning(
-                "Ордер {OrderId} не исполнен полностью за {Timeout} с: {Executed}/{Original}, статус {Status}.",
-                current.BinanceOrderId, _tradingConfig.OrderFillTimeoutSeconds,
-                current.ExecutedQuantity, current.OriginalQuantity, current.Status);
+            TradeLog.Warn("ORDER-FILL-TIMEOUT", current.Symbol,
+                $"order_id={current.BinanceOrderId} executed={LogOptions.N(current.ExecutedQuantity)}/{LogOptions.N(current.OriginalQuantity)} " +
+                $"status={current.Status} timeout_s={_tradingConfig.OrderFillTimeoutSeconds}");
         }
 
         return current;
@@ -1023,11 +1010,9 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
         if (audit.Mismatch)
         {
-            _logger.LogError(
-                "CANCEL-AUDIT расхождение по {Symbol} ордер {OrderId}: {Detail}",
-                order.Symbol, order.BinanceOrderId, audit.Detail);
+
             TradeLog.Rejected(order.Symbol, "cancel-audit",
-                $"{audit.Detail}; исполнено {audit.Executed} из {order.OriginalQuantity} — остаток мог остаться живым на бирже");
+                $"{audit.Detail}; исполнено {audit.Executed} из {order.OriginalQuantity} — остаток мог остаться живым на бирже (ордер {order.BinanceOrderId})");
             return;
         }
 
@@ -1046,9 +1031,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
         if (order.ExecutedQuantity < order.OriginalQuantity)
         {
-            _logger.LogWarning(
-                "Частичное исполнение {Symbol}: {Executed}/{Original} — позиция открывается на исполненный объём",
-                symbol, order.ExecutedQuantity, order.OriginalQuantity);
+            TradeLog.Warn("PARTIAL-FILL", symbol,
+                $"executed={LogOptions.N(order.ExecutedQuantity)}/{LogOptions.N(order.OriginalQuantity)} — позиция открывается на исполненный объём");
         }
 
         ExchangeLog.Order("FILLED", symbol, order.Side.ToString(), order.ExecutedQuantity,
@@ -1107,7 +1091,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             baseAsset = parsedBase;
         else
         {
-            _logger.LogWarning("Не удалось определить базовый актив {Symbol} — live SELL использует объём позиции", position.Symbol);
+            TradeLog.Warn("BASE-ASSET-UNKNOWN", position.Symbol, "live SELL использует объём позиции");
             return position.Quantity;
         }
 
