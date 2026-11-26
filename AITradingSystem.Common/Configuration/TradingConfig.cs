@@ -30,6 +30,21 @@ public sealed class TradingConfig
     public decimal MinExchangePositionNotional { get; set; } = 1m;
 
     /// <summary>
+    /// Буфер к минимальной сумме ордера биржи (NOTIONAL/minNotional), %.
+    /// Binance считает нотариал по средней цене исполнения, а не по mid, поэтому
+    /// ордер ровно «в минимум» на MARKET может отклониться. Диапазон: [0; 10].
+    /// </summary>
+    public decimal MinNotionalBufferPercent { get; set; } = 1.5m;
+
+    /// <summary>
+    /// На сколько процентов разрешено превысить риск-сайзинг ради минимума биржи.
+    /// 0 — никогда не увеличивать объём против риска: пара просто пропускается.
+    /// Подъём всё равно ограничен свободными деньгами, лимитом пары и портфельными кэпами.
+    /// Диапазон: [0; 100].
+    /// </summary>
+    public decimal MinNotionalBumpMaxPercent { get; set; } = 25m;
+
+    /// <summary>
     /// Процент риска от депозита на одну сделку (FR-5.1).
     /// Диапазон: 0.001 (0.1%) — 0.05 (5%).
     /// </summary>
@@ -484,6 +499,10 @@ public sealed class TradingConfig
             throw new InvalidOperationException("AccountRefreshIntervalSeconds должен быть в диапазоне [5; 300].");
         if (MinExchangePositionNotional < 0)
             throw new InvalidOperationException("MinExchangePositionNotional должен быть >= 0.");
+        if (MinNotionalBufferPercent < 0m || MinNotionalBufferPercent > 10m)
+            throw new InvalidOperationException("MinNotionalBufferPercent должен быть в диапазоне [0; 10].");
+        if (MinNotionalBumpMaxPercent < 0m || MinNotionalBumpMaxPercent > 100m)
+            throw new InvalidOperationException("MinNotionalBumpMaxPercent должен быть в диапазоне [0; 100].");
 
         var validIntervals = new HashSet<string>
         {

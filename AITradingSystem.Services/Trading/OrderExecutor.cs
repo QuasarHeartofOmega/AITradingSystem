@@ -252,28 +252,31 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         var info = await GetSymbolInfoCachedAsync(signal.Symbol, ct);
         if (info != null)
         {
-            if (info.StepSize > 0)
-                quantity = Math.Floor(quantity / info.StepSize) * info.StepSize;
-
             if (!_tradingConfig.UseMarketEntry && info.TickSize > 0)
                 executionPrice = RoundPriceToTick(executionPrice, info.TickSize, side);
-
-            if (quantity <= 0 || (info.MinQty > 0 && quantity < info.MinQty))
-            {
-                TradeLog.Rejected(signal.Symbol, "filters", $"quantity {quantity} < minQty {info.MinQty}");
-                return null;
-            }
 
             var notionalPrice = _tradingConfig.UseMarketEntry
                 ? currentOrderBook?.MidPrice ?? executionPrice
                 : executionPrice;
 
-            if (info.MinNotional > 0 && quantity * notionalPrice < info.MinNotional)
+            // MARKET живёт по MARKET_LOT_SIZE, LIMIT — по LOT_SIZE; NOTIONAL для MARKET —
+            // только при applyMinToMarket. Минимум проверяем с буфером на проскальзывание.
+            // bumpMaxPercent = 0: исполнитель не имеет права увеличивать объём против риск-сайзинга,
+            // подъём до минимума решает TradingEngine (MIN-NOTIONAL-BUMP).
+            var entryPlan = EntryFilterPolicy.PlanEntry(
+                quantity, notionalPrice, _tradingConfig.UseMarketEntry,
+                info.StepSize, info.MinQty, info.MarketStepSize, info.MarketMinQty,
+                info.MinNotional, info.ApplyMinNotionalToMarket,
+                _tradingConfig.MinNotionalBufferPercent,
+                bumpMaxPercent: 0m, quantityCeiling: quantity);
+
+            if (entryPlan.Route == EntryFilterRoute.Reject)
             {
-                TradeLog.Rejected(signal.Symbol, "filters",
-                    $"notional {quantity * notionalPrice:F2} < minNotional {info.MinNotional}");
+                TradeLog.Rejected(signal.Symbol, "filters", entryPlan.Reason ?? "объём ниже фильтров символа");
                 return null;
             }
+
+            quantity = entryPlan.Quantity;
         }
         else if (!_tradingConfig.PaperTradingMode)
         {

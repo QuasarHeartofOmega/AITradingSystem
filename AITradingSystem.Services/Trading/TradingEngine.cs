@@ -88,6 +88,12 @@ public sealed class TradingEngine : IAsyncDisposable
 
     private sealed record SymbolPrecision(int PriceDecimals, decimal? TickSize, decimal? StepSize);
     private readonly ConcurrentDictionary<string, SymbolPrecision> _symbolPrecision = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Фильтры лотов/минимальной суммы ордера — чтобы сайзинг знал про минимум биржи заранее.</summary>
+    private sealed record SymbolEntryFilters(
+        decimal StepSize, decimal MinQty, decimal MarketStepSize, decimal MarketMinQty,
+        decimal MinNotional, bool ApplyMinNotionalToMarket);
+    private readonly ConcurrentDictionary<string, SymbolEntryFilters> _symbolEntryFilters = new(StringComparer.OrdinalIgnoreCase);
     public IReadOnlyList<string> UnavailableSymbols { get; private set; } = Array.Empty<string>();
     /// <summary>P0.6: все исключённые пары и причины, включая неторговые классы и ошибки exchangeInfo.</summary>
     public IReadOnlyDictionary<string, string> ExcludedSymbols { get; private set; } =
@@ -976,6 +982,53 @@ public sealed class TradingEngine : IAsyncDisposable
         if (quantity <= 0)
             return;
 
+        // 7c. Минимум биржи (NOTIONAL + лоты) учитываем ДО отправки: иначе риск-сайзинг даёт
+        //     объём на 2 USDT при минимуме 5, и ордер отклоняется уже после инференса и проверок.
+        //     Либо подъём до минимума в пределах риска/денег, либо явный пропуск пары.
+        if (_symbolEntryFilters.TryGetValue(symbol, out var entryFilters))
+        {
+            var notionalPrice = _config.Trading.UseMarketEntry
+                ? currentOrderBook?.MidPrice ?? signal.EntryPrice.Value
+                : signal.EntryPrice.Value;
+
+            var bumpCeiling = maxAffordable;
+            if (_config.Trading.SymbolPositionLimits.TryGetValue(symbol, out var bumpCapPercent))
+                bumpCeiling = Math.Min(bumpCeiling,
+                    balance * bumpCapPercent / 100m / (signal.EntryPrice.Value * feeBuffer));
+
+            var entryPlan = EntryFilterPolicy.PlanEntry(
+                quantity, notionalPrice, _config.Trading.UseMarketEntry,
+                entryFilters.StepSize, entryFilters.MinQty,
+                entryFilters.MarketStepSize, entryFilters.MarketMinQty,
+                entryFilters.MinNotional, entryFilters.ApplyMinNotionalToMarket,
+                _config.Trading.MinNotionalBufferPercent,
+                _config.Trading.MinNotionalBumpMaxPercent,
+                bumpCeiling);
+
+            if (entryPlan.Route == EntryFilterRoute.Reject)
+            {
+                TradeLog.Rejected(symbol, "min-notional", entryPlan.Reason ?? "объём ниже фильтров биржи");
+                return;
+            }
+
+            if (entryPlan.Route == EntryFilterRoute.Bump)
+            {
+                // Подъём не должен обходить портфельные лимиты: если они режут объём ниже
+                // минимума биржи — вход пропускается, а не отправляется заведомо невалидным.
+                var allowed = ApplyPortfolioRiskCap(symbol, entryPlan.Quantity, signal.EntryPrice.Value, balance, "min-notional-bump");
+                if (allowed < entryPlan.Quantity)
+                {
+                    TradeLog.Rejected(symbol, "min-notional",
+                        $"минимум биржи требует {entryPlan.Quantity}, портфельный лимит разрешает {allowed} — вход пропущен");
+                    return;
+                }
+
+                TradeLog.Decision(symbol, "MIN-NOTIONAL-BUMP", entryPlan.Reason ?? string.Empty);
+            }
+
+            quantity = entryPlan.Quantity;
+        }
+
         // 8. Исполнение. Ордер возвращается только после реального исполнения.
         var order = await _orderExecutor.ExecuteSignalAsync(signal, quantity, currentOrderBook, ct);
         if (order == null)
@@ -1363,6 +1416,9 @@ public sealed class TradingEngine : IAsyncDisposable
                 var configured = _config.Trading.SymbolPriceDecimals.TryGetValue(symbol, out var decimals);
                 var precision = tick.HasValue ? TickDecimals(tick.Value) : configured ? decimals : 8;
                 _symbolPrecision[symbol] = new SymbolPrecision(precision, tick, info.StepSize > 0 ? info.StepSize : null);
+                _symbolEntryFilters[symbol] = new SymbolEntryFilters(
+                    info.StepSize, info.MinQty, info.MarketStepSize, info.MarketMinQty,
+                    info.MinNotional, info.ApplyMinNotionalToMarket);
                 available.Add(symbol);
             }
             catch (OperationCanceledException) { throw; }
