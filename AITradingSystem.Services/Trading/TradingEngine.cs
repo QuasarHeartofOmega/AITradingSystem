@@ -2475,6 +2475,11 @@ public sealed class TradingEngine : IAsyncDisposable
     {
         var cfg = _config.Trading;
         var reason = _marketDataRecoveryReason.TryGetValue(symbol, out var r) ? r : "silent-stream";
+
+        // P0.3a: до любой эскалации фиксируем per-stream факты — какой именно стрим молчит
+        // (kline/depth/оба), сколько сообщений принято, возраст последнего, подтверждена ли подписка.
+        var silentTarget = LogStreamDiagnostics(symbol, reason);
+
         var attempts = _marketAnalyzer.GetResubscribeAttempts(symbol);
 
         if (attempts < cfg.MarketDataMaxResubscribeAttempts)
@@ -2518,11 +2523,90 @@ public sealed class TradingEngine : IAsyncDisposable
         }
 
         // Реконнект уже был недавно или не удался — символ карантинирован, цикл по нему остановлен.
+        // P0.3a: в причину карантина попадает и то, какой стрим молчал — иначе 30 одинаковых циклов
+        // quarantine/lift не объясняют, что именно не доставляется по символу.
         var quarantine = TimeSpan.FromSeconds(cfg.MarketDataQuarantineSeconds);
-        _marketAnalyzer.Quarantine(symbol, $"no-live-tick:{reason}", DateTime.UtcNow, quarantine);
+        var quarantineReason = $"no-live-tick:{reason}:silent-{silentTarget}";
+        _marketAnalyzer.Quarantine(symbol, quarantineReason, DateTime.UtcNow, quarantine);
         _metrics.RecordMarketDataQuarantine();
-        TradeLog.DataQuarantine(symbol, $"no-live-tick:{reason}", quarantine.TotalSeconds);
+        TradeLog.DataQuarantine(symbol, quarantineReason, quarantine.TotalSeconds);
         ForgetRecovery(symbol);
+    }
+
+    /// <summary>
+    /// P0.3a: записать per-stream диагностику символа и вернуть, какой стрим молчит:
+    /// "kline", "depth", "both", "none" (доставка есть, проблема не в стриме) или "unknown" (диагностика недоступна).
+    /// Это факты из WebSocket-клиента, а не интерпретация: причина молчания по ним всё ещё требует расследования.
+    /// </summary>
+    private string LogStreamDiagnostics(string symbol, string reason)
+    {
+        IReadOnlyList<MarketStreamDiagnostics> diagnostics;
+        try
+        {
+            diagnostics = _wsClient.GetStreamDiagnostics(DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            TradeLog.Warn("DATA-STREAM-DIAG-FAILED", symbol,
+                "per-stream диагностика недоступна; причина молчания не зафиксирована", ex);
+            return "unknown";
+        }
+
+        var kline = diagnostics.FirstOrDefault(d => IsStreamOf(d, symbol, MarketStreamKind.Kline));
+        var depth = diagnostics.FirstOrDefault(d => IsStreamOf(d, symbol, MarketStreamKind.Depth));
+
+        // Молчанием считаем отсутствие сообщений дольше окна свежести/подтверждения live.
+        var silenceThreshold = TimeSpan.FromSeconds(Math.Max(
+            _config.Trading.MarketDataMaxAgeSeconds,
+            _config.Trading.MarketDataLiveConfirmSeconds));
+        var silentTarget = ClassifySilentTarget(kline, depth, silenceThreshold);
+
+        var (indicatorsReady, acceptedCandles, requiredCandles) = _marketAnalyzer.GetWarmupInfo(symbol);
+
+        TradeLog.DataStreamDiag(
+            symbol, reason, silentTarget,
+            kline?.MessageCount ?? 0, kline?.LastMessageAgeSeconds, kline?.EmptyPayloadCount ?? 0,
+            kline?.Subscribed ?? false, kline?.SubscribeRequestCount ?? 0, DescribeSubscribeAck(kline),
+            depth?.MessageCount ?? 0, depth?.LastMessageAgeSeconds, depth?.EmptyPayloadCount ?? 0,
+            depth?.Subscribed ?? false, depth?.SubscribeRequestCount ?? 0, DescribeSubscribeAck(depth),
+            acceptedCandles, requiredCandles, indicatorsReady);
+
+        return silentTarget;
+    }
+
+    private static bool IsStreamOf(MarketStreamDiagnostics diagnostics, string symbol, MarketStreamKind kind) =>
+        diagnostics.Kind == kind && string.Equals(diagnostics.Symbol, symbol, StringComparison.OrdinalIgnoreCase);
+
+    private static string ClassifySilentTarget(
+        MarketStreamDiagnostics? kline,
+        MarketStreamDiagnostics? depth,
+        TimeSpan silenceThreshold) =>
+        (IsStreamSilent(kline, silenceThreshold), IsStreamSilent(depth, silenceThreshold)) switch
+        {
+            (true, true) => "both",
+            (true, false) => "kline",
+            (false, true) => "depth",
+            (false, false) => "none"
+        };
+
+    private static bool IsStreamSilent(MarketStreamDiagnostics? diagnostics, TimeSpan silenceThreshold) =>
+        diagnostics is null ||
+        diagnostics.MessageCount == 0 ||
+        diagnostics.LastMessageAgeSeconds is null ||
+        diagnostics.LastMessageAgeSeconds.Value > silenceThreshold.TotalSeconds;
+
+    /// <summary>P0.3a: состояние подписки стрима одним токеном: url / id{N}:acked / id{N}:pending / id{N}:error / none.</summary>
+    private static string DescribeSubscribeAck(MarketStreamDiagnostics? diagnostics)
+    {
+        if (diagnostics is null)
+            return "no-such-stream";
+        if (diagnostics.LastSubscribeError is not null)
+            return $"id{diagnostics.LastSubscribeRequestId}:error";
+        if (diagnostics.LastSubscribeRequestId is null)
+            return diagnostics.Subscribed ? "url" : "none";
+        return diagnostics.LastSubscribeAcked
+            ? $"id{diagnostics.LastSubscribeRequestId.Value}:acked"
+            : $"id{diagnostics.LastSubscribeRequestId.Value}:pending";
     }
 
     /// <summary>P1.4: fail-closed гейт свежести рыночных данных перед входом.</summary>

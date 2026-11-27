@@ -346,6 +346,25 @@ public static class ExchangeLog
         Ch.Error(ex, "WS-PARSE-ERROR\n{Block}", LogOptions.Block("RAW MESSAGE", rawMessage));
     }
 
+    /// <summary>P0.3a: отправлен контрольный кадр SUBSCRIBE/UNSUBSCRIBE. id нужен, чтобы связать запрос с ack.</summary>
+    public static void SubscribeControl(string method, int id, string streams)
+    {
+        Ch.Information("WS-SUBSCRIBE-SENT method={Method} id={Id} streams={Streams}", method, id, streams);
+    }
+
+    /// <summary>P0.3a: сервер подтвердил SUBSCRIBE/UNSUBSCRIBE. Подтверждение подписки не равно живому потоку данных.</summary>
+    public static void SubscribeAck(string method, int id, string streams, double latencyMs)
+    {
+        Ch.Information("WS-SUBSCRIBE-ACK method={Method} id={Id} latency_ms={Latency} streams={Streams} data_confirmed=false",
+            method, id, LogOptions.N(latencyMs), streams);
+    }
+
+    /// <summary>P0.3a: сервер отклонил SUBSCRIBE/UNSUBSCRIBE — молчание стрима объяснено подпиской, а не «биржа не шлёт данные».</summary>
+    public static void SubscribeError(string method, int id, string streams, string error)
+    {
+        Ch.Warning("WS-SUBSCRIBE-ERROR method={Method} id={Id} streams={Streams} — {Error}", method, id, streams, error);
+    }
+
     public static void Environment(string environment, string restUrl, string streamUrl)
     {
         Ch.Information("BINANCE-ENV env={Environment} rest={Rest} stream={Stream}", environment, restUrl, streamUrl);
@@ -640,6 +659,47 @@ public static class TradeLog
     {
         Ch.Information("DATA-QUARANTINE-LIFTED symbol={Symbol} previous_reason={Reason} entries_allowed=false", symbol, reason);
     }
+
+    /// <summary>
+    /// P0.3a: per-stream диагностика молчащего символа — kline и стакан раздельно.
+    /// Фиксирует факты (сколько сообщений принято, возраст последнего, подтверждена ли подписка),
+    /// чтобы причину молчания не приходилось угадывать и чтобы один молчащий символ не объяснялся
+    /// «проблемами биржи» без доказательств.
+    /// </summary>
+    public static void DataStreamDiag(
+        string symbol,
+        string reason,
+        string silentTarget,
+        long klineMessages,
+        double? klineAgeSeconds,
+        long klineEmpty,
+        bool klineSubscribed,
+        int klineSubscribeRequests,
+        string klineAck,
+        long depthMessages,
+        double? depthAgeSeconds,
+        long depthEmpty,
+        bool depthSubscribed,
+        int depthSubscribeRequests,
+        string depthAck,
+        int acceptedClosedCandles,
+        int requiredClosedCandles,
+        bool indicatorsReady)
+    {
+        Ch.Warning(
+            "DATA-STREAM-DIAG symbol={Symbol} reason={Reason} silent_target={Target} " +
+            "kline_msgs={KMsgs} kline_last_age_s={KAge} kline_empty={KEmpty} kline_subscribed={KSub} kline_subscribes={KReq} kline_ack={KAck} " +
+            "depth_msgs={DMsgs} depth_last_age_s={DAge} depth_empty={DEmpty} depth_subscribed={DSub} depth_subscribes={DReq} depth_ack={DAck} " +
+            "candles={Candles}/{Required} indicators_ready={Ready}",
+            symbol, reason, silentTarget,
+            klineMessages, StreamAge(klineAgeSeconds), klineEmpty, klineSubscribed, klineSubscribeRequests, klineAck,
+            depthMessages, StreamAge(depthAgeSeconds), depthEmpty, depthSubscribed, depthSubscribeRequests, depthAck,
+            acceptedClosedCandles, requiredClosedCandles, indicatorsReady);
+    }
+
+    /// <summary>P0.3a: возраст последнего сообщения стрима; "-" означает, что сообщений не было ни разу.</summary>
+    private static string StreamAge(double? ageSeconds) =>
+        ageSeconds.HasValue ? LogOptions.N(ageSeconds.Value, "F1") : "-";
 
     public static void UserDataProbe(string environment, bool supported, int? httpStatus, int? apiCode, string? detail)
     {

@@ -78,4 +78,13 @@ public interface IBinanceWebSocketClient : IAsyncDisposable
     bool IsUserDataStreamConnected { get; }
     /// <summary>Последняя цена из уже полученного kline; без сетевого запроса.</summary>
     bool TryGetLastPrice(string symbol, out decimal price);
+
+    /// <summary>
+    /// P0.3a: per-stream диагностика рыночных стримов (kline и depth раздельно):
+    /// счётчики сообщений/пустых payload/ошибок разбора, время и возраст последнего сообщения,
+    /// состояние подписки и id/ack последнего SUBSCRIBE-запроса.
+    /// Используется эскалацией recovery и журналом вместо предположений о причине молчания символа.
+    /// Счётчики монотонны в пределах процесса и не сбрасываются реконнектом.
+    /// </summary>
+    IReadOnlyList<MarketStreamDiagnostics> GetStreamDiagnostics(DateTime nowUtc);
 }

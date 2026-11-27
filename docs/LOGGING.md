@@ -107,6 +107,7 @@ yyyy-MM-dd HH:mm:ss.fff zzz [LVL] [канал] Источник: EVENT-CODE key=
 | `KILL-SWITCH-*` | Аварийная блокировка, закрытие, сброс/отказ сброса, восстановление. |
 | `LLM-ROLE`, `LLM-VETO-*` | Роль модели и результат veto-контура. |
 | `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE*`, `DATA-WS-*` | Здоровье рыночных данных. |
+| `DATA-STREAM-DIAG` | P0.3a: per-stream факты молчащего символа — счётчики kline/depth, возраст последнего сообщения, пустые payload, состояние и ack подписки, прогрев свечей. Пишется перед каждой эскалацией recovery. |
 | `RECON-START`, `RECON-SUMMARY`, `RECON-FAIL`, `RECON-FINDING`, `RECON-ADOPT`, `RECON-CANCEL` | Реконсиляция. |
 | `RECON-SKIP-ACTIVE-ENTRY`, `RECON-EXPIRE-ENTRY` | Защита активного входа от преждевременной отмены. |
 | `EXECUTION-MODE`, `EXECUTION-STATE-BLOCKED`, `USER-DATA-*` | Режим исполнения и user-data stream. |
@@ -123,6 +124,7 @@ yyyy-MM-dd HH:mm:ss.fff zzz [LVL] [канал] Источник: EVENT-CODE key=
 | `TIME-SYNC` / `TIME-SYNC-FAIL` | Синхронизация времени. |
 | `ACCOUNT-BALANCE` | Доступный баланс quote-актива. |
 | `WS`, `WS-PARSE-ERROR` | WebSocket-события и ошибки разбора. |
+| `WS-SUBSCRIBE-SENT`, `WS-SUBSCRIBE-ACK`, `WS-SUBSCRIBE-ERROR` | P0.3a: контрольные кадры SUBSCRIBE/UNSUBSCRIBE с id, подтверждением сервера и latency. Подтверждение подписки не равно живому потоку данных. |
 | `BINANCE-ENV` | REST/stream URL окружения. |
 | `SYMBOL-NOT-FOUND`, `KLINES-SKIPPED` | Проблемы справочника/свечей. |
 

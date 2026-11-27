@@ -32,6 +32,32 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
     private long _messagesReceived;
     private long _parseErrors;
 
+    // P0.3a: per-stream диагностика. kline и depth одного символа — разные стримы и разные факты:
+    // счётчики сообщений, возраст последнего payload, id/ack подписки. Без этого причину молчания
+    // символа (ENJ/DASH) приходится угадывать, а эскалация recovery не объяснима в логе.
+    private readonly ConcurrentDictionary<string, StreamStats> _streamStats = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<int, ControlRequest> _pendingControlRequests = new();
+
+    private sealed class StreamStats
+    {
+        public string Stream { get; init; } = string.Empty;
+        public string Symbol { get; init; } = string.Empty;
+        public MarketStreamKind Kind { get; init; }
+        public long MessageCount;
+        public long EmptyPayloadCount;
+        public long ParseErrorCount;
+        public DateTime? FirstMessageUtc;
+        public DateTime? LastMessageUtc;
+        public bool Subscribed;
+        public int SubscribeRequestCount;
+        public int? LastSubscribeRequestId;
+        public DateTime? LastSubscribeRequestUtc;
+        public bool LastSubscribeAcked;
+        public string? LastSubscribeError;
+    }
+
+    private sealed record ControlRequest(string Method, string[] Streams, DateTime SentUtc);
+
     public event Action<OHLCV>? OnKline;
     public event Action<string, decimal, decimal, DateTime>? OnTrade;
     public event Action<OrderBook>? OnOrderBook;
@@ -67,10 +93,13 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         _marketConnectToken = ct;
         _marketInterval = interval;
 
-        var streams = BuildStreams(symbolList, interval);
+        var streams = BuildStreams(symbolList, interval).ToArray();
 
         var combinedStream = string.Join("/", streams);
         _streamUrl = $"{_config.MarketStreamBaseUrl}?streams={combinedStream}";
+
+        // P0.3a: стримы известны до подключения — фиксируем их в диагностике как подписанные через URL.
+        RegisterUrlStreams(streams);
 
         ExchangeLog.WebSocket("подключение",
             $"{symbolList.Count * 2} стримов, окружение {_config.ResolvedEnvironment}, url {_streamUrl}");
@@ -85,6 +114,91 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             $"{s.ToLowerInvariant()}@kline_{interval}",
             $"{s.ToLowerInvariant()}@depth20@1000ms"
         });
+
+    /// <summary>P0.3a: стримы, подписанные через URL комбинированного стрима (сохраняются для реконнекта).</summary>
+    private string[] _marketStreams = Array.Empty<string>();
+
+    /// <summary>
+    /// P0.3a: подписка через URL не подтверждается сервером отдельным ack — помечаем стрим подписанным сразу,
+    /// id/ack подписки остаются пустыми, в диагностике это видно как источник "url".
+    /// </summary>
+    private void RegisterUrlStreams(string[] streams)
+    {
+        _marketStreams = streams;
+        foreach (var stream in streams)
+            GetOrCreateStreamStats(stream).Subscribed = true;
+    }
+
+    private static (string Symbol, MarketStreamKind Kind)? ParseStreamName(string stream)
+    {
+        var at = stream.IndexOf('@');
+        if (at <= 0 || at == stream.Length - 1)
+            return null;
+
+        var symbol = stream[..at].ToUpperInvariant();
+        if (stream.Contains("@kline_", StringComparison.Ordinal))
+            return (symbol, MarketStreamKind.Kline);
+        if (stream.Contains("@depth", StringComparison.Ordinal))
+            return (symbol, MarketStreamKind.Depth);
+        return null;
+    }
+
+    private StreamStats GetOrCreateStreamStats(string stream) =>
+        _streamStats.GetOrAdd(stream, s =>
+        {
+            var parsed = ParseStreamName(s);
+            return new StreamStats
+            {
+                Stream = s,
+                Symbol = parsed?.Symbol ?? s,
+                Kind = parsed?.Kind ?? MarketStreamKind.Kline
+            };
+        });
+
+    /// <summary>P0.3a: учёт принятого payload по конкретному стриму (kline и depth — раздельно).</summary>
+    private StreamStats NoteStreamMessage(string stream, DateTime nowUtc)
+    {
+        var stats = GetOrCreateStreamStats(stream);
+        Interlocked.Increment(ref stats.MessageCount);
+        stats.LastMessageUtc = nowUtc;
+        stats.FirstMessageUtc ??= nowUtc;
+        return stats;
+    }
+
+    /// <summary>
+    /// P0.3a: снимок per-stream диагностики на момент nowUtc. Счётчики монотонны в пределах процесса;
+    /// реконнект их не обнуляет, поэтому по снимку видно, молчит стрим всегда или замолчал после реконнекта.
+    /// </summary>
+    public IReadOnlyList<MarketStreamDiagnostics> GetStreamDiagnostics(DateTime nowUtc)
+    {
+        var snapshot = new List<MarketStreamDiagnostics>(_streamStats.Count);
+        foreach (var stats in _streamStats.Values)
+        {
+            var last = stats.LastMessageUtc;
+            snapshot.Add(new MarketStreamDiagnostics(
+                stats.Symbol,
+                stats.Stream,
+                stats.Kind,
+                Interlocked.Read(ref stats.MessageCount),
+                Interlocked.Read(ref stats.EmptyPayloadCount),
+                Interlocked.Read(ref stats.ParseErrorCount),
+                stats.FirstMessageUtc,
+                last,
+                last.HasValue ? Math.Max(0d, (nowUtc - last.Value).TotalSeconds) : null,
+                stats.Subscribed,
+                stats.SubscribeRequestCount,
+                stats.LastSubscribeRequestId,
+                stats.LastSubscribeRequestUtc,
+                stats.LastSubscribeAcked,
+                stats.LastSubscribeError));
+        }
+
+        return snapshot
+            .OrderBy(d => d.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(d => d.Kind)
+            .ThenBy(d => d.Stream, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
 
     /// <summary>
     /// P0.3: UNSUBSCRIBE + SUBSCRIBE по молчащему символу. Соединение и остальные стримы не рвутся.
@@ -114,16 +228,94 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         ExchangeLog.WebSocket("resubscribe", $"{string.Join("/", streams)}");
     }
 
-    private async Task SendControlFrameAsync(ClientWebSocket ws, string method, string[] streams, CancellationToken ct)
+    private async Task<int> SendControlFrameAsync(ClientWebSocket ws, string method, string[] streams, CancellationToken ct)
     {
+        var id = Interlocked.Increment(ref _subscribeRequestId);
         var payload = JsonSerializer.Serialize(new
         {
             method,
             @params = streams,
-            id = Interlocked.Increment(ref _subscribeRequestId)
+            id
         });
         var bytes = Encoding.UTF8.GetBytes(payload);
         await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+
+        // P0.3a: id контрольного запроса сохраняется до ack — иначе в логе нельзя связать
+        // SUBSCRIBE/UNSUBSCRIBE с ответом сервера и отличить «подписка не подтверждена» от «стрим молчит».
+        var sentUtc = DateTime.UtcNow;
+        _pendingControlRequests[id] = new ControlRequest(method, streams, sentUtc);
+
+        var isSubscribe = string.Equals(method, "SUBSCRIBE", StringComparison.Ordinal);
+        foreach (var stream in streams)
+        {
+            var stats = GetOrCreateStreamStats(stream);
+            if (isSubscribe)
+            {
+                stats.SubscribeRequestCount++;
+                stats.LastSubscribeRequestId = id;
+                stats.LastSubscribeRequestUtc = sentUtc;
+                stats.LastSubscribeAcked = false;
+                stats.LastSubscribeError = null;
+                // До ack сервера подписку нельзя считать действующей.
+                stats.Subscribed = false;
+            }
+            else
+            {
+                stats.Subscribed = false;
+            }
+        }
+
+        ExchangeLog.SubscribeControl(method, id, string.Join("/", streams));
+        return id;
+    }
+
+    /// <summary>
+    /// P0.3a: разбор ответа на SUBSCRIBE/UNSUBSCRIBE. Ранее ответ игнорировался, поэтому молчание стрима
+    /// после неподтверждённой подписки выглядело как проблема биржевых данных.
+    /// </summary>
+    private void HandleControlResponse(JsonElement root)
+    {
+        if (!root.TryGetProperty("id", out var idProp) ||
+            idProp.ValueKind != JsonValueKind.Number ||
+            !idProp.TryGetInt32(out var requestId) ||
+            !_pendingControlRequests.TryRemove(requestId, out var request))
+        {
+            // Ответ без известного id (или unsolicited error) — фиксируем, но не связываем с подпиской.
+            if (root.TryGetProperty("error", out var orphanError) && orphanError.ValueKind != JsonValueKind.Null)
+                ExchangeLog.WebSocket("ошибка от сервера", orphanError.GetRawText());
+            return;
+        }
+
+        var latencyMs = (DateTime.UtcNow - request.SentUtc).TotalMilliseconds;
+        var isSubscribe = string.Equals(request.Method, "SUBSCRIBE", StringComparison.Ordinal);
+        var streams = string.Join("/", request.Streams);
+
+        if (root.TryGetProperty("error", out var error) && error.ValueKind != JsonValueKind.Null)
+        {
+            var text = error.GetRawText();
+            foreach (var stream in request.Streams)
+            {
+                var stats = GetOrCreateStreamStats(stream);
+                stats.LastSubscribeAcked = false;
+                stats.LastSubscribeError = text;
+                if (isSubscribe)
+                    stats.Subscribed = false;
+            }
+
+            ExchangeLog.SubscribeError(request.Method, requestId, streams, text);
+            return;
+        }
+
+        foreach (var stream in request.Streams)
+        {
+            var stats = GetOrCreateStreamStats(stream);
+            stats.LastSubscribeAcked = true;
+            stats.LastSubscribeError = null;
+            // SUBSCRIBE подтверждён — стрим подписан; UNSUBSCRIBE подтверждён — подписки больше нет.
+            stats.Subscribed = isSubscribe;
+        }
+
+        ExchangeLog.SubscribeAck(request.Method, requestId, streams, latencyMs);
     }
 
     /// <summary>
@@ -164,6 +356,11 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         ExchangeLog.WebSocket("принудительный реконнект", _streamUrl);
         await ConnectInternalAsync(_cts.Token);
         _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
+
+        // P0.3a: после реконнекта подписка снова идёт через URL; контрольные запросы старого сокета
+        // уже никогда не будут подтверждены — убираем их из ожидания, чтобы ack не «висел» в диагностике.
+        _pendingControlRequests.Clear();
+        RegisterUrlStreams(_marketStreams);
 
         try { OnReconnected?.Invoke(); }
         catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnReconnected при принудительном реконнекте"); }
@@ -285,6 +482,8 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                 await Task.Delay(reconnectDelayMs, ct);
                 await ConnectInternalAsync(ct);
                 reconnectDelayMs = Math.Min(reconnectDelayMs * 2, 60_000);
+                // P0.3a: контрольные запросы прежнего сокета уже не получат ack.
+                _pendingControlRequests.Clear();
 
                 // P1.4: сокет снова открыт, но история могла потерять свечи/стакан.
                 // Движок обязан выполнить REST-дозагрузку и повторный прогрев до разрешения входов.
@@ -306,6 +505,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
 
     private void ProcessMessage(string json)
     {
+        string? streamName = null;
         try
         {
             using var doc = JsonDocument.Parse(json);
@@ -314,19 +514,21 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             // Комбинированный стрим: {"stream":"btcusdt@kline_15m","data":{...}}
             if (!root.TryGetProperty("stream", out var streamProp))
             {
-                // Ответ на подписку {"result":null,"id":1} — игнорируем.
-                if (root.TryGetProperty("error", out var error))
-                    ExchangeLog.WebSocket("ошибка от сервера", error.GetRawText());
+                // P0.3a: ответ на SUBSCRIBE/UNSUBSCRIBE — фиксируем id/ack вместо молчаливого игнора.
+                HandleControlResponse(root);
                 return;
             }
 
             var stream = streamProp.GetString();
             if (stream is null) return;
+            streamName = stream;
 
             if (!root.TryGetProperty("data", out var data))
                 return;
 
             _messagesReceived++;
+            var receivedAtUtc = DateTime.UtcNow;
+            var stats = NoteStreamMessage(stream, receivedAtUtc);
 
             if (stream.Contains("@kline_", StringComparison.Ordinal))
             {
@@ -334,6 +536,7 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                 if (kline?.Kline is null || string.IsNullOrEmpty(kline.Kline.Symbol))
                 {
                     _parseErrors++;
+                    Interlocked.Increment(ref stats.EmptyPayloadCount);
                     ExchangeLog.WebSocket("пустой kline payload", stream);
                     return;
                 }
@@ -348,15 +551,19 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
                 if (depth is null)
                 {
                     _parseErrors++;
+                    Interlocked.Increment(ref stats.EmptyPayloadCount);
                     return;
                 }
 
-                ProcessDepth(depth, symbol);
+                if (!ProcessDepth(depth, symbol))
+                    Interlocked.Increment(ref stats.EmptyPayloadCount);
             }
         }
         catch (Exception ex)
         {
             _parseErrors++;
+            if (streamName is not null)
+                Interlocked.Increment(ref GetOrCreateStreamStats(streamName).ParseErrorCount);
             ExchangeLog.WebSocketParseError(json, ex);
         }
     }
@@ -395,7 +602,9 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         OnTrade?.Invoke(ohlcv.Symbol, ohlcv.Close, ohlcv.Volume, ohlcv.CloseTime);
     }
 
-    private void ProcessDepth(BinancePartialDepthStream depth, string symbol)
+    /// <summary>P0.3a: возвращает false, если стакан пришёл пустым — это факт для per-stream диагностики,
+    /// а не «стрим молчит»: сообщения по depth-стриму идут, но usable-снаряжения не дают.</summary>
+    private bool ProcessDepth(BinancePartialDepthStream depth, string symbol)
     {
         var orderBook = new OrderBook
         {
@@ -410,10 +619,11 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         {
             _logger.LogDebug("Пустой стакан {Symbol} (bids={Bids}, asks={Asks})",
                 symbol, orderBook.Bids.Count, orderBook.Asks.Count);
-            return;
+            return false;
         }
 
         OnOrderBook?.Invoke(orderBook);
+        return true;
     }
 
     private static List<OrderBookEntry> ParseLevels(List<List<string>> levels)
