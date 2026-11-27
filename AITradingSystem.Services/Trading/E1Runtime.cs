@@ -9,6 +9,7 @@ using AITradingSystem.Core.Models.MarketData;
 using AITradingSystem.Core.Models.Trading;
 using AITradingSystem.Data.Binance;
 using AITradingSystem.Data.Storage;
+using AITradingSystem.Services.Analysis;
 using Microsoft.Extensions.Logging;
 
 namespace AITradingSystem.Services.Trading;
@@ -146,7 +147,7 @@ public sealed class E1Runtime
                 LifecycleId = intent.EntryIntentId!, EntryIntentId = intent.EntryIntentId!,
                 DecisionId = intent.DecisionId, Status = OutcomeStatus.NoFill,
                 Side = intent.Side ?? OrderSide.Buy, UnresolvedReason = string.Empty,
-                ExitReason = stored.Error ?? "entry-not-filled"
+                ExitReason = stored?.Error ?? "entry-not-filled"
             }, ct);
         }
     }
