@@ -174,6 +174,8 @@
 
 ## 5. E1: журнал решений, fills и outcomes — следующий после P0.9/P0.3a
 
+**Статус E1 после шага 1:** добавлены machine-readable контракты `DecisionLedgerRecord`/`FillLedgerRecord`/`OutcomeLedgerRecord`, durable JSONL-хранилище `JsonE1Ledger` с идемпотентностью по identity, fail-closed при повреждении строки/партиции, разделением source/environment/account и проверкой fee/outcome-арифметики; добавлены регрессионные контракты `E1LedgerTests` и описание `docs/E1-LEDGER.md`. Runtime-продюсеры decision/entry/protection/exit/outcome ещё не подключены; сборки/компиляции/тесты не выполнялись; Demo-приёмка E1 не выполнена.
+
 Сохранить требования полной исторической редакции, но начать с минимально проверяемого сквозного пути:
 
 ```text
@@ -196,12 +198,12 @@ exit_reason, protection_resolution, dust_qty, unresolved_reason
 
 Требования:
 
-- `[ ]` Один финальный outcome на entry/position lifecycle; повторная доставка события идемпотентна.
-- `[ ]` Сырые human logs не заменяют machine-readable ledger; repeats не используются как статистическая выборка.
-- `[ ]` HOLD/NO_FILL не считаются сделками; отсутствие AI-вызова не считается AI-отказом.
-- `[ ]` Demo, Paper, Shadow и Live имеют разный source; нет смешивания симулированных и биржевых fills.
-- `[ ]` Комиссия учитывается один раз, в том числе fee в базовом активе/BNB; balance delta не заменяет fee ledger.
-- `[ ]` Сохранять point-in-time признаки и версии gates для последующего walk-forward.
+- `[~]` Один финальный outcome на entry/position lifecycle; повторная доставка события идемпотентна. Контракт/hранилище проверяют immutable identity и однократную финализацию `Unresolved`; runtime-продюсеры lifecycle ещё не подключены.
+- `[~]` Сырые human logs не заменяют machine-readable ledger; repeats не используются как статистическая выборка. Добавлен отдельный JSONL ledger; runtime-запись решений/fills/outcomes ещё не подключена.
+- `[~]` HOLD/NO_FILL не считаются сделками; отсутствие AI-вызова не считается AI-отказом. Контракты `DecisionOutcome`/`AiDisposition`/`OutcomeStatus.NoFill` и проверки хранилища добавлены; runtime-классификация ещё не подключена.
+- `[~]` Demo, Paper, Shadow и Live имеют разный source; нет смешивания симулированных и биржевых fills. Партиции source/environment/account и evidence-проверки добавлены; runtime-источники ещё не подключены.
+- `[~]` Комиссия учитывается один раз, в том числе fee в базовом активе/BNB; balance delta не заменяет fee ledger. Контракты fee delta/valuation/conversion и сумма outcome fees добавлены; runtime-получение myTrades/конвертация ещё не подключены.
+- `[~]` Сохранять point-in-time признаки и версии gates для последующего walk-forward. Поля features/gate versions/data snapshot hash добавлены в контракты; runtime-снимок на момент сигнала ещё не подключён.
 
 ---
 
