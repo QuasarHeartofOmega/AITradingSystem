@@ -207,7 +207,10 @@ public sealed class E1Runtime
                 return;
             }
 
-            var existing = await _ledger.LoadFillsAsync(ct);
+            // An exchange trade is an immutable fact: replaying it (polling reconcile, restart, duplicate
+            // report) must be a no-op, not a second append under the same FillId.
+            var recorded = new HashSet<string>(
+                (await _ledger.LoadFillsAsync(ct)).Select(f => f.FillId), StringComparer.Ordinal);
             decimal cumulative = 0m;
             foreach (var t in ordered)
             {
@@ -215,6 +218,7 @@ public sealed class E1Runtime
                 var price = Dec(t.Price);
                 if (qty <= 0 || price <= 0) continue;
                 cumulative += qty;
+                if (!recorded.Add($"exchange:{order.BinanceOrderId}:{t.Id}")) continue;
                 var fee = Dec(t.Commission);
                 var feeAsset = t.CommissionAsset ?? string.Empty;
                 var quote = QuoteOf(order.Symbol);
@@ -308,12 +312,14 @@ public sealed class E1Runtime
             await _gate.WaitAsync(ct);
             try
             {
+                var fillId = $"exchange:{report.OrderId}:{report.TradeId}";
+                if ((await _ledger.LoadFillsAsync(ct)).Any(f => f.FillId == fillId)) return;
                 await _ledger.RecordFillAsync(new FillLedgerRecord
                 {
                     RunId = RunId, ConfigHash = _configHash, BuildHash = "unknown",
                     Environment = Environment, AccountFingerprint = AccountFingerprint,
                     QuoteAsset = quote, Source = Source, Symbol = report.Symbol,
-                    FillId = $"exchange:{report.OrderId}:{report.TradeId}",
+                    FillId = fillId,
                     DecisionId = decisionId, EntryIntentId = entryIntentId, PositionId = positionId,
                     ProtectionIdentity = protectionIdentity, ClientOrderId = report.ClientOrderId,
                     ExchangeOrderId = report.OrderId.ToString(CultureInfo.InvariantCulture),

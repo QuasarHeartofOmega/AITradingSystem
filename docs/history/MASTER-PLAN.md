@@ -1,6 +1,7 @@
 # AITradingSystem — единый мастер-план
 
 **Дата консолидации:** 2026-11-27  
+**Последнее обновление:** 2026-11-27 — внесены шаги 1–6 по логам 2026-11-27 (сборочные правки, идемпотентность E1, Blocker 5/6, Phase 1.5, 8.3, 8.4, 7, 8.1).  
 **Область:** все планы/трекеры/журналы из `docs/history/`, плюс связанные операционные документы `docs/SETUP-WINDOWS.md`, `docs/LOGGING.md`, `docs/E1-LEDGER.md`.  
 **Статус документа:** это единый читаемый план и сводка состояния. Сам факт консолидации не является сборкой, тестом, runtime-приёмкой или доказательством торговой готовности.
 
@@ -224,7 +225,8 @@
 
 # Часть II. Текущий baseline и блокеры
 
-Источник: `PLAN-PROFIT-ENGINE-ext.md`, логи 2026-11-26 17:28–20:22 (+03:00).
+Источник: `PLAN-PROFIT-ENGINE-ext.md`, логи 2026-11-26 17:28–20:22 (+03:00).  
+Источник обновления: логи 2026-11-27 15:48–22:02 (+03:00) (`trading/exchange/trades/news`), `trades.json`, `positions.json`, `execution_journal.json`, `risk_state_*.json`.
 
 ## 1. Что подтверждено
 
@@ -250,6 +252,8 @@ ENJ/DASH recovery вызывает repeated resubscribe/reconnect и затра�
 
 **Требование:** per-symbol isolation, dual kline/depth freshness, bounded reconnect/backoff, operator escalation, healthy-symbol progress preserved.
 
+Подтверждение 2026-11-27: DASH `stale-kline` → `ws-disconnected` → `DATA-QUARANTINE 300 s` в 16:51–16:56, `MONITOR-LAG` 5.1–15.3 s при пороге 2 s, 133 × `DATA-STALE`, 82 × `DATA-QUARANTINE`, 84 × `DATA-WS-RECONNECT` за прогон. Сопровождение открытой позиции шло на протухших данных.
+
 ### Blocker 3: нет достоверного net outcome ledger
 
 Изменение USDT-баланса не является net PnL. Нет связанной цепочки entry/protection/exit/fees/net R.
@@ -259,6 +263,29 @@ ENJ/DASH recovery вызывает repeated resubscribe/reconnect и затра�
 ### Blocker 4: E0 не закрыт
 
 Нет подтверждённого сквозного Demo acceptance: entry fill → OCO → SL/TP/partial → recon → restart → risk-state → kill-switch → fees/net R.
+
+### Blocker 5: одна позиция продавалась 17 раз (лог 2026-11-27, DASHUSDT)
+
+Факт по `trades.json` и `trading-20261127.txt`:
+
+- Вход один: `16:45:52` LIMIT_MAKER 36.82, исполнено **1.267 из 19.038** (6.7 %), `ORDER-FILL-TIMEOUT 60 s`, остаток отменён, позиция открыта на частичный объём.
+- `17:22:06` законный `Stop-Loss` → MARKET 36.6719, net **−0.2353 USDT**.
+- Далее **16 повторных принудительных закрытий** той же позиции: `17:30:14`–`17:35:04`, причина `NoExchangeProtection`, цены 36.54 → 36.14, каждые 20 с.
+- Итог: 17 записей DASH с одинаковым `EntryPrice 36.82`, продано **20.522 DASH при купленных 1.267**, комиссии 0.76, net **−8.87 USDT**, из них **−8.64 — цикл повторных закрытий**, а не рынок.
+- Механика: close-филл `exchange:807229690:34932945` не записывался в E1 (`LedgerConflictException`) → `ApplyExchangeFillAsync` бросал исключение → позиция не помечалась закрытой локально → reconcile видел «открытая позиция без биржевой защиты» → новый принудительный MARKET.
+- Продан объём, которого не было на балансе: Demo принимал такие ордера. На Live это отказы либо реальная короткая позиция.
+
+**Требование:** закрытие lifecycle идемпотентно и не зависит от успеха записи evidence; принудительный MARKET сверяется с фактическим балансом актива; повторный reconcile не создаёт новый sell-order по уже закрытой позиции.
+
+**Статус:** `[code]` первопричина (идемпотентность fills) устранена; `[todo]` защита в глубину и баланс-контроль — Phase 1.5; `[accept]` Demo-регрессия повторного закрытия.
+
+### Blocker 6: конфликт идентичности E1 глушил reconcile и защиту
+
+Логи 2026-11-27 15:51–17:22: `RECON-FAIL … Conflicting immutable E1 identity` каждые 20 с → `EXECUTION-STATE-BLOCKED entries_allowed=false` по всем 7 парам; конфликт по outcome позиции ломал постановку/замену OCO → «позиция БЕЗ биржевого стопа» → аварийное закрытие → dust.
+
+Причины: правило замены outcome разрешало единственный переход `Unresolved → final` и запрещало уточнение открытой записи, хотя runtime пишет outcome на каждое событие защиты; повторная запись финального outcome считалась конфликтом, а не no-op.
+
+**Статус:** `[code]` исправлено (Phase 2.3/2.4). В прогоне 17:22–22:02 `RECON-FAIL` = 0, конфликтов outcome = 0. Остаток: 7931 конфликт fills (Blocker 5) и 1 × `RECON-ADOPT-FAIL … E1 identity is required`.
 
 ---
 
@@ -311,7 +338,19 @@ ENJ/DASH recovery вызывает repeated resubscribe/reconnect и затра�
 - `[accept]` Symbol policy/direction mismatch/UI persistence.
 - `[accept]` Transport fault-injection: timeout не останавливает цикл; orphan/watchdog видны.
 
-**Критерий выхода из Phase 1:** нет фантомных позиций; исчезнувшая OCO имеет terminal resolution или explicit unresolved freeze; карантин одного символа не вызывает бесконечный reconnect общего рынка.
+### 1.5 Идемпотентность закрытия и запрет повторных продаж (Blocker 5)
+
+- `[code]` `E1Runtime.RecordOrderAsync`: дедуп биржевых трейдов по `FillId` (`exchange:{orderId}:{tradeId}`) — переменная `existing` была загружена и не использовалась, повторный реплей писал тот же fill под другим payload.
+- `[code]` `E1Runtime.RecordReportAsync`: та же проверка перед записью fill из executionReport.
+- `[todo]` Пометка позиции закрытой/уменьшенной **не зависит** от успеха записи в E1: сбой evidence-журнала не откатывает применённый биржевой факт (сейчас исключение из ledger отменяет применение close-филла).
+- `[todo]` Один terminal close на lifecycle: `close_in_flight`/`closed` флаг + дедуп по `positionId` и `clientOrderId`, чтобы reconcile, monitor и manual close не создавали второй sell-order.
+- `[todo]` Перед принудительным MARKET (`NoExchangeProtection`, trailing-fail, kill-switch) сверять фактический свободный баланс базового актива; продавать не больше, чем есть; недостающий объём — в alert/dust-review, не в ордер.
+- `[todo]` `RECON-ADOPT-FAIL … E1 identity is required`: подхват сиротской позиции без E1-идентичности не должен бросать исключение — присваивать/восстанавливать identity либо явно помечать `external`, не ломая reconcile.
+- `[todo]` Алерт на аномалию «суммарный проданный объём > купленного по lifecycle» (в прогоне 20.522 против 1.267).
+- `[accept]` Demo-регрессия: SL → close-филл → повторный polling/restart/manual close даёт **один** sell-order; сбой записи в ledger не приводит к повторной продаже.
+- `[accept]` Ledger недоступен/конфликтует → позиция закрыта локально, entries frozen, alert; после восстановления evidence дописывается без дублей.
+
+**Критерий выхода из Phase 1:** нет фантомных позиций; исчезнувшая OCO имеет terminal resolution или explicit unresolved freeze; карантин одного символа не вызывает бесконечный reconnect общего рынка; одна позиция не продаётся дважды.
 
 ## Phase 2. E1: журнал решений, fills и outcomes
 
@@ -348,6 +387,7 @@ decision_id → entry_intent_id → entry_fill(s)
 - `[code]` Fee в base конвертируется по цене того же филла с evidence; BNB/прочее остаётся Unvalued до отдельного conversion evidence.
 - `[code]` Protection identity/resolution связан с fills и outcome.
 - `[code]` Balance delta не заменяет fee ledger.
+- `[code]` 2026-11-27: fills идемпотентны по `FillId` в `RecordOrderAsync`/`RecordReportAsync`; правило неизменяемости fills в `JsonE1Ledger` не ослаблено (первый авторитетный exchange trade выигрывает).
 
 ### 2.4 Шаг 4 — outcomes/restart/polling
 
@@ -357,6 +397,9 @@ decision_id → entry_intent_id → entry_fill(s)
 - `[code]` Restart/polling recovery переиспользует lifecycle/intent ids и дедуплицирует fills/fees.
 - `[code]` Dust отделён от realized exit quantity.
 - `[code]` Net R считается от initial quote risk и actual fills/fees.
+- `[code]` 2026-11-27: `JsonE1Ledger.MayReplaceOutcome` — открытую (`Unresolved`) запись можно уточнять (protection attach/resolve, trailing replace, partial, reconcile-open) при совпадении `Symbol/EntryIntentId/DecisionId/Side`; финальная запись неизменяема.
+- `[code]` 2026-11-27: `E1Runtime.RecordOutcomeAsync` — повторная запись финального outcome это идемпотентный no-op с `LogDebug`, а не `LedgerConflictException`, обрывавший весь `ReconcileAsync`.
+- `[accept]` 2026-11-27 подтверждено логом: `RECON-FAIL` = 0 и конфликтов outcome = 0 за 17:22–22:02 (было каждые 20 с).
 
 ### 2.5 Шаг 5 — E1 acceptance
 
@@ -532,6 +575,14 @@ IGNORE: listing, partnership, upgrade — не является разрешен
 - `[todo]` Метрики: `veto_precision`, `avoided_R`, `unique_veto`, `false_veto_cost`, `llm_latency`.
 - `[todo]` Если `avoided_R <= false_veto_cost` на достаточной выборке — роль сжимается до explainer/off.
 
+Наблюдение 2026-11-27 (DASH/DOGE): `LLM-VETO-LATE latency_ms=11913` и `11487` при `veto_budget_s=10`, `veto=True`, `within_budget=False` — единственный голос «против» входа был отброшен по таймауту, вход состоялся на `prior=0.56` при пороге `0.55`.
+
+- `[todo]` Измерить `llm_latency` p50/p95 на целевом GPU (RX590/Vulkan, ctx 4096, thinkingBudget 96) и привести бюджет veto в соответствие с фактом, а не с ожиданием.
+- `[todo]` Прогрев/кэш модели и переиспользование контекста, чтобы первый вызов после старта не съедал бюджет.
+- `[todo]` Late-veto не теряется молча: писать отдельный аудит и считать исход опоздавшего veto в `avoided_R`/`false_veto_cost` (тень отклонённых).
+- `[todo]` Политика при систематическом опоздании: либо роль Off/Explainer по метрике, либо вход не разрешается без veto в пределах бюджета — выбрать явно, не оставлять «LLM вне критического пути» как скрытый пропуск.
+- `[accept]` SL/TP/protection подтверждённо не ждут LLM ни при каком таймауте.
+
 **Критерий выхода из Phase 7:** LLM может только запретить и объяснить; её польза измерена в R.
 
 ## Phase 8. E6: исполнение, post-only и защита
@@ -545,6 +596,12 @@ IGNORE: listing, partnership, upgrade — не является разрешен
 - `[todo]` `fill_probability` по submitted intents, не по AI-сигналам.
 - `[todo]` Paper post-only моделирует очередь/вероятность fill, не мгновенное исполнение.
 - `[todo]` Метрики: `time_to_fill`, `fill_ratio`, `post_only_reject_rate`, `cancel_rate`, `expired_rate`.
+
+Наблюдение 2026-11-27: DOGE `LIMIT_MAKER` по 0.05856 отклонён `-2010 Order would immediately match and take`; DASH maker 36.82 исполнился на 6.7 % за 60 с и был отменён по таймауту.
+
+- `[todo]` Цена post-only входа ставится по стакану, а не по last/entry-оценке: BUY строго ниже bestAsk, SELL строго выше bestBid, с учётом tick; при пересечении — reprice, а не exception-отказ.
+- `[todo]` `-2010` обрабатывается как штатный исход post-only lifecycle (reprice/cancel/skip) и попадает в `post_only_reject_rate`, а не в `stage=exception`.
+- `[todo]` Коридор допустимого отклонения цены/спреда для maker-входа; `WIDE-SPREAD` (BTTC 3.28 %) блокирует вход, а не только логируется.
 
 ### 8.2 Adverse selection и slippage
 
@@ -573,7 +630,27 @@ slippage_vs_arrival = side_sign * (fill_price - arrival_mid) / initial_risk
 - `[todo]` `unprotected_seconds` и `protection_missing` — метрики и алерты.
 - `[todo]` Тест: LLM занята, UI закрыт, сеть моргнула, процесс упал — защита/recon восстанавливают состояние.
 
+Наблюдение 2026-11-27 (DASH): initial SL 36.56 (−0.70 %), трейлинг поднял стоп до 36.6889 (**−0.36 % от входа**) за 2 минуты после частичного входа; стоп снят шумом через 35 минут. Защита 0.00000000 < minQty 1.0 после частичного исполнения и dust 0.593 DOGE ниже `MARKET_LOT_SIZE/minNotional` оставляли позицию без биржевого стопа.
+
+- `[todo]` Ширина initial SL и шаг трейлинга считаются от ATR/волатильности символа, а не от фиксированного процента; минимальная ширина ≥ k·ATR и ≥ tick/step-коридора.
+- `[todo]` Трейлинг не подтягивает стоп ближе минимальной волатильностной дистанции и не активируется раньше подтверждения OCO/полного входа.
+- `[todo]` Частичный вход: объём защиты пересчитывается от фактически исполненного и округляется по `LOT_SIZE`; если объём < minQty — защита невозможна, это явный режим (quarantine/аварийное закрытие с аудитом), а не бесконечный `TRAILING-REPLACE-FAIL`.
+- `[todo]` Dust ниже фильтров: отдельная процедура (конвертация/ручной аудит) и запрет повторных MARKET по этому остатку.
+- `[todo]` Cancel/replace OCO атомарен по состоянию: при неудаче прежняя защита восстанавливается или позиция закрывается один раз, без цикла «без стопа».
+- `[accept]` Метрика `unprotected_seconds` и алерт на «позиция без биржевого стопа» подтверждены на Demo.
+
 **Критерий выхода из Phase 8:** позиция не остаётся неуправляемой; издержки в EV соответствуют фактическим.
+
+### 8.4 Качество входа: anti-chase и маржинальный порог
+
+Наблюдение 2026-11-27 (DASH, 16:45:49): `PRE-SCORE direction=LONG, score=0.51, prior=0.56` при пороге `0.55` — проход с запасом **0.01**; ADX 28.3, volume_ratio 1.69, EMA20>EMA50>EMA200, Supertrend вверх, RSI 46.9, StochRSI бычий крест, **OBV падает — объём против тренда**. Вход по закрытой свече после импульса попал в локальный максимум 36.82; TP 37.61 не достигался ни разу.
+
+- `[todo]` Признак перерастяжения в момент входа: расстояние цены до EMA20/EMA50 в ATR, позиция в диапазоне последних N свечей, доля импульса, уже пройденная без отката.
+- `[todo]` Anti-chase правило: при перерастяжении выше порога — вход запрещён либо только maker-лимит на откате, без догоняющего market.
+- `[todo]` Маржинальная зона `prior − threshold < 0.02`: отдельный bucket и отдельная статистика; решение (уменьшенный размер / skip / обычный вход) принимается по EV, а не вкусово.
+- `[todo]` Расхождение объёма (OBV против тренда) — явный флаг в `EngineScore.Facts` и признак бакета, а не только текст в логе.
+- `[todo]` Все изменения фильтров входа валидируются через Phase 4 (BucketTable, net R, walk-forward) и Phase 5 (EdgeGate); не ослаблять и не ужесточать порог ради числа сделок.
+- `[accept]` Отчёт «вход на излёте импульса»: adverse_selection_R и net R против расстояния до EMA в ATR — до и после фильтра.
 
 ## Phase 9. E7: капитал, сайзинг и риск разорения
 
@@ -602,6 +679,7 @@ slippage_vs_arrival = side_sign * (fill_price - arrival_mid) / initial_risk
 - `[todo]` Секреты: DPAPI, masking, запрет полных account dumps в логах/промптах.
 - `[accept]` Native DLL/model/build hashes зафиксированы; AMD Polaris/RX590 обновлён до llama.cpp с фиксом кластерного мусора.
 - `[todo]` Воспроизводимая поставка и откат версии.
+- `[code]` 2026-11-27: устранены сборочные дефекты `AITradingSystem.Services` — отсутствующий `using AITradingSystem.Services.Analysis` в `E1Runtime.cs` (CS0246 `EngineScore`) и разыменование `stored.Error` → `stored?.Error` (CS8602). Сборка/тесты в этом проходе не выполнялись; факт запуска подтверждён runtime-логом заказчика 15:48–22:02.
 - `[todo]` Метрики гейтов, отказов, latency, деградации; Telegram alerts.
 - `[todo]` Effective config hash в каждом run.
 - `[accept]` Logging acceptance: объём, отсутствие полных тел при Summary, no WRN spam, masking, rotation, AI/native separation.
@@ -727,10 +805,13 @@ LLM вне критического пути; её польза измерена
 
 ## Ближайший исполнимый порядок
 
-1. **Phase 1 / P0.9 runtime:** восстановить фактический DOGE exit через Demo order/trade history; не отправлять новые ордера в рамках аудита.
-2. **Phase 1 / P0.9 acceptance:** проверить resolver и регрессию гонки на Demo SL/TP/partial/restart.
-3. **Phase 1 / P0.3a acceptance:** собрать per-stream диагностику ENJ/DASH и подтвердить isolation/backoff.
-4. **Phase 2 / E1 acceptance:** Demo-приёмка decision/fill/protection/outcome цепочки, restart/polling, fees/net R.
-5. **Phase 3 / E0:** повторить Demo infrastructure acceptance.
-6. **Phase 3 / E0:** повторить Demo infrastructure acceptance.
-7. **Phase 4–11:** статистика, EdgeGate, события, LLM-роли, исполнение, капитал, надёжность, Live ramp-up.
+1. **Phase 1.5 / Blocker 5:** идемпотентность закрытия в глубину — пометка close независимо от записи в E1, один terminal close на lifecycle, сверка баланса перед принудительным MARKET, `RECON-ADOPT-FAIL` без исключения.
+2. **Phase 1 / P0.9 runtime:** восстановить фактический DOGE exit через Demo order/trade history; не отправлять новые ордера в рамках аудита.
+3. **Phase 8.3:** ширина SL/трейлинга от ATR, объём защиты после частичного входа, dust-процедура, атомарный cancel/replace OCO.
+4. **Phase 1 / P0.3a acceptance:** per-stream диагностика ENJ/DASH, isolation/backoff, `MONITOR-LAG` и `DATA-QUARANTINE` не оставляют позицию без сопровождения.
+5. **Phase 8.1:** post-only цена по стакану и штатная обработка `-2010`; коридор спреда.
+6. **Phase 7:** бюджет LLM-veto по фактической latency, аудит и учёт опоздавших veto.
+7. **Phase 8.4 → Phase 4/5:** anti-chase и маржинальная зона порога — только со статистической валидацией на net R.
+8. **Phase 2 / E1 acceptance:** Demo-приёмка decision/fill/protection/outcome цепочки, restart/polling, fees/net R.
+9. **Phase 3 / E0:** сквозной Demo infrastructure acceptance.
+10. **Phase 4–11:** статистика, EdgeGate, события, LLM-роли, исполнение, капитал, надёжность, Live ramp-up.
