@@ -42,8 +42,20 @@ public sealed class JsonE1Ledger : IE1Ledger
         _decisions = new(Path.Combine(partition, "decisions.jsonl"), r => r.DecisionId, ValidateDecision, (_, _) => false);
         _fills = new(Path.Combine(partition, "fills.jsonl"), r => r.FillId, ValidateFill, (_, _) => false);
         _outcomes = new(Path.Combine(partition, "outcomes.jsonl"), r => r.LifecycleId, ValidateOutcome,
-            (old, next) => old.Status == OutcomeStatus.Unresolved && next.Status != OutcomeStatus.Unresolved);
+            MayReplaceOutcome);
     }
+
+    /// <summary>
+    /// An open (unresolved) lifecycle is refined in place: protection attach/resolve, trailing replace,
+    /// partial fills, reconcile-open. Its identity is immutable, its evidence is not.
+    /// A resolved lifecycle (closed/no-fill/…) is final evidence and is never rewritten.
+    /// </summary>
+    private static bool MayReplaceOutcome(OutcomeLedgerRecord old, OutcomeLedgerRecord next) =>
+        old.Status == OutcomeStatus.Unresolved
+        && string.Equals(old.Symbol, next.Symbol, StringComparison.Ordinal)
+        && string.Equals(old.EntryIntentId, next.EntryIntentId, StringComparison.Ordinal)
+        && string.Equals(old.DecisionId, next.DecisionId, StringComparison.Ordinal)
+        && old.Side == next.Side;
 
     public Task<bool> RecordDecisionAsync(DecisionLedgerRecord record, CancellationToken ct = default) =>
         _decisions.AppendAsync(record, ct);

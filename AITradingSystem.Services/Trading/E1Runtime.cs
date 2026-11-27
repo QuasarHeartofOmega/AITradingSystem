@@ -581,7 +581,20 @@ public sealed class E1Runtime
     private async Task RecordOutcomeAsync(OutcomeLedgerRecord record, CancellationToken ct)
     {
         await _gate.WaitAsync(ct);
-        try { await _ledger.RecordOutcomeAsync(record, ct); }
+        try
+        {
+            var existing = (await _ledger.LoadOutcomesAsync(ct))
+                .FirstOrDefault(o => o.LifecycleId == record.LifecycleId);
+            if (existing != null && existing.Status != OutcomeStatus.Unresolved)
+            {
+                // Final evidence is immutable. Repeated reconcile/protection passes are idempotent no-ops,
+                // not conflicts: a rewrite here used to abort reconciliation and block all entries.
+                _logger.LogDebug("E1 outcome {LifecycleId} already resolved as {Status}; skipping {Requested} rewrite",
+                    record.LifecycleId, existing.Status, record.Status);
+                return;
+            }
+            await _ledger.RecordOutcomeAsync(record, ct);
+        }
         finally { _gate.Release(); }
     }
 
