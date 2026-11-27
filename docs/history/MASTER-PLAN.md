@@ -1,7 +1,7 @@
 # AITradingSystem — единый мастер-план
 
 **Дата консолидации:** 2026-11-27  
-**Последнее обновление:** 2026-11-27 — внесены шаги 1–6 по логам 2026-11-27 (сборочные правки, идемпотентность E1, Blocker 5/6, Phase 1.5, 8.3, 8.4, 7, 8.1).  
+**Последнее обновление:** 2026-11-28 — шаг 7: Phase 1.5 «защита в глубину» закрыта в коде (fail-safe evidence, один terminal close на lifecycle, баланс-контроль принудительного MARKET, external-identity, алерт oversell). Сборка/тесты/runtime в этом проходе не выполнялись.  
 **Область:** все планы/трекеры/журналы из `docs/history/`, плюс связанные операционные документы `docs/SETUP-WINDOWS.md`, `docs/LOGGING.md`, `docs/E1-LEDGER.md`.  
 **Статус документа:** это единый читаемый план и сводка состояния. Сам факт консолидации не является сборкой, тестом, runtime-приёмкой или доказательством торговой готовности.
 
@@ -277,7 +277,7 @@ ENJ/DASH recovery вызывает repeated resubscribe/reconnect и затра�
 
 **Требование:** закрытие lifecycle идемпотентно и не зависит от успеха записи evidence; принудительный MARKET сверяется с фактическим балансом актива; повторный reconcile не создаёт новый sell-order по уже закрытой позиции.
 
-**Статус:** `[code]` первопричина (идемпотентность fills) устранена; `[todo]` защита в глубину и баланс-контроль — Phase 1.5; `[accept]` Demo-регрессия повторного закрытия.
+**Статус:** `[code]` первопричина (идемпотентность fills) устранена; `[code]` 2026-11-28 защита в глубину и баланс-контроль внесены (Phase 1.5, шаг 7); `[accept]` Demo-регрессия повторного закрытия остаётся открытой.
 
 ### Blocker 6: конфликт идентичности E1 глушил reconcile и защиту
 
@@ -342,11 +342,11 @@ ENJ/DASH recovery вызывает repeated resubscribe/reconnect и затра�
 
 - `[code]` `E1Runtime.RecordOrderAsync`: дедуп биржевых трейдов по `FillId` (`exchange:{orderId}:{tradeId}`) — переменная `existing` была загружена и не использовалась, повторный реплей писал тот же fill под другим payload.
 - `[code]` `E1Runtime.RecordReportAsync`: та же проверка перед записью fill из executionReport.
-- `[todo]` Пометка позиции закрытой/уменьшенной **не зависит** от успеха записи в E1: сбой evidence-журнала не откатывает применённый биржевой факт (сейчас исключение из ledger отменяет применение close-филла).
-- `[todo]` Один terminal close на lifecycle: `close_in_flight`/`closed` флаг + дедуп по `positionId` и `clientOrderId`, чтобы reconcile, monitor и manual close не создавали второй sell-order.
-- `[todo]` Перед принудительным MARKET (`NoExchangeProtection`, trailing-fail, kill-switch) сверять фактический свободный баланс базового актива; продавать не больше, чем есть; недостающий объём — в alert/dust-review, не в ордер.
-- `[todo]` `RECON-ADOPT-FAIL … E1 identity is required`: подхват сиротской позиции без E1-идентичности не должен бросать исключение — присваивать/восстанавливать identity либо явно помечать `external`, не ломая reconcile.
-- `[todo]` Алерт на аномалию «суммарный проданный объём > купленного по lifecycle» (в прогоне 20.522 против 1.267).
+- `[code]` 2026-11-28: пометка позиции закрытой/уменьшенной **не зависит** от успеха записи в E1. `E1Runtime` разделён на write-ahead entry path (fail-closed: `PrepareEntryAsync`/`RecordDecisionAsync`/`RecordEntryResultAsync`) и applied-fact path (fail-safe: `RecordOrderAsync`/`RecordReportAsync`/`RecordProtectionAsync`/`AttachPositionAsync`/`RefreshOutcomeAsync`). Сбой журнала → `E1-EVIDENCE-DEFERRED` + отложенная очередь (≤512) + replay в `ReconcileAsync` (`E1-EVIDENCE-REPLAYED`), идемпотентно по `FillId`/lifecycle. Пока evidence не догнала факты — `E1-EVIDENCE-PENDING` и freeze входов (`Trading:EvidenceFailureFreezesEntries`), защита и закрытие продолжают работать.
+- `[code]` 2026-11-28: один terminal close на lifecycle. `Position.CloseInFlight` (in-memory, `[JsonIgnore]`, stale-сброс по `Trading:CloseInFlightStaleSeconds`) + реестр терминальных lifecycle в `TradingEngine` (`MarkLifecycleClosed`/`IsLifecycleClosed`) + `CloseClientOrderId`; `ClosePositionAsync` работает с живой записью менеджера, а не с устаревшей копией. Reconcile, monitor, manual и kill-switch проходят один шлюз; повторный sell-order по закрытому lifecycle не отправляется (`CLOSE-SKIPPED`). Бюджет принудительных закрытий: `Trading:ForcedCloseMaxAttempts=3`, `ForcedCloseCooldownSeconds=60` → `CLOSE-DEFERRED`, затем `CLOSE-FORCED-EXHAUSTED` + freeze входов вместо цикла MARKET каждые 20 с; счётчик обнуляется при восстановлении биржевой защиты.
+- `[code]` 2026-11-28: перед принудительным MARKET сверяется фактический free-баланс базового актива (`GetLiveSellableQuantityAsync`): продаётся не больше, чем есть; недостача → `CLOSE-BALANCE-SHORTFALL` + dust-review, нулевой баланс → `CLOSE-NO-BALANCE` и разбор по биржевой истории. Если защита ещё висит на бирже (объём, вероятно, заблокирован ногами), dust-объём не списывается — только флаг ручного разбора, чтобы E1 не закрыл lifecycle фиктивной пылью.
+- `[code]` 2026-11-28: `RECON-ADOPT-FAIL … E1 identity is required` устранён: `E1Runtime.RestoreIdentityAsync` восстанавливает identity из журнала намерений, иначе помечает `external:` (`E1-EXTERNAL-IDENTITY`); outcome без идентичности пропускается (`E1-OUTCOME-SKIPPED`), а не бросает исключение в reconcile. Подхват из журнала переносит `DecisionId`/`EntryIntentId`/`PositionId` в позицию.
+- `[code]` 2026-11-28: lifetime-учёт `Position.LifetimeBoughtQuantity`/`LifetimeSoldQuantity` (персистится, ленивая база для старых `positions.json`) ограничивает суммарные продажи одного lifecycle; превышение → `CLOSE-OVERSELL-ANOMALY` + freeze входов, лишний объём не отправляется (`CLOSE-NO-ALLOWANCE`/`EXCHANGE-FILL-NO-ALLOWANCE`). Юнит-проверки: `AITradingSystem.Tests/CloseIdempotencyTests.cs` (не запускались в этом проходе).
 - `[accept]` Demo-регрессия: SL → close-филл → повторный polling/restart/manual close даёт **один** sell-order; сбой записи в ledger не приводит к повторной продаже.
 - `[accept]` Ledger недоступен/конфликтует → позиция закрыта локально, entries frozen, alert; после восстановления evidence дописывается без дублей.
 
@@ -805,8 +805,8 @@ LLM вне критического пути; её польза измерена
 
 ## Ближайший исполнимый порядок
 
-1. **Phase 1.5 / Blocker 5:** идемпотентность закрытия в глубину — пометка close независимо от записи в E1, один terminal close на lifecycle, сверка баланса перед принудительным MARKET, `RECON-ADOPT-FAIL` без исключения.
-2. **Phase 1 / P0.9 runtime:** восстановить фактический DOGE exit через Demo order/trade history; не отправлять новые ордера в рамках аудита.
+1. ~~**Phase 1.5 / Blocker 5:** идемпотентность закрытия в глубину~~ — `[code]` внесено 2026-11-28 (шаг 7); осталась `[accept]` Demo-регрессия.
+2. **Phase 1 / P0.9 runtime:** восстановить фактический DOGE exit через Demo order/trade history; не отправлять новые ордера в рамках аудита. ← следующий шаг
 3. **Phase 8.3:** ширина SL/трейлинга от ATR, объём защиты после частичного входа, dust-процедура, атомарный cancel/replace OCO.
 4. **Phase 1 / P0.3a acceptance:** per-stream диагностика ENJ/DASH, isolation/backoff, `MONITOR-LAG` и `DATA-QUARANTINE` не оставляют позицию без сопровождения.
 5. **Phase 8.1:** post-only цена по стакану и штатная обработка `-2010`; коридор спреда.

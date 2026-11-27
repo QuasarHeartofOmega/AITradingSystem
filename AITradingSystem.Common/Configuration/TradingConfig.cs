@@ -364,6 +364,28 @@ public sealed class TradingConfig
     /// </summary>
     public bool DustMarketCloseEnabled { get; set; } = true;
 
+    /// <summary>
+    /// Phase 1.5 (Blocker 5): максимум принудительных закрытий одной позиции
+    /// (NoExchangeProtection / trailing-fail). Дальше — алерт оператору и freeze входов,
+    /// а не новый MARKET каждые 20 секунд по уже проданному объёму.
+    /// </summary>
+    public int ForcedCloseMaxAttempts { get; set; } = 3;
+
+    /// <summary>Phase 1.5: минимальная пауза между принудительными закрытиями одной позиции, секунды.</summary>
+    public int ForcedCloseCooldownSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Phase 1.5: через сколько секунд зависший close_in_flight считается протухшим
+    /// и снимается (ордер мог умереть вместе с сетевым вызовом).
+    /// </summary>
+    public int CloseInFlightStaleSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// Phase 1.5: отложенная/незаписанная evidence E1 блокирует новые входы до догона журнала.
+    /// Закрытие и защита при этом продолжают работать: биржевой факт важнее записи.
+    /// </summary>
+    public bool EvidenceFailureFreezesEntries { get; set; } = true;
+
     /// <summary>P1.2: перенос стопа в безубыток после достижения net прибыли, кратной начальному net риску.</summary>
     public bool BreakEvenEnabled { get; set; } = true;
 

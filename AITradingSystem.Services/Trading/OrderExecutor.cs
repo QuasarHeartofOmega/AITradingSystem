@@ -1136,8 +1136,33 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
         if (sellable < position.Quantity)
         {
+            var shortfall = position.Quantity - sellable;
             TradeLog.Decision(position.Symbol, "LIVE-BALANCE-CAP",
                 $"объём позиции {position.Quantity} ограничен free-балансом {baseAsset}: free={free}, sendable={sellable}");
+
+            // Phase 1.5 (Blocker 5): недостающий объём не отправляется ордером. Он уходит
+            // в алерт/dust-review, иначе принудительный MARKET продаёт то, чего нет на балансе
+            // (Demo принимал такие ордера; Live дал бы отказ или реальную короткую позицию).
+            TradeLog.Warn("CLOSE-BALANCE-SHORTFALL", position.Symbol,
+                $"lifecycle={position.Id} base={baseAsset} позиция={LogOptions.N(position.Quantity)} free={LogOptions.N(free)} " +
+                $"недостача={LogOptions.N(shortfall)} — недостающий объём в dust-review, не в ордер",
+                gateKey: "close-balance-shortfall:" + position.Symbol);
+
+            // Защита ещё висит на бирже => объём, скорее всего, заблокирован ногами OCO,
+            // а не утрачен: помечаем ручной разбор без списания в dust (иначе E1 закроет
+            // lifecycle фиктивной пылью). Защиты нет => недостача реальная, это dust-review.
+            var possiblyLocked = position.Protection != null;
+            var reviewQuantity = possiblyLocked ? 0m : shortfall;
+            position.MarkDustForManualReview(reviewQuantity,
+                $"{(possiblyLocked ? "balance-locked-or-short" : "balance-shortfall")}:{baseAsset} " +
+                $"local_qty={position.Quantity} exchange_free={free} shortfall={shortfall}");
+
+            if (sellable <= 0m)
+            {
+                TradeLog.Error("CLOSE-NO-BALANCE", position.Symbol,
+                    $"свободного {baseAsset} на бирже нет (защита висит={possiblyLocked}): локальная позиция не подтверждена балансом — " +
+                    "требуется разбор по биржевой истории, повторные MARKET запрещены");
+            }
         }
 
         return sellable;

@@ -30,6 +30,138 @@ public sealed class E1Runtime
     private readonly SemaphoreSlim _gate = new(1, 1);
     private string _configHash = "unknown";
 
+    /// <summary>
+    /// Phase 1.5: evidence-запись, которая не смогла лечь в ledger. Биржевой факт уже применён
+    /// к позиции, поэтому сбой журнала не откатывает закрытие, а откладывается на replay.
+    /// Дедуп по FillId/lifecycle делает повтор идемпотентным.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentQueue<PendingEvidence> _pendingEvidence = new();
+    private const int MaxPendingEvidence = 512;
+    private int _evidenceFailures;
+
+    private sealed record PendingEvidence(string Stage, string? Symbol, Func<CancellationToken, Task> Write);
+
+    /// <summary>Phase 1.5: сколько evidence-записей ждут повторной записи (0 = журнал догнал факты).</summary>
+    public int EvidencePendingCount => _pendingEvidence.Count;
+
+    /// <summary>Phase 1.5: накопленное число сбоев evidence-журнала за прогон.</summary>
+    public int EvidenceFailureCount => Volatile.Read(ref _evidenceFailures);
+
+    /// <summary>
+    /// Phase 1.5: применить биржевой факт к lifecycle важнее, чем записать evidence.
+    /// Любой сбой журнала (конфликт идентичности, недоступный файл, torn payload) фиксируется
+    /// как отложенная запись и НЕ выбрасывается в торговый контур: иначе закрытие отменялось
+    /// и reconcile продавал уже проданный объём снова (Blocker 5, 17 продаж одной позиции).
+    /// </summary>
+    private async Task TryEvidenceAsync(string stage, string? symbol, Func<CancellationToken, Task> write, CancellationToken ct)
+    {
+        try
+        {
+            await write(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _evidenceFailures);
+            EnqueuePending(new PendingEvidence(stage, symbol, write));
+            TradeLog.Error("E1-EVIDENCE-DEFERRED", symbol,
+                $"stage={stage} pending={_pendingEvidence.Count} — биржевой факт применён, запись в ledger отложена; входы блокируются до догона evidence", ex);
+            _logger.LogError(ex, "E1 evidence {Stage} deferred for {Symbol}", stage, symbol);
+        }
+    }
+
+    private void EnqueuePending(PendingEvidence item)
+    {
+        while (_pendingEvidence.Count >= MaxPendingEvidence && _pendingEvidence.TryDequeue(out var dropped))
+        {
+            TradeLog.Error("E1-EVIDENCE-DROPPED", dropped.Symbol,
+                $"stage={dropped.Stage} — очередь отложенной evidence переполнена ({MaxPendingEvidence}); требуется разбор оператором");
+        }
+        _pendingEvidence.Enqueue(item);
+    }
+
+    /// <summary>Phase 1.5: догон отложенной evidence. Повтор безопасен: fill дедупится по FillId, outcome — по lifecycle.</summary>
+    private async Task ReplayPendingEvidenceAsync(CancellationToken ct)
+    {
+        var batch = Math.Min(_pendingEvidence.Count, 64);
+        for (var i = 0; i < batch; i++)
+        {
+            if (ct.IsCancellationRequested) break;
+            if (!_pendingEvidence.TryDequeue(out var item)) break;
+            try
+            {
+                await item.Write(ct);
+                TradeLog.Info("E1-EVIDENCE-REPLAYED", item.Symbol,
+                    $"stage={item.Stage} pending={_pendingEvidence.Count}");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                EnqueuePending(item);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                EnqueuePending(item);
+                _logger.LogWarning(ex, "E1 evidence {Stage} still unresolved for {Symbol}", item.Stage, item.Symbol);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Phase 1.5: сиротская/внешняя позиция без E1-идентичности не должна ломать reconcile
+    /// исключением «E1 identity is required». Восстанавливаем identity из opening order либо
+    /// явно помечаем запись как external — lifecycle остаётся наблюдаемым.
+    /// </summary>
+    private void EnsureLifecycleIdentity(Position p)
+    {
+        var wasMissing = string.IsNullOrWhiteSpace(p.E1EntryIntentId);
+        if (wasMissing)
+            p.E1EntryIntentId = !string.IsNullOrWhiteSpace(p.OpeningOrderId)
+                ? p.OpeningOrderId
+                : "external:" + p.Id;
+        if (string.IsNullOrWhiteSpace(p.E1DecisionId))
+            p.E1DecisionId = "external:" + p.E1EntryIntentId;
+        if (wasMissing)
+            TradeLog.Warn("E1-EXTERNAL-IDENTITY", p.Symbol,
+                $"lifecycle={p.Id} entry_intent={p.E1EntryIntentId} decision={p.E1DecisionId} — позиция без E1-идентичности помечена external, reconcile продолжается");
+    }
+
+    /// <summary>
+    /// Phase 1.5: восстановить E1-идентичность подхваченной позиции из журнала намерений.
+    /// Не найден источник — помечаем external вместо исключения, которое раньше роняло
+    /// RECON-ADOPT и оставляло позицию без защиты.
+    /// </summary>
+    public async Task RestoreIdentityAsync(Position position, CancellationToken ct = default)
+    {
+        if (!string.IsNullOrWhiteSpace(position.E1EntryIntentId)
+            && !string.IsNullOrWhiteSpace(position.E1DecisionId)) return;
+        try
+        {
+            var intents = await _journal.LoadAsync(ct);
+            var intent = intents.FirstOrDefault(i =>
+                (!string.IsNullOrWhiteSpace(position.OpeningOrderId)
+                 && string.Equals(i.ClientOrderId, position.OpeningOrderId, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrWhiteSpace(i.PositionId) && i.PositionId == position.Id));
+            if (intent != null)
+            {
+                if (string.IsNullOrWhiteSpace(position.E1DecisionId) && !string.IsNullOrWhiteSpace(intent.DecisionId))
+                    position.E1DecisionId = intent.DecisionId!;
+                if (string.IsNullOrWhiteSpace(position.E1EntryIntentId))
+                    position.E1EntryIntentId = !string.IsNullOrWhiteSpace(intent.EntryIntentId)
+                        ? intent.EntryIntentId! : intent.ClientOrderId;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "E1 identity lookup failed for {Symbol}", position.Symbol);
+        }
+        EnsureLifecycleIdentity(position);
+    }
+
     public string RunId { get; } = Guid.NewGuid().ToString("N");
     public LedgerSource Source { get; }
     public string Environment { get; }
@@ -152,9 +284,14 @@ public sealed class E1Runtime
         }
     }
 
-    public async Task AttachPositionAsync(Position position, CancellationToken ct = default)
+    public Task AttachPositionAsync(Position position, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(position.E1EntryIntentId)) return;
+        EnsureLifecycleIdentity(position);
+        return TryEvidenceAsync("attach-position", position.Symbol, token => AttachPositionCoreAsync(position, token), ct);
+    }
+
+    private async Task AttachPositionCoreAsync(Position position, CancellationToken ct)
+    {
         var risk = position.InitialStopLoss > 0 && position.EntryPrice > 0
             ? Math.Abs(position.EntryPrice - position.InitialStopLoss) * position.Quantity
             : 0m;
@@ -162,18 +299,27 @@ public sealed class E1Runtime
         await UpsertPositionOutcomeAsync(position, "position-open", ct);
     }
 
-    public async Task RecordProtectionAsync(Position position, string resolution, bool confirmed, CancellationToken ct = default)
+    public Task RecordProtectionAsync(Position position, string resolution, bool confirmed, CancellationToken ct = default)
     {
         position.E1ProtectionConfirmed |= confirmed;
         position.E1ProtectionResolution = resolution;
-        if (string.IsNullOrWhiteSpace(position.E1EntryIntentId)) return;
-        await UpsertPositionOutcomeAsync(position, resolution, ct);
+        EnsureLifecycleIdentity(position);
+        return TryEvidenceAsync("protection:" + resolution, position.Symbol,
+            token => UpsertPositionOutcomeAsync(position, resolution, token), ct);
     }
 
-    public async Task RecordOrderAsync(
+    public Task RecordOrderAsync(
         Order order, FillRole role, string? decisionId, string? entryIntentId, string? positionId,
         string? protectionIdentity, OrderBook? arrivalBook, CancellationToken ct = default,
         bool cumulativeFee = true)
+        => TryEvidenceAsync("order:" + role, order.Symbol,
+            token => RecordOrderCoreAsync(order, role, decisionId, entryIntentId, positionId,
+                protectionIdentity, arrivalBook, token, cumulativeFee), ct);
+
+    private async Task RecordOrderCoreAsync(
+        Order order, FillRole role, string? decisionId, string? entryIntentId, string? positionId,
+        string? protectionIdentity, OrderBook? arrivalBook, CancellationToken ct,
+        bool cumulativeFee)
     {
         if (order.ExecutedQuantity <= 0) return;
         await _gate.WaitAsync(ct);
@@ -273,8 +419,13 @@ public sealed class E1Runtime
         finally { _gate.Release(); }
     }
 
-    public async Task RecordReportAsync(Position? position, ExecutionReport report, FillRole role,
+    public Task RecordReportAsync(Position? position, ExecutionReport report, FillRole role,
         string? protectionIdentity, CancellationToken ct = default)
+        => TryEvidenceAsync("report:" + role, report.Symbol,
+            token => RecordReportCoreAsync(position, report, role, protectionIdentity, token), ct);
+
+    private async Task RecordReportCoreAsync(Position? position, ExecutionReport report, FillRole role,
+        string? protectionIdentity, CancellationToken ct)
     {
         if (!report.IsFill) return;
         var decisionId = position?.E1DecisionId;
@@ -354,9 +505,14 @@ public sealed class E1Runtime
         await RecordOrderAsync(order, role, decisionId, entryIntentId, positionId, protectionIdentity, null, ct, cumulativeFee: false);
     }
 
-    public async Task RefreshOutcomeAsync(string positionId, string exitReason, decimal dustQuantity = 0m, CancellationToken ct = default)
+    public Task RefreshOutcomeAsync(string positionId, string exitReason, decimal dustQuantity = 0m, CancellationToken ct = default)
+        => TryEvidenceAsync("outcome:" + exitReason, _positions.GetPositionById(positionId)?.Symbol,
+            token => RefreshOutcomeCoreAsync(positionId, exitReason, dustQuantity, token), ct);
+
+    private async Task RefreshOutcomeCoreAsync(string positionId, string exitReason, decimal dustQuantity, CancellationToken ct)
     {
         var position = _positions.GetPositionById(positionId);
+        if (position != null) EnsureLifecycleIdentity(position);
         if (position != null)
         {
             await UpsertPositionOutcomeAsync(position, exitReason, ct);
@@ -368,6 +524,8 @@ public sealed class E1Runtime
     /// <summary>Restart/polling recovery: replay exchange trades for known intents/positions; never invent fills.</summary>
     public async Task ReconcileAsync(CancellationToken ct = default)
     {
+        // Phase 1.5: сначала догоняем отложенную evidence, чтобы не копить расхождение журнала и фактов.
+        await ReplayPendingEvidenceAsync(ct);
         var intents = await _journal.LoadAsync(ct);
         var positions = _positions.GetOpenPositions();
         var outcomes = await _ledger.LoadOutcomesAsync(ct);
@@ -586,6 +744,14 @@ public sealed class E1Runtime
 
     private async Task RecordOutcomeAsync(OutcomeLedgerRecord record, CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(record.LifecycleId) || string.IsNullOrWhiteSpace(record.EntryIntentId))
+        {
+            // Phase 1.5: запись без идентичности — дефект продюсера, а не причина останавливать
+            // reconcile/защиту исключением. Пропускаем и оставляем след для разбора.
+            TradeLog.Warn("E1-OUTCOME-SKIPPED", record.Symbol,
+                $"lifecycle='{record.LifecycleId}' entry_intent='{record.EntryIntentId}' — outcome без идентичности не записан");
+            return;
+        }
         await _gate.WaitAsync(ct);
         try
         {

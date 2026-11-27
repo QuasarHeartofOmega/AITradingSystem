@@ -35,3 +35,15 @@ This is a **single-writer** store (the application process). The async gate seri
 For `Closed`, gross is calculated from actual average entry/exit prices and **exit quantity**; net is gross minus valued round-trip fees; net R is net divided by the original quote risk. Slippage is diagnostic against an arrival benchmark and is not deducted again from actual-fill gross. Dust is not counted as realized exit quantity. Missing fees, risk, fills, protection resolution or an unresolved reason excludes the outcome from `IsStatisticallyUsable`.
 
 The storage layer checks linked fill ids, roles, evidence, fee totals and arithmetic. `E1Runtime` obtains exchange trades/fees from `myTrades` or executionReport trade ids, persists entry identity before submission, records protection identity/resolution, and reconciles restart/polling without creating a second lifecycle outcome. Base-asset fees are valued at the same fill price with conversion evidence; BNB/other non-quote fees remain `Unvalued` until separate conversion evidence exists. Demo acceptance remains open.
+
+## Applied exchange facts vs. deferred evidence (Phase 1.5)
+
+An exchange fill is a fact; the ledger is evidence about that fact. `E1Runtime` therefore separates the two:
+
+- **Write-ahead entry path stays fail-closed.** `PrepareEntryAsync`, `RecordDecisionAsync` and `RecordEntryResultAsync` still throw on ledger failure, so an entry cannot be submitted without durable identity.
+- **Applied-fact path is fail-safe.** `RecordOrderAsync`, `RecordReportAsync`, `RecordProtectionAsync`, `AttachPositionAsync` and `RefreshOutcomeAsync` never propagate a ledger exception into the trading loop. A failure is logged as `E1-EVIDENCE-DEFERRED`, queued (bounded, 512 items) and replayed by `ReconcileAsync` (`E1-EVIDENCE-REPLAYED`). Replay is idempotent: fills dedup by `FillId`, outcomes by lifecycle.
+- **Deferred evidence freezes entries, not exits.** While `EvidencePendingCount > 0` and `Trading:EvidenceFailureFreezesEntries=true`, reconciliation reports `E1-EVIDENCE-PENDING` and marks execution state untrusted. Position protection and closing continue: a journal outage must not leave a position open or trigger a second sell (Blocker 5, 2026-11-27: 17 sells of one DASH lifecycle).
+- **Identity is repaired, not fatal.** An adopted orphan without E1 identity gets it from the execution journal (`RestoreIdentityAsync`) or is explicitly marked `external:` (`E1-EXTERNAL-IDENTITY`). An outcome record without identity is skipped with `E1-OUTCOME-SKIPPED` instead of throwing `E1 identity is required` into reconcile.
+- **Lifetime quantity accounting.** `Position.LifetimeBoughtQuantity` / `LifetimeSoldQuantity` cap the total sellable volume of one lifecycle across SL, reconcile, manual and kill-switch contours. A request above the remaining allowance raises `CLOSE-OVERSELL-ANOMALY` and is clamped, never sent.
+
+Demo regression acceptance for these paths is still open (`[accept]` in `docs/history/MASTER-PLAN.md`, Phase 1.5).

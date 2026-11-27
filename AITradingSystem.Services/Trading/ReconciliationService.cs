@@ -48,6 +48,17 @@ public sealed class ReconciliationService : IAsyncDisposable
     /// <summary>P0.4: момент последней успешной реконсиляции — основа доверия к состоянию исполнения.</summary>
     public DateTime LastSuccessfulReconcileUtc { get; private set; }
 
+    /// <summary>
+    /// Phase 1.5: торговый контур сообщает о недостоверном состоянии lifecycle (исчерпаны
+    /// принудительные закрытия, аномалия «продано больше купленного», отложенная evidence).
+    /// Это freeze входов и алерт, а не исключение, останавливающее сопровождение позиций.
+    /// </summary>
+    public void FlagUnresolvedState(string reason)
+    {
+        Interlocked.Increment(ref _unresolvedStateIssues);
+        TradeLog.ExecutionStateBlocked(reason);
+    }
+
     /// <summary>P0.4: STREAM | POLLING-FALLBACK | UNAVAILABLE | PAPER | DISABLED.</summary>
     public string ExecutionMode => _executionMode;
 
@@ -348,7 +359,17 @@ public sealed class ReconciliationService : IAsyncDisposable
                 TradeLog.ReconFinding(finding);
 
             await RemediateAsync(positionsSnapshot, openOrders, openLists, ct, activeEntries);
-            if (_e1 != null) await _e1.ReconcileAsync(ct);
+            if (_e1 != null)
+            {
+                await _e1.ReconcileAsync(ct);
+                // Phase 1.5: журнал не догнал биржевые факты — входы запрещены, но закрытие/защита работают.
+                if (_e1.EvidencePendingCount > 0 && _config.EvidenceFailureFreezesEntries)
+                {
+                    Interlocked.Increment(ref _unresolvedStateIssues);
+                    TradeLog.Warn("E1-EVIDENCE-PENDING", null,
+                        $"pending={_e1.EvidencePendingCount} failures={_e1.EvidenceFailureCount} — входы заблокированы до догона evidence");
+                }
+            }
 
             // P0.4: успех фиксируется только если не осталось неразрешённых состояний.
             var unresolved = Volatile.Read(ref _unresolvedStateIssues);
@@ -555,11 +576,20 @@ public sealed class ReconciliationService : IAsyncDisposable
                         Symbol = order.Symbol,
                         Side = order.Side,
                         Quantity = order.ExecutedQuantity,
+                        LifetimeBoughtQuantity = order.ExecutedQuantity,
                         EntryPrice = order.AverageFillPrice ?? order.Price,
                         CurrentPrice = order.AverageFillPrice ?? order.Price,
                         OpenedAt = order.CreatedAt,
                         OpeningOrderId = order.ClientOrderId,
-                        EntryCommission = order.Commission
+                        EntryCommission = order.Commission,
+                        // Phase 1.5: идентичность lifecycle берём из намерения, а не теряем при подхвате.
+                        E1DecisionId = intent.DecisionId ?? string.Empty,
+                        E1EntryIntentId = intent.EntryIntentId ?? string.Empty,
+                        Id = !string.IsNullOrWhiteSpace(intent.PositionId)
+                            ? intent.PositionId!
+                            : !string.IsNullOrWhiteSpace(intent.EntryIntentId)
+                                ? intent.EntryIntentId!
+                                : Guid.NewGuid().ToString("N")
                     };
                     await _adoptOrphanPosition(orphan, ct);
                     _metrics.RecordOrphanPositionAdopted();
@@ -644,6 +674,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                         Symbol = order.Symbol,
                         Side = order.Side,
                         Quantity = order.ExecutedQuantity,
+                        LifetimeBoughtQuantity = order.ExecutedQuantity,
                         EntryPrice = order.AverageFillPrice ?? order.Price,
                         CurrentPrice = order.AverageFillPrice ?? order.Price,
                         OpenedAt = order.CreatedAt,

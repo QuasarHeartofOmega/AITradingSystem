@@ -1,5 +1,6 @@
 ﻿using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
 using AITradingSystem.Core.Models.Enums;
 
 namespace AITradingSystem.Core.Models.Trading;
@@ -101,6 +102,93 @@ public sealed class Position : INotifyPropertyChanged
     }
 
     /// <summary>
+    /// Phase 1.5 (Blocker 5): сколько базового актива куплено за весь lifecycle позиции.
+    /// Персистится: суммарный проданный объём не может превышать купленный, даже если
+    /// close-филл пришёл из нескольких контуров (SL, reconcile, manual, kill-switch).
+    /// 0 = запись из старого positions.json; база восстанавливается лениво из Quantity.
+    /// </summary>
+    public decimal LifetimeBoughtQuantity { get; set; }
+
+    /// <summary>Phase 1.5: сколько объёма уже реально закрыто/продано за lifecycle (все контуры).</summary>
+    public decimal LifetimeSoldQuantity { get; set; }
+
+    /// <summary>Phase 1.5: clientOrderId последнего отправленного close-ордера (аудит повторных продаж).</summary>
+    public string CloseClientOrderId { get; set; } = string.Empty;
+
+    /// <summary>Phase 1.5: сколько принудительных закрытий (NoExchangeProtection и т.п.) уже отправлено.</summary>
+    public int ForcedCloseAttempts { get; set; }
+
+    /// <summary>Phase 1.5: момент последней попытки принудительного закрытия (cooldown между циклами).</summary>
+    public DateTime? LastForcedCloseAttemptUtc { get; set; }
+
+    /// <summary>Phase 1.5: аномалия «продано больше, чем куплено» уже поднята оператору один раз.</summary>
+    public bool CloseOversellAlerted { get; set; }
+
+    /// <summary>
+    /// Phase 1.5: close-ордер отправлен и ещё не разрешён. Только in-memory: после рестарта
+    /// решение принимает реконсиляция по биржевой истории, а не протухший флаг.
+    /// </summary>
+    [JsonIgnore]
+    public bool CloseInFlight { get; set; }
+
+    /// <summary>Phase 1.5: когда взведён CloseInFlight (для снятия зависшего флага).</summary>
+    [JsonIgnore]
+    public DateTime CloseInFlightSinceUtc { get; set; }
+
+    /// <summary>Phase 1.5: остаток купленного объёма, который ещё разрешено продать за lifecycle.</summary>
+    public decimal RemainingSellableLifetimeQuantity
+    {
+        get
+        {
+            EnsureLifetimeBaseline();
+            return Math.Max(0m, LifetimeBoughtQuantity - LifetimeSoldQuantity);
+        }
+    }
+
+    /// <summary>
+    /// Phase 1.5: зарегистрировать вход (в т.ч. долив частичного входа) в lifetime-базе.
+    /// </summary>
+    public void RegisterEntryQuantity(decimal quantity)
+    {
+        if (quantity <= 0m) return;
+        EnsureLifetimeBaseline();
+        LifetimeBoughtQuantity += quantity;
+        UpdatedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Phase 1.5: атомарно (под посимвольным шлюзом) зарезервировать объём к продаже.
+    /// Возвращает разрешённый объём — не больше купленного за lifecycle; oversell=true,
+    /// если запрошено больше, чем есть по lifetime-учёту. Ничего не продаёт «в долг».
+    /// </summary>
+    public bool TryReserveExitQuantity(decimal requested, out decimal allowed, out bool oversell)
+    {
+        EnsureLifetimeBaseline();
+        var remaining = Math.Max(0m, LifetimeBoughtQuantity - LifetimeSoldQuantity);
+        allowed = Math.Max(0m, Math.Min(requested, remaining));
+        oversell = requested - allowed > QuantityEpsilon;
+        if (allowed > 0m)
+        {
+            LifetimeSoldQuantity += allowed;
+            UpdatedAt = DateTime.UtcNow;
+        }
+        return allowed > 0m;
+    }
+
+    /// <summary>Phase 1.5: суммарный проданный объём превысил купленный (аномалия учёта).</summary>
+    public bool IsLifetimeOversold => LifetimeBoughtQuantity > 0m
+        && LifetimeSoldQuantity - LifetimeBoughtQuantity > QuantityEpsilon;
+
+    private const decimal QuantityEpsilon = 0.00000001m;
+
+    private void EnsureLifetimeBaseline()
+    {
+        // Запись из старого positions.json без lifetime-учёта: текущий остаток + уже закрытое.
+        if (LifetimeBoughtQuantity <= 0m)
+            LifetimeBoughtQuantity = Math.Max(0m, Quantity + LifetimeSoldQuantity);
+    }
+
+    /// <summary>
     /// Биржевая защита позиции — OCO (STOP_LOSS_LIMIT + TAKE_PROFIT_LIMIT), P0.1.
     /// null = на бирже защиты нет (paper-режим, отказ постановки или защита выключена).
     /// Персистится вместе с позицией, чтобы после рестарта знать id ног.
@@ -118,6 +206,13 @@ public sealed class Position : INotifyPropertyChanged
                 && x.OrderListId == Protection.OrderListId))
             E1ProtectionHistory.Add(Protection);
         Protection = protection;
+        // Phase 1.5: бюджет принудительных закрытий относится к одному «эпизоду без защиты».
+        // Защита восстановлена — счётчик попыток и cooldown обнуляются.
+        if (protection is { IsLive: true })
+        {
+            ForcedCloseAttempts = 0;
+            LastForcedCloseAttemptUtc = null;
+        }
         UpdatedAt = DateTime.UtcNow;
         OnPropertyChanged(nameof(Protection));
         OnPropertyChanged(nameof(HasExchangeProtection));

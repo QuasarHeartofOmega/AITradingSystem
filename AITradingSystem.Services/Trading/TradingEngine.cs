@@ -80,6 +80,80 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly Dictionary<string, DateTime> _lastPositionReview = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _reviewLock = new();
 
+    /// <summary>
+    /// Phase 1.5 (Blocker 5): lifecycle, по которым терминальное закрытие уже применено.
+    /// Второй sell-order по тому же positionId не отправляется ни reconcile, ни монитором,
+    /// ни ручным закрытием — даже если positions.json/очередь ещё не отражают факт.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, DateTime> _terminalCloseLifecycles =
+        new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxTerminalCloseLifecycles = 4096;
+
+    private void MarkLifecycleClosed(string positionId)
+    {
+        if (string.IsNullOrWhiteSpace(positionId)) return;
+        _terminalCloseLifecycles[positionId] = DateTime.UtcNow;
+        if (_terminalCloseLifecycles.Count <= MaxTerminalCloseLifecycles) return;
+        foreach (var old in _terminalCloseLifecycles.OrderBy(x => x.Value).Take(512).ToList())
+            _terminalCloseLifecycles.TryRemove(old.Key, out _);
+    }
+
+    private bool IsLifecycleClosed(string positionId) =>
+        !string.IsNullOrWhiteSpace(positionId) && _terminalCloseLifecycles.ContainsKey(positionId);
+
+    /// <summary>
+    /// Phase 1.5: принудительное закрытие (нет биржевой защиты / trailing-fail) не должно
+    /// повторяться бесконечным циклом по уже проданному объёму. Ограничиваем частоту и число
+    /// попыток; после исчерпания — алерт оператору и freeze входов, позиция остаётся под наблюдением.
+    /// </summary>
+    private bool ForcedCloseAllowed(Position position, string reason)
+    {
+        var forced = reason is "NoExchangeProtection" or "TrailingProtectionFailed" or "ProtectionLost";
+        if (!forced) return true;
+
+        var now = DateTime.UtcNow;
+        var cooldown = TimeSpan.FromSeconds(Math.Max(1, _config.Trading.ForcedCloseCooldownSeconds));
+        if (position.LastForcedCloseAttemptUtc is { } last && now - last < cooldown)
+        {
+            TradeLog.Info("CLOSE-DEFERRED", position.Symbol,
+                $"принудительное закрытие ({reason}) отложено: cooldown {(cooldown - (now - last)).TotalSeconds:F0} c, попыток {position.ForcedCloseAttempts}");
+            return false;
+        }
+
+        var max = Math.Max(1, _config.Trading.ForcedCloseMaxAttempts);
+        if (position.ForcedCloseAttempts >= max)
+        {
+            TradeLog.Error("CLOSE-FORCED-EXHAUSTED", position.Symbol,
+                $"lifecycle={position.Id} reason={reason} attempts={position.ForcedCloseAttempts}/{max} — повторные MARKET запрещены; " +
+                "требуется разбор оператора (биржевая история/баланс), входы заблокированы");
+            _reconciliation.FlagUnresolvedState($"forced-close-exhausted:{position.Symbol}");
+            return false;
+        }
+
+        position.ForcedCloseAttempts++;
+        position.LastForcedCloseAttemptUtc = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Phase 1.5: зарезервировать объём к закрытию по lifetime-учёту и поднять аномалию
+    /// «продано больше, чем куплено» (в прогоне 2026-11-27: 20.522 против 1.267 DASH).
+    /// </summary>
+    private decimal ReserveExitQuantity(Position position, decimal requested, string reason)
+    {
+        position.TryReserveExitQuantity(requested, out var allowed, out var oversell);
+        if (oversell && !position.CloseOversellAlerted)
+        {
+            position.CloseOversellAlerted = true;
+            TradeLog.Error("CLOSE-OVERSELL-ANOMALY", position.Symbol,
+                $"lifecycle={position.Id} reason={reason} запрошено={LogOptions.N(requested)} разрешено={LogOptions.N(allowed)} " +
+                $"куплено={LogOptions.N(position.LifetimeBoughtQuantity)} продано={LogOptions.N(position.LifetimeSoldQuantity)} — " +
+                "лишний объём НЕ отправляется на биржу");
+            _reconciliation.FlagUnresolvedState($"close-oversell:{position.Symbol}");
+        }
+        return allowed;
+    }
+
     /// <summary>Cooldown анализа символа (B11): последний запрос к ИИ на вход.</summary>
     private readonly Dictionary<string, DateTime> _lastSymbolAnalysis = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1157,6 +1231,8 @@ public sealed class TradingEngine : IAsyncDisposable
             Symbol = symbol,
             Side = side,
             Quantity = sellableQuantity,
+            // Phase 1.5: lifetime-база «куплено» — потолок суммарных продаж по этой позиции.
+            LifetimeBoughtQuantity = sellableQuantity,
             EntryPrice = actualEntry,
             CurrentPrice = referencePrice,
             StopLoss = stopLoss,
@@ -1690,19 +1766,45 @@ public sealed class TradingEngine : IAsyncDisposable
         // Шлюз + повторная проверка «позиция ещё открыта» исключают двойной MARKET-выход.
         using (await _positionMonitor.LockSymbolAsync(position.Symbol, ct))
         {
-            if (_positionManager.GetPositionById(position.Id) is null)
+            // Phase 1.5: работаем с живой записью менеджера, а не с устаревшей копией из вызывающего контура.
+            var live = _positionManager.GetPositionById(position.Id);
+            if (live is null || IsLifecycleClosed(position.Id))
             {
                 TradeLog.Info("CLOSE-SKIPPED", position.Symbol,
                     $"позиция уже закрыта другим контуром — повторное закрытие ({reason}) пропущено");
                 return;
             }
 
-            await ClosePositionCoreAsync(position, reason, ct, exitPriceOverride);
+            if (live.CloseInFlight)
+            {
+                var stale = TimeSpan.FromSeconds(Math.Max(5, _config.Trading.CloseInFlightStaleSeconds));
+                if (DateTime.UtcNow - live.CloseInFlightSinceUtc < stale)
+                {
+                    TradeLog.Info("CLOSE-SKIPPED", live.Symbol,
+                        $"close_in_flight client_order_id={live.CloseClientOrderId} — второй sell-order ({reason}) не отправляется");
+                    return;
+                }
+                TradeLog.Warn("CLOSE-INFLIGHT-STALE", live.Symbol,
+                    $"close_in_flight висит {(DateTime.UtcNow - live.CloseInFlightSinceUtc).TotalSeconds:F0} c — флаг снят, решение по биржевой истории");
+                live.CloseInFlight = false;
+            }
+
+            await ClosePositionCoreAsync(live, reason, ct, exitPriceOverride);
         }
     }
 
     private async Task ClosePositionCoreAsync(Position position, string reason, CancellationToken ct, decimal? exitPriceOverride)
     {
+        // Phase 1.5: терминальное закрытие уже применено — новый sell-order запрещён.
+        if (IsLifecycleClosed(position.Id))
+        {
+            TradeLog.Info("CLOSE-SKIPPED", position.Symbol,
+                $"lifecycle={position.Id} уже терминально закрыт — повторный {reason} пропущен");
+            return;
+        }
+
+        if (!ForcedCloseAllowed(position, reason)) return;
+
         TradeLog.Info("CLOSE-TRIGGER", position.Symbol, reason);
 
         // Фиксируем цену выхода: для SL/TP — уровень срабатывания, для ручного — текущая
@@ -1713,14 +1815,31 @@ public sealed class TradingEngine : IAsyncDisposable
 
         var emergency = reason.StartsWith("KillSwitch", StringComparison.OrdinalIgnoreCase)
                         || reason is "NoExchangeProtection" or "Stop-Loss";
-        var order = await _orderExecutor.ClosePositionAsync(
-            position, ct, GetCurrentOrderBook(position.Symbol), emergency);
+
+        // Phase 1.5: один terminal close на lifecycle. Флаг взводится до отправки и переживает
+        // гонку с reconcile/монитором; снимается только если ордер не состоялся.
+        position.CloseInFlight = true;
+        position.CloseInFlightSinceUtc = DateTime.UtcNow;
+        Order? order;
+        try
+        {
+            order = await _orderExecutor.ClosePositionAsync(
+                position, ct, GetCurrentOrderBook(position.Symbol), emergency);
+        }
+        finally
+        {
+            position.CloseInFlight = false;
+        }
+
         if (order == null)
         {
             TradeLog.Rejected(position.Symbol, "close", "ордер на закрытие не исполнен — позиция остаётся открытой");
             await _positionManager.SavePositionsAsync(ct);
             return;
         }
+
+        if (!string.IsNullOrWhiteSpace(order.ClientOrderId))
+            position.CloseClientOrderId = order.ClientOrderId;
 
         // Для live используем фактическую цену исполнения, если она есть
         var fillPrice = order.AverageFillPrice;
@@ -1733,6 +1852,19 @@ public sealed class TradingEngine : IAsyncDisposable
         var closedQuantity = order.ExecutedQuantity > 0 ? order.ExecutedQuantity : position.Quantity;
         if (closedQuantity > position.Quantity)
             closedQuantity = position.Quantity;
+
+        // Phase 1.5: lifetime-учёт «куплено/продано» — суммарно нельзя продать больше купленного.
+        closedQuantity = ReserveExitQuantity(position, closedQuantity, reason);
+        if (closedQuantity <= 0m)
+        {
+            TradeLog.Error("CLOSE-NO-ALLOWANCE", position.Symbol,
+                $"lifecycle={position.Id} reason={reason} — lifetime-объём исчерпан, локальная позиция снимается без нового ордера");
+            MarkLifecycleClosed(position.Id);
+            await _positionManager.RemovePositionAsync(position.Id, ct);
+            await _e1.RefreshOutcomeAsync(position.Id, reason + "-oversell-guard", position.DustExchangeQuantity, ct);
+            _reconciliation.FlagUnresolvedState($"close-no-allowance:{position.Symbol}");
+            return;
+        }
 
         var remaining = position.Quantity - closedQuantity;
         var isPartial = remaining > 0m;
@@ -1795,6 +1927,9 @@ public sealed class TradingEngine : IAsyncDisposable
         }
         else
         {
+            // Phase 1.5: сначала фиксируем терминальный факт lifecycle, затем пишем evidence.
+            // Сбой E1 больше не откатывает закрытие и не порождает повторную продажу.
+            MarkLifecycleClosed(position.Id);
             await _positionManager.RemovePositionAsync(position.Id, ct);
             await _e1.RefreshOutcomeAsync(position.Id, reason, position.DustExchangeQuantity, ct);
 
@@ -1949,7 +2084,7 @@ public sealed class TradingEngine : IAsyncDisposable
         using (await _positionMonitor.LockSymbolAsync(position.Symbol, ct))
         {
             var live = _positionManager.GetPositionById(position.Id);
-            if (live is null) return false;
+            if (live is null || IsLifecycleClosed(position.Id)) return false;
 
             var unapplied = live.GetUnappliedExchangeFill(report.ClientOrderId, report.CumulativeQuantity);
             if (unapplied <= 0) return false;
@@ -1962,8 +2097,15 @@ public sealed class TradingEngine : IAsyncDisposable
             if (e1Role == FillRole.ProtectiveExit)
                 await _e1.RecordProtectionAsync(live, reason, true, ct);
 
-            closedQuantity = Math.Min(unapplied, live.Quantity);
-            if (closedQuantity <= 0) return false;
+            // Phase 1.5: биржевой филл применяется к позиции независимо от того, легла ли
+            // evidence в E1 (запись выше уже fail-safe). Lifetime-учёт не даёт продать дважды.
+            closedQuantity = ReserveExitQuantity(live, Math.Min(unapplied, live.Quantity), reason);
+            if (closedQuantity <= 0)
+            {
+                TradeLog.Warn("EXCHANGE-FILL-NO-ALLOWANCE", live.Symbol,
+                    $"lifecycle={live.Id} reason={reason} — lifetime-объём исчерпан, филл не уменьшает позицию повторно");
+                return false;
+            }
 
             var exitPrice = report.LastPrice > 0
                 ? report.LastPrice
@@ -2017,6 +2159,7 @@ public sealed class TradingEngine : IAsyncDisposable
             fullyClosed = remaining <= 0m;
             if (fullyClosed)
             {
+                MarkLifecycleClosed(live.Id);
                 await _positionManager.RemovePositionAsync(live.Id, ct);
                 await _e1.RefreshOutcomeAsync(live.Id, reason, live.DustExchangeQuantity, ct);
                 lock (_reviewLock) _lastPositionReview.Remove(live.Symbol);
@@ -2078,8 +2221,15 @@ public sealed class TradingEngine : IAsyncDisposable
             orphan.TakeProfit = _riskManager.CalculateTakeProfit(orphan.Side, orphan.EntryPrice, orphan.StopLoss);
             orphan.InitialStopLoss = orphan.StopLoss;
             orphan.SignalId = "reconciled";
+            if (orphan.LifetimeBoughtQuantity <= 0m)
+                orphan.LifetimeBoughtQuantity = orphan.Quantity;
+
+            // Phase 1.5: подхват без E1-идентичности не должен бросать «E1 identity is required»
+            // и ронять reconcile. Восстанавливаем identity из журнала намерений, иначе external.
+            await _e1.RestoreIdentityAsync(orphan, ct);
 
             await _positionManager.AddPositionAsync(orphan, ct);
+            await _e1.AttachPositionAsync(orphan, ct);
             var protectedOk = await _orderExecutor.EnsureProtectionAsync(orphan, ct);
             if (protectedOk && orphan.Protection != null)
                 await _positionManager.SavePositionsAsync(ct);
