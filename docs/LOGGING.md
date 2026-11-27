@@ -106,8 +106,9 @@ yyyy-MM-dd HH:mm:ss.fff zzz [LVL] [канал] Источник: EVENT-CODE key=
 | `SYMBOL-UNIVERSE` | Активные символы и причины исключений. |
 | `KILL-SWITCH-*` | Аварийная блокировка, закрытие, сброс/отказ сброса, восстановление. |
 | `LLM-ROLE`, `LLM-VETO-*` | Роль модели и результат veto-контура. |
-| `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE*`, `DATA-WS-*` | Здоровье рыночных данных. |
+| `DATA-STALE`, `DATA-REST-RELOAD`, `DATA-LIVE-CONFIRMED`, `DATA-QUARANTINE*`, `DATA-WS-*` | Здоровье рыночных данных. P0.3a шаг 2: `DATA-LIVE-CONFIRMED` и досрочное снятие карантина требуют kline И depth, наблюдаемые после начала ожидания/постановки карантина; причина `awaiting-live-tick:{kline\|book\|both}` указывает, какого типа сообщений не хватает. P0.3a шаг 4: в `DATA-LIVE-CONFIRMED` и `DATA-QUARANTINE-LIFTED` пишется итоговый `entries_allowed` (WS подключён + свежесть обоих стримов), а не промежуточный fresh-book флаг. |
 | `DATA-STREAM-DIAG` | P0.3a: per-stream факты молчащего символа — счётчики kline/depth, возраст последнего сообщения, пустые payload, состояние и ack подписки, прогрев свечей. Пишется перед каждой эскалацией recovery. |
+| `DATA-QUARANTINE-ESCALATED` | P0.3a шаг 3: операторский алерт — символ получил ≥3 карантинов подряд без live-подтверждения; длительность карантина растёт экспоненциально (`MarketDataQuarantineSeconds` × 2^streak до `MarketDataQuarantineMaxSeconds`). Серия сбрасывается только live-подтверждением обоих стримов. |
 | `RECON-START`, `RECON-SUMMARY`, `RECON-FAIL`, `RECON-FINDING`, `RECON-ADOPT`, `RECON-CANCEL` | Реконсиляция. |
 | `RECON-SKIP-ACTIVE-ENTRY`, `RECON-EXPIRE-ENTRY` | Защита активного входа от преждевременной отмены. |
 | `EXECUTION-MODE`, `EXECUTION-STATE-BLOCKED`, `USER-DATA-*` | Режим исполнения и user-data stream. |

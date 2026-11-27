@@ -301,6 +301,12 @@ public sealed class TradingConfig
     /// <summary>P0.3: длительность карантина символа, у которого WS так и не ожил, секунд.</summary>
     public int MarketDataQuarantineSeconds { get; set; } = 300;
 
+    /// <summary>
+    /// P0.3a шаг 3: потолок экспоненциального backoff карантина для persistently silent символа, секунд.
+    /// Каждый повторный карантин без live-подтверждения удваивает длительность до этого предела.
+    /// </summary>
+    public int MarketDataQuarantineMaxSeconds { get; set; } = 3600;
+
     /// <summary>P0.3: минимальная пауза между принудительными реконнектами рыночного WS, секунд.</summary>
     public int MarketDataReconnectCooldownSeconds { get; set; } = 60;
 
@@ -540,6 +546,14 @@ public sealed class TradingConfig
         if (MarketDataQuarantineSeconds < 30 || MarketDataQuarantineSeconds > 3600)
             throw new InvalidOperationException(
                 $"MarketDataQuarantineSeconds должен быть в диапазоне [30; 3600]. Текущее: {MarketDataQuarantineSeconds}");
+
+        if (MarketDataQuarantineMaxSeconds < 60 || MarketDataQuarantineMaxSeconds > 86400)
+            throw new InvalidOperationException(
+                $"MarketDataQuarantineMaxSeconds должен быть в диапазоне [60; 86400]. Текущее: {MarketDataQuarantineMaxSeconds}");
+
+        if (MarketDataQuarantineMaxSeconds < MarketDataQuarantineSeconds)
+            throw new InvalidOperationException(
+                $"MarketDataQuarantineMaxSeconds ({MarketDataQuarantineMaxSeconds}) не может быть меньше MarketDataQuarantineSeconds ({MarketDataQuarantineSeconds})");
 
         if (MarketDataReconnectCooldownSeconds < 10 || MarketDataReconnectCooldownSeconds > 600)
             throw new InvalidOperationException(

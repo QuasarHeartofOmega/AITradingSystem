@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AITradingSystem.Core.Models.Trading;
 using AITradingSystem.Core.RiskManagement;
 using AITradingSystem.Data.Binance;
@@ -365,9 +366,61 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
     }
 
     public void RecordMarketDataResubscribe() { lock (_lock) MarketDataResubscribes++; }
-    public void RecordMarketDataReconnectRequest() { lock (_lock) MarketDataReconnectRequests++; }
-    public void RecordMarketDataQuarantine() { lock (_lock) MarketDataQuarantines++; }
+    public void RecordMarketDataReconnectRequest(string? cause = null)
+    {
+        lock (_lock) MarketDataReconnectRequests++;
+        if (!string.IsNullOrEmpty(cause))
+            MarketDataReconnectCauses.AddOrUpdate(cause, 1, (_, v) => v + 1);
+    }
+    public void RecordMarketDataQuarantine(int streak = 1)
+    {
+        lock (_lock)
+        {
+            MarketDataQuarantines++;
+            if (streak > MarketDataQuarantineMaxStreak) MarketDataQuarantineMaxStreak = streak;
+        }
+    }
     public void RecordMarketDataQuarantineLift() { lock (_lock) MarketDataQuarantineLifts++; }
+
+    /// <summary>
+    /// P0.3a шаги 3–4: backoff/эскалация карантина, фактические секунды карантина,
+    /// collateral-эффект общего реконнекта и исходы recovery-циклов по символам.
+    /// </summary>
+    public int MarketDataQuarantineMaxStreak { get; private set; }
+    public long MarketDataQuarantineEscalations { get; private set; }
+    public double MarketDataQuarantinedSeconds { get; private set; }
+    public long MarketDataReconnectKept { get; private set; }
+    public long MarketDataReconnectReloads { get; private set; }
+    public ConcurrentDictionary<string, long> MarketDataReconnectCauses { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public ConcurrentDictionary<string, long> MarketDataRecoveryCyclesBySymbol { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public ConcurrentDictionary<string, long> MarketDataRecoveryFailedCyclesBySymbol { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public void RecordMarketDataQuarantineEscalation() { lock (_lock) MarketDataQuarantineEscalations++; }
+    public void RecordMarketDataQuarantineServed(double seconds)
+    {
+        lock (_lock) MarketDataQuarantinedSeconds += Math.Max(0d, seconds);
+    }
+    public void RecordMarketDataReconnectKept() { lock (_lock) MarketDataReconnectKept++; }
+    public void RecordMarketDataReconnectReload() { lock (_lock) MarketDataReconnectReloads++; }
+
+    /// <summary>Recovery-цикл символа завершён: live-подтверждением (success) или карантином (failure).</summary>
+    public void RecordMarketDataRecoveryCycle(string symbol, bool success)
+    {
+        MarketDataRecoveryCyclesBySymbol.AddOrUpdate(symbol, 1, (_, v) => v + 1);
+        if (!success)
+            MarketDataRecoveryFailedCyclesBySymbol.AddOrUpdate(symbol, 1, (_, v) => v + 1);
+    }
+
+    private static string FormatCounts(ConcurrentDictionary<string, long> counts) =>
+        counts.IsEmpty ? "none" : string.Join(", ", counts.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}"));
+
+    private string FormatRecoveryCycles() =>
+        MarketDataRecoveryCyclesBySymbol.IsEmpty
+            ? "none"
+            : string.Join(", ", MarketDataRecoveryCyclesBySymbol.OrderBy(kv => kv.Key).Select(kv =>
+                MarketDataRecoveryFailedCyclesBySymbol.TryGetValue(kv.Key, out var failed) && failed > 0
+                    ? $"{kv.Key}={kv.Value}(failed {failed})"
+                    : $"{kv.Key}={kv.Value}"));
 
     /// <summary>P2.4: подбор порога MinConfidence по expectancy после издержек.</summary>
     public long ConfidenceTuneRuns { get; private set; }
@@ -630,7 +683,10 @@ public sealed class MetricsCollector : IRestRateLimitMetrics
                $"recoveries {MarketDataRecoveries} (attempts {MarketDataRecoveryAttempts}, failures {MarketDataRecoveryFailures}), stale-entry blocks {MarketDataStaleEntryBlocks}, " +
                $"live confirmations {MarketDataLiveConfirmations} (mean ttl {MarketDataMeanTimeToLiveSeconds:F1}s, max {MarketDataMaxTimeToLiveSeconds:F1}s), " +
                $"resubscribes {MarketDataResubscribes}, reconnect requests {MarketDataReconnectRequests}, " +
-               $"quarantines {MarketDataQuarantines} (lifts {MarketDataQuarantineLifts}), " +
+               $"quarantines {MarketDataQuarantines} (lifts {MarketDataQuarantineLifts}, max streak {MarketDataQuarantineMaxStreak}, escalations {MarketDataQuarantineEscalations}, served {MarketDataQuarantinedSeconds:F0}s), " +
+               $"reconnect kept {MarketDataReconnectKept}/reloads {MarketDataReconnectReloads}, " +
+               $"reconnect causes [{FormatCounts(MarketDataReconnectCauses)}], " +
+               $"recovery cycles [{FormatRecoveryCycles()}], " +
                $"REST weight {RestUsedWeight}/{RestWeightLimit} (max {RestMaxUsedWeight}), " +
                $"rate limits 429={RateLimit429Hits} -1003={RateLimit1003Hits} 418={IpBan418Hits}, " +
                $"weight throttles {WeightThrottleWaits} (max {MaxWeightThrottleWaitMs:F0} ms, total {TotalWeightThrottleWaitMs:F0} ms), " +

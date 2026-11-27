@@ -28,6 +28,8 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
     private string _marketInterval = "15m";
     private CancellationToken _marketConnectToken;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    // P0.3a шаг 3: single-flight принудительного реконнекта рыночного сокета на весь процесс.
+    private readonly SemaphoreSlim _marketReconnectLock = new(1, 1);
     private int _subscribeRequestId;
     private long _messagesReceived;
     private long _parseErrors;
@@ -326,44 +328,59 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
         if (_streamUrl == null)
             throw new InvalidOperationException("Рыночный WebSocket ещё не подключался — реконнект невозможен.");
 
-        try { OnDisconnected?.Invoke(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnDisconnected при принудительном реконнекте"); }
-
-        _cts?.Cancel();
-        if (_receiveTask != null)
+        // P0.3a шаг 3: параллельный запрос не запускает второй разрыв сокета — уже идущий
+        // реконнект сам переподпишет все символы и уведомит OnReconnected.
+        if (!await _marketReconnectLock.WaitAsync(0, ct))
         {
-            try { await _receiveTask; }
-            catch (OperationCanceledException) { /* ожидаемо */ }
-            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка завершения receive loop при реконнекте"); }
-            _receiveTask = null;
+            ExchangeLog.WebSocket("реконнект пропущен", "другой принудительный реконнект уже выполняется (single-flight)");
+            return;
         }
 
-        if (_ws?.State == WebSocketState.Open)
+        try
         {
-            try
+            try { OnDisconnected?.Invoke(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnDisconnected при принудительном реконнекте"); }
+
+            _cts?.Cancel();
+            if (_receiveTask != null)
             {
-                using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Market data reconnect", closeCts.Token);
+                try { await _receiveTask; }
+                catch (OperationCanceledException) { /* ожидаемо */ }
+                catch (Exception ex) { _logger.LogWarning(ex, "Ошибка завершения receive loop при реконнекте"); }
+                _receiveTask = null;
             }
-            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка закрытия рыночного сокета при реконнекте"); }
+
+            if (_ws?.State == WebSocketState.Open)
+            {
+                try
+                {
+                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Market data reconnect", closeCts.Token);
+                }
+                catch (Exception ex) { _logger.LogWarning(ex, "Ошибка закрытия рыночного сокета при реконнекте"); }
+            }
+
+            _ws?.Dispose();
+            _ws = null;
+            _cts?.Dispose();
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(_marketConnectToken, ct);
+
+            ExchangeLog.WebSocket("принудительный реконнект", _streamUrl);
+            await ConnectInternalAsync(_cts.Token);
+            _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
+
+            // P0.3a: после реконнекта подписка снова идёт через URL; контрольные запросы старого сокета
+            // уже никогда не будут подтверждены — убираем их из ожидания, чтобы ack не «висел» в диагностике.
+            _pendingControlRequests.Clear();
+            RegisterUrlStreams(_marketStreams);
+
+            try { OnReconnected?.Invoke(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnReconnected при принудительном реконнекте"); }
         }
-
-        _ws?.Dispose();
-        _ws = null;
-        _cts?.Dispose();
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(_marketConnectToken, ct);
-
-        ExchangeLog.WebSocket("принудительный реконнект", _streamUrl);
-        await ConnectInternalAsync(_cts.Token);
-        _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), _cts.Token);
-
-        // P0.3a: после реконнекта подписка снова идёт через URL; контрольные запросы старого сокета
-        // уже никогда не будут подтверждены — убираем их из ожидания, чтобы ack не «висел» в диагностике.
-        _pendingControlRequests.Clear();
-        RegisterUrlStreams(_marketStreams);
-
-        try { OnReconnected?.Invoke(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Ошибка обработчика OnReconnected при принудительном реконнекте"); }
+        finally
+        {
+            _marketReconnectLock.Release();
+        }
     }
 
     private async Task ConnectInternalAsync(CancellationToken ct)

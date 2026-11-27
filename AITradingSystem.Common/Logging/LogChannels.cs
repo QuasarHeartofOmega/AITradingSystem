@@ -643,10 +643,11 @@ public static class TradeLog
         Ch.Warning("DATA-WS-RECONNECT symbol={Symbol} — {Reason}", symbol, reason);
     }
 
-    public static void DataLiveConfirmed(string symbol, double secondsToLive, int resubscribeAttempts)
+    public static void DataLiveConfirmed(string symbol, double secondsToLive, int resubscribeAttempts, bool entriesAllowed)
     {
-        Ch.Information("DATA-LIVE-CONFIRMED symbol={Symbol} time_to_live_s={Ttl} resubscribes={Attempts} entries_allowed_after_fresh_book=true",
-            symbol, LogOptions.N(secondsToLive, "F1"), resubscribeAttempts);
+        // P0.3a шаг 4: итоговый вердикт data-гейта на момент события, а не промежуточный fresh-book флаг.
+        Ch.Information("DATA-LIVE-CONFIRMED symbol={Symbol} time_to_live_s={Ttl} resubscribes={Attempts} entries_allowed={EntriesAllowed}",
+            symbol, LogOptions.N(secondsToLive, "F1"), resubscribeAttempts, entriesAllowed);
     }
 
     public static void DataQuarantine(string symbol, string reason, double durationSeconds)
@@ -655,9 +656,21 @@ public static class TradeLog
             symbol, LogOptions.N(durationSeconds), reason);
     }
 
-    public static void DataQuarantineLifted(string symbol, string reason)
+    /// <summary>
+    /// P0.3a шаг 3: символ молчит после повторных recovery-циклов — длительность карантина растёт
+    /// экспоненциально, оператору нужен явный сигнал вместо бесконечных одинаковых циклов.
+    /// </summary>
+    public static void DataQuarantineEscalated(string symbol, string reason, int streak, double durationSeconds)
     {
-        Ch.Information("DATA-QUARANTINE-LIFTED symbol={Symbol} previous_reason={Reason} entries_allowed=false", symbol, reason);
+        Ch.Error("DATA-QUARANTINE-ESCALATED symbol={Symbol} streak={Streak} duration_s={Duration} entries_allowed=false — {Reason}; требуется внимание оператора: повторные recovery не вернули стрим",
+            symbol, streak, LogOptions.N(durationSeconds), reason);
+    }
+
+    public static void DataQuarantineLifted(string symbol, string reason, bool entriesAllowed)
+    {
+        // P0.3a шаг 4: снятие карантина не равно разрешению входа — пишем фактический итоговый гейт.
+        Ch.Information("DATA-QUARANTINE-LIFTED symbol={Symbol} previous_reason={Reason} entries_allowed={EntriesAllowed}",
+            symbol, reason, entriesAllowed);
     }
 
     /// <summary>
