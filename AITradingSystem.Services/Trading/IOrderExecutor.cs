@@ -16,7 +16,8 @@ public interface IOrderExecutor
         TradingSignal signal,
         decimal quantity,
         OrderBook? currentOrderBook,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        ExecutionIntent? entryIntent = null);
 
     /// <summary>
     /// Закрыть позицию. P1.2: обычный выход идёт marketable LIMIT IOC с cap проскальзывания;

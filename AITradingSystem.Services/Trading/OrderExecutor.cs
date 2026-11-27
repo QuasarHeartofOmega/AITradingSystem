@@ -42,6 +42,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
     /// <summary>P1.5: метрики post-only-отказов (опционально — старые вызовы совместимы).</summary>
     private readonly MetricsCollector? _metrics;
+    private readonly E1Runtime? _e1;
 
     // P0.5: ожидание филлов идёт через executionReport, а не polling.
     private readonly ConcurrentDictionary<string, ExecutionReport> _latestReports = new(StringComparer.OrdinalIgnoreCase);
@@ -61,7 +62,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         ExecutionQueue executionQueue,
         IBinanceWebSocketClient ws,
         ILogger<OrderExecutor> logger,
-        MetricsCollector? metrics = null)
+        MetricsCollector? metrics = null,
+        E1Runtime? e1 = null)
     {
         _binanceClient = binanceClient ?? throw new ArgumentNullException(nameof(binanceClient));
         _tradingConfig = tradingConfig ?? throw new ArgumentNullException(nameof(tradingConfig));
@@ -69,6 +71,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         _ws = ws ?? throw new ArgumentNullException(nameof(ws));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _metrics = metrics;
+        _e1 = e1;
 
         _ws.OnExecutionReport += OnExecutionReportForFill;
 
@@ -121,12 +124,13 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         ExecutionPriority priority,
         string clientOrderId,
         Func<string, CancellationToken, Task<Order>> place,
-        CancellationToken ct)
+        CancellationToken ct,
+        ExecutionIntent? intent = null)
     {
         try
         {
             return await _executionQueue.SubmitAsync(
-                symbol, priority, clientOrderId, token => place(clientOrderId, token), ct);
+                symbol, priority, clientOrderId, token => place(clientOrderId, token), ct, intent);
         }
         catch (BinanceApiException ex) when (ex.IsDuplicateOrder)
         {
@@ -212,7 +216,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         TradingSignal signal,
         decimal quantity,
         OrderBook? currentOrderBook,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ExecutionIntent? entryIntent = null)
     {
         if (signal.Action is SignalAction.Hold or SignalAction.Close)
         {
@@ -308,6 +313,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
 
                     paperOrder = CreatePaperOrder(signal.Symbol, side, quantity, fill.FilledQuantity,
                         fill.AveragePrice, postOnly: false, _tradingConfig.PaperCommissionRate);
+                    if (entryIntent != null) paperOrder.ClientOrderId = entryIntent.ClientOrderId;
                     TradeLog.Decision(signal.Symbol, "PAPER-SLIPPAGE",
                         $"entry {side}: filled={fill.FilledQuantity}/{quantity}, avg={fill.AveragePrice:F8}, " +
                         $"slippage={fill.SlippagePercent:F4}%");
@@ -325,6 +331,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     executionPrice, postOnly: true, _tradingConfig.PaperCommissionRate);
             }
 
+            if (entryIntent != null) paperOrder.ClientOrderId = entryIntent.ClientOrderId;
             var openedPrice = paperOrder.AverageFillPrice ?? paperOrder.Price;
             TradeLog.Opened(signal.Symbol, side.ToString(), paperOrder.ExecutedQuantity, openedPrice,
                 signal.StopLoss ?? 0m, signal.TakeProfit ?? 0m, "PAPER", paperOrder.Id);
@@ -335,19 +342,21 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
         {
             if (_tradingConfig.UseMarketEntry)
             {
+                var marketKey = entryIntent?.ClientOrderId
+                    ?? StableClientOrderId("mkt", signal.Symbol, side, quantity, executionPrice, signal.Timestamp);
                 var marketOrder = await PlaceOrderIdempotentAsync(
-                    signal.Symbol, ExecutionPriority.Entry,
-                    StableClientOrderId("mkt", signal.Symbol, side, quantity, executionPrice, signal.Timestamp),
-                    (id, token) => _binanceClient.PlaceMarketOrderAsync(signal.Symbol, side, quantity, id, token), ct);
+                    signal.Symbol, ExecutionPriority.Entry, marketKey,
+                    (id, token) => _binanceClient.PlaceMarketOrderAsync(signal.Symbol, side, quantity, id, token), ct, entryIntent);
                 _executionQueue.ActiveEntries.Complete(marketOrder.ClientOrderId);
                 return ValidateFilled(marketOrder, signal.Symbol, "market-entry");
             }
 
+            var limitKey = entryIntent?.ClientOrderId
+                ?? StableClientOrderId("ent", signal.Symbol, side, quantity, executionPrice, signal.Timestamp);
             var order = await PlaceOrderIdempotentAsync(
-                signal.Symbol, ExecutionPriority.Entry,
-                StableClientOrderId("ent", signal.Symbol, side, quantity, executionPrice, signal.Timestamp),
+                signal.Symbol, ExecutionPriority.Entry, limitKey,
                 (id, token) => _binanceClient.PlaceOrderAsync(
-                    signal.Symbol, side, quantity, executionPrice, postOnly: true, clientOrderId: id, ct: token), ct);
+                    signal.Symbol, side, quantity, executionPrice, postOnly: true, clientOrderId: id, ct: token), ct, entryIntent);
 
             if (order.Status is OrderStatus.Rejected or OrderStatus.Expired or OrderStatus.Canceled)
             {
@@ -422,6 +431,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                 var paperOrder = CreatePaperOrder(position.Symbol, side, position.Quantity, fill.FilledQuantity,
                     fill.AveragePrice, postOnly: false, _tradingConfig.PaperCommissionRate);
                 position.SetProtection(null);
+                if (_e1 != null) await _e1.RecordOrderAsync(paperOrder, FillRole.Exit, position.E1DecisionId,
+                    position.E1EntryIntentId, position.Id, null, currentOrderBook, ct);
 
                 ExchangeLog.Order("PAPER-CLOSE", position.Symbol, side.ToString(), fill.FilledQuantity, fill.AveragePrice,
                     $"fee={paperOrder.Commission:F4} slippage={fill.SlippagePercent:F4}%");
@@ -435,6 +446,8 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             var fallbackOrder = CreatePaperOrder(position.Symbol, side, position.Quantity, position.Quantity,
                 fallbackPrice, postOnly: false, _tradingConfig.PaperCommissionRate);
             position.SetProtection(null);
+            if (_e1 != null) await _e1.RecordOrderAsync(fallbackOrder, FillRole.Exit, position.E1DecisionId,
+                position.E1EntryIntentId, position.Id, null, currentOrderBook, ct);
 
             ExchangeLog.Order("PAPER-CLOSE", position.Symbol, side.ToString(), position.Quantity, fallbackPrice,
                 $"fee={fallbackOrder.Commission:F4}");
@@ -527,12 +540,21 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             }
 
             // P0.3: закрытие идёт с приоритетом Close — обгоняет входы в очереди.
+            var closeIntent = new ExecutionIntent
+            {
+                ClientOrderId = StableClientOrderId("cls", position.Id, quantity, exitLimitPrice, useIoc),
+                Symbol = position.Symbol,
+                Operation = nameof(ExecutionPriority.Close),
+                DecisionId = string.IsNullOrWhiteSpace(position.E1DecisionId) ? null : position.E1DecisionId,
+                EntryIntentId = string.IsNullOrWhiteSpace(position.E1EntryIntentId) ? null : position.E1EntryIntentId,
+                PositionId = position.Id,
+                Side = side
+            };
             var order = await PlaceOrderIdempotentAsync(
-                position.Symbol, ExecutionPriority.Close,
-                StableClientOrderId("cls", position.Id, quantity, exitLimitPrice, useIoc),
+                position.Symbol, ExecutionPriority.Close, closeIntent.ClientOrderId,
                 (id, token) => useIoc
                     ? _binanceClient.PlaceIocOrderAsync(position.Symbol, side, quantity, exitLimitPrice, id, token)
-                    : _binanceClient.PlaceMarketOrderAsync(position.Symbol, side, quantity, id, token), ct);
+                    : _binanceClient.PlaceMarketOrderAsync(position.Symbol, side, quantity, id, token), ct, closeIntent);
 
             if (order.ExecutedQuantity <= 0)
             {
@@ -541,6 +563,9 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             }
 
             var validated = ValidateFilled(order, position.Symbol, "close");
+            if (validated != null && _e1 != null)
+                await _e1.RecordOrderAsync(validated, FillRole.Exit, position.E1DecisionId,
+                    position.E1EntryIntentId, position.Id, null, currentOrderBook, ct);
             if (validated == null)
             {
                 // P1.3: для dust восстановление OCO бессмысленно — ноги не пройдут minQty/minNotional,
@@ -622,7 +647,10 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
     public async Task<bool> EnsureProtectionAsync(Position position, CancellationToken ct = default)
     {
         if (!_tradingConfig.ExchangeProtectionEnabled)
+        {
+            if (_e1 != null) await _e1.RecordProtectionAsync(position, "exchange-protection-disabled", false, ct);
             return true; // осознанный отказ от биржевой защиты (локальный SL — единственный)
+        }
 
         if (position.Protection != null)
             return true; // уже стоит на бирже либо симулируется в paper-режиме
@@ -722,6 +750,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     return null;
                 }, ct);
             position.SetProtection(null);
+            if (_e1 != null) await _e1.RecordProtectionAsync(position, "canceled-for-exit-or-replace", position.E1ProtectionConfirmed, ct);
             // P0.3: ключ снятой связки больше не должен блокировать постановку такой же защиты.
             await _executionQueue.ForgetKeyAsync(
                 position.Symbol, protection.ListClientOrderId, "OCO снята локально", ct);
@@ -734,6 +763,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             TradeLog.Decision(position.Symbol, "PROTECTION-GONE",
                 $"OCO#{protection.OrderListId} отсутствует — возможное исполнение биржей, нужна реконсиляция (P0.5)");
             position.SetProtection(null);
+            if (_e1 != null) await _e1.RecordProtectionAsync(position, "protection-gone-needs-reconcile", false, ct);
             await _executionQueue.ForgetKeyAsync(
                 position.Symbol, protection.ListClientOrderId, "OCO на бирже не найдена", ct);
             return true;
@@ -830,6 +860,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
             };
 
             position.SetProtection(simulated);
+            if (_e1 != null) await _e1.RecordProtectionAsync(position, "paper-simulated-oco", true, ct);
             ExchangeLog.Order("PAPER-OCO", position.Symbol, protectiveSide.ToString(), prices.Quantity,
                 prices.StopTrigger, $"SL={prices.StopTrigger}/{prices.StopLimit} TP={prices.TakeProfitTrigger}/{prices.TakeProfitLimit}");
             return simulated;
@@ -850,6 +881,7 @@ public sealed class OrderExecutor : IOrderExecutor, IDisposable
                     listClientOrderId: listClientId, ct: token), ct);
 
             position.SetProtection(protection);
+            if (_e1 != null) await _e1.RecordProtectionAsync(position, "exchange-oco-live", true, ct);
 
             TradeLog.Decision(position.Symbol, "PROTECTION",
                 $"OCO на бирже: SL={protection.StopTriggerPrice}/{protection.StopLimitPrice} " +

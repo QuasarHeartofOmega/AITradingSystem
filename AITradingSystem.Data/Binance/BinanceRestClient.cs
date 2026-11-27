@@ -547,6 +547,14 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
         return order;
     }
 
+    public async Task<List<BinanceMyTrade>> GetMyTradesAsync(string symbol, long? orderId = null, CancellationToken ct = default)
+    {
+        var query = $"symbol={symbol.ToUpperInvariant()}";
+        if (orderId.HasValue) query += $"&orderId={orderId.Value}";
+        return await SendRequestAsync<List<BinanceMyTrade>>(
+            $"/api/v3/myTrades?{query}", HttpMethod.Get, signed: true, ct: ct);
+    }
+
     public async Task<List<Order>> GetOpenOrdersAsync(string? symbol = null, CancellationToken ct = default)
     {
         var query = symbol != null ? $"symbol={symbol.ToUpperInvariant()}" : string.Empty;

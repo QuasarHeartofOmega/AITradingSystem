@@ -34,6 +34,13 @@ public sealed class ExecutionIntent
     /// <summary>Тип операции = приоритет очереди: Entry / Close / Trailing / Protection.</summary>
     public string Operation { get; set; } = string.Empty;
 
+    /// <summary>E1: stable decision/intent/position linkage persisted before submission.</summary>
+    public string? DecisionId { get; set; }
+    public string? EntryIntentId { get; set; }
+    public string? PositionId { get; set; }
+    public string? ProtectionIdentity { get; set; }
+    public Enums.OrderSide? Side { get; set; }
+
     public ExecutionIntentStatus Status { get; set; } = ExecutionIntentStatus.Pending;
 
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;

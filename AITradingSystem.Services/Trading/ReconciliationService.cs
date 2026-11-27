@@ -31,6 +31,7 @@ public sealed class ReconciliationService : IAsyncDisposable
     private readonly IExecutionJournal _journal;
     private readonly MetricsCollector _metrics;
     private readonly ILogger<ReconciliationService> _logger;
+    private readonly E1Runtime? _e1;
 
     private CancellationTokenSource? _cts;
     private Task? _keepAliveLoop;
@@ -161,7 +162,8 @@ public sealed class ReconciliationService : IAsyncDisposable
         ExecutionQueue executionQueue,
         IExecutionJournal journal,
         MetricsCollector metrics,
-        ILogger<ReconciliationService> logger)
+        ILogger<ReconciliationService> logger,
+        E1Runtime? e1 = null)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _rest = rest ?? throw new ArgumentNullException(nameof(rest));
@@ -171,6 +173,7 @@ public sealed class ReconciliationService : IAsyncDisposable
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _e1 = e1;
     }
 
     /// <summary>Подключить колбэки движка до StartAsync.</summary>
@@ -345,6 +348,7 @@ public sealed class ReconciliationService : IAsyncDisposable
                 TradeLog.ReconFinding(finding);
 
             await RemediateAsync(positionsSnapshot, openOrders, openLists, ct, activeEntries);
+            if (_e1 != null) await _e1.ReconcileAsync(ct);
 
             // P0.4: успех фиксируется только если не осталось неразрешённых состояний.
             var unresolved = Volatile.Read(ref _unresolvedStateIssues);
@@ -785,6 +789,7 @@ public sealed class ReconciliationService : IAsyncDisposable
             CumulativeQuantity = order.ExecutedQuantity,
             CumulativeQuoteQuantity = order.FilledQuoteQuantity,
             Commission = order.Commission,
+            CommissionAsset = order.CommissionAsset,
             TransactionTimeUtc = order.UpdatedAt ?? order.CreatedAt,
             RejectReason = reason
         };

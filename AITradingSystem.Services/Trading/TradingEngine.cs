@@ -42,6 +42,7 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly ILogger<TradingEngine> _logger;
     private readonly AccountSnapshotService _accountSnapshots;
     private readonly LlmVetoService _llmVeto;
+    private readonly E1Runtime _e1;
     private string _configHash = "unknown";
     private AccountSnapshot? _accountSnapshot;
     private decimal _paperFreeCash;
@@ -141,6 +142,7 @@ public sealed class TradingEngine : IAsyncDisposable
         IStateRepository stateRepository,
         MetricsCollector metrics,
         LlmVetoService llmVeto,
+        E1Runtime e1,
         ILogger<TradingEngine> logger)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
@@ -163,6 +165,7 @@ public sealed class TradingEngine : IAsyncDisposable
         _stateRepository = stateRepository ?? throw new ArgumentNullException(nameof(stateRepository));
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _llmVeto = llmVeto ?? throw new ArgumentNullException(nameof(llmVeto));
+        _e1 = e1 ?? throw new ArgumentNullException(nameof(e1));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager);
 
@@ -217,6 +220,7 @@ public sealed class TradingEngine : IAsyncDisposable
 
             // Восстановление позиций
             await _positionManager.LoadPositionsAsync(ct);
+            await _e1.InitializeAsync(_configHash, ct);
             foreach (var restored in _positionManager.GetOpenPositions())
             {
                 OnPositionOpened?.Invoke(restored); // показываем восстановленные позиции в UI
@@ -710,11 +714,31 @@ public sealed class TradingEngine : IAsyncDisposable
 
     private async Task ProcessSymbolAsync(string symbol, CancellationToken ct)
     {
+        var ctx = new E1DecisionContext(_e1, symbol);
+        ctx.LlmRole = _config.AI.ResolvedRole.ToString();
+        try
+        {
+            await ProcessSymbolCoreAsync(symbol, ctx, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await ctx.ErrorAsync("exception", "exception", ex.Message, CancellationToken.None);
+            throw;
+        }
+    }
+
+    private async Task ProcessSymbolCoreAsync(string symbol, E1DecisionContext ctx, CancellationToken ct)
+    {
         // P0.6: kill-switch блокирует новые входы независимо от статуса (Pause может не примениться
         // во время Starting); сопровождение открытых позиций продолжает PositionMonitor.
         if (IsKillSwitchEngaged)
         {
             TradeLog.Rejected(symbol, "kill-switch", "входы заблокированы kill-switch (пробит лимит риска или ручная паника)");
+            await ctx.RejectAsync("kill-switch", "kill_switch_engaged", "входы заблокированы kill-switch", ct);
             return;
         }
 
@@ -725,6 +749,7 @@ public sealed class TradingEngine : IAsyncDisposable
             _metrics.RecordExecutionStateBlock();
             TradeLog.Rejected(symbol, "execution-state",
                 $"состояние исполнения недостоверно ({blockReason}); режим {_reconciliation.ExecutionMode}");
+            await ctx.RejectAsync("execution-state", "execution_state_untrusted", blockReason, ct);
             return;
         }
 
@@ -732,6 +757,7 @@ public sealed class TradingEngine : IAsyncDisposable
         if (_accountSnapshot?.IsValuationComplete != true)
         {
             TradeLog.Rejected(symbol, "risk", "снимок капитала неполон или отсутствует (account valuation fail-closed)");
+            await ctx.RejectAsync("risk", "account_valuation_incomplete", "снимок капитала неполон", ct);
             return;
         }
 
@@ -740,6 +766,7 @@ public sealed class TradingEngine : IAsyncDisposable
         //    чтобы сопровождение не ждало инференса LLM по всем остальным парам.
         if (_positionManager.GetPositionBySymbol(symbol) != null)
         {
+            await ctx.HoldAsync("position-review", "position_already_open", "открытая позиция сопровождается отдельным контуром", ct);
             await ReviewOpenPositionAsync(symbol, ct);
             return;
         }
@@ -750,6 +777,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             TradeLog.Rejected(symbol, "portfolio",
                 $"достигнут лимит открытых позиций {openCount}/{_config.Trading.MaxOpenPositions}");
+            await ctx.RejectAsync("portfolio", "max_open_positions", $"{openCount}/{_config.Trading.MaxOpenPositions}", ct);
             return;
         }
 
@@ -758,6 +786,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             _metrics.RecordPortfolioRejection("daily-or-pause");
             TradeLog.Rejected(symbol, "portfolio", portfolioBlock);
+            await ctx.RejectAsync("portfolio", "portfolio_daily_or_pause", portfolioBlock, ct);
             return;
         }
 
@@ -766,12 +795,16 @@ public sealed class TradingEngine : IAsyncDisposable
         if (currentCandle == null)
         {
             LogWaiting(symbol, "нет текущей свечи (ожидание данных WebSocket/REST)");
+            await ctx.RejectAsync("market-data", "no_current_candle", "нет текущей свечи", ct);
             return;
         }
 
         // P1.4: fail-closed до AI — протухшие/разорванные данные после реконнекта WS не допускаются ко входу.
-        if (!PassesMarketDataFreshness(symbol, "pre-ai"))
+        if (!PassesMarketDataFreshness(symbol, "pre-ai", ctx))
+        {
+            await ctx.RejectAsync("market-data", "market_data_freshness", "pre-ai freshness fail", ct);
             return;
+        }
 
         var indicators = _marketAnalyzer.GetIndicatorSnapshot(symbol, currentCandle);
         if (indicators == null)
@@ -779,15 +812,24 @@ public sealed class TradingEngine : IAsyncDisposable
             // Раньше здесь был молчаливый return — в логах было пусто, казалось что бот не работает.
             var warmup = _marketAnalyzer.GetWarmupInfo(symbol);
             LogWaiting(symbol, $"прогрев индикаторов: {warmup.Candles}/{warmup.Required} свечей");
+            await ctx.RejectAsync("warmup", "indicator_warmup", $"{warmup.Candles}/{warmup.Required}", ct);
             return;
         }
 
         // 3a. Cooldown на символ: при 12+ парах и медленном инференсе не забиваем очередь одним символом.
         if (!TryEnterAnalysisCooldown(symbol))
+        {
+            await ctx.RejectAsync("cooldown", "analysis_cooldown", "symbol analysis cooldown", ct);
             return;
+        }
 
         // 3b. Детерминированный pre-score (B9): математика до ИИ, якорь для рубрики уверенности.
         var preScore = _calibrator.PreScore(indicators);
+        ctx.PreScore = preScore;
+        foreach (var kv in indicators) ctx.Features[kv.Key] = kv.Value;
+        ctx.CandleCloseUtc = currentCandle.OpenTime;
+        ctx.DataSnapshotHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(indicators))))[..16].ToLowerInvariant();
         TradeLog.Decision(symbol, "PRE-SCORE", $"{preScore.Summary}; {preScore.ReasonsText}");
 
         // 4. P0.5: детерминированный сигнал БЕЗ ожидания LLM. Направление/prior — PreScore,
@@ -803,9 +845,11 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             TradeLog.Rejected(symbol, "symbol-policy",
                 $"direction_mismatch: engine={preScore.DirectionName}, proposed={signal.Action}; вход запрещён без отдельного reversal setup");
+            await ctx.RejectAsync("symbol-policy", "direction_mismatch", $"{preScore.DirectionName}/{signal.Action}", ct);
             return;
         }
 
+        ctx.Signal = signal;
         _metrics.RecordSignal(signal);
         OnSignalGenerated?.Invoke(signal);
 
@@ -830,6 +874,8 @@ public sealed class TradingEngine : IAsyncDisposable
                     _metrics.RecordLlmVetoPendingBlock();
                     TradeLog.LlmVetoPending(symbol);
                     TradeLog.Rejected(symbol, "llm-veto", "вердикт LLM по закрытой свече ещё не готов (VetoOnly, fail-closed)");
+                    ctx.AiDisposition = AiDisposition.NotInvoked;
+                    await ctx.RejectAsync("llm-veto", "llm_verdict_pending", "VetoOnly fail-closed", ct);
                     return;
                 }
             }
@@ -842,6 +888,8 @@ public sealed class TradingEngine : IAsyncDisposable
                     _metrics.RecordLlmVetoPendingBlock();
                     TradeLog.Rejected(symbol, "llm-veto",
                         $"вердикт LLM опоздал ({verdict.LatencyMs:F0} ms > бюджета {_config.AI.VetoBudgetSeconds}s) — вход не разрешён");
+                    ctx.AiDisposition = AiDisposition.TimedOut;
+                    await ctx.RejectAsync("llm-veto", "llm_verdict_late", verdict.LatencyMs.ToString("F0"), ct);
                     return;
                 }
 
@@ -850,6 +898,8 @@ public sealed class TradingEngine : IAsyncDisposable
                     _metrics.RecordLlmVetoApplied();
                     TradeLog.LlmVetoApplied(symbol, verdict.Reason);
                     TradeLog.Rejected(symbol, "llm-veto", verdict.Reason);
+                    ctx.AiDisposition = AiDisposition.Completed;
+                    await ctx.RejectAsync("llm-veto", "llm_veto", verdict.Reason, ct);
                     return;
                 }
             }
@@ -862,6 +912,7 @@ public sealed class TradingEngine : IAsyncDisposable
                 signal.Action == SignalAction.Close
                     ? "ИИ просит закрыть, но открытой позиции нет"
                     : $"conf={signal.Confidence:P0}: {signal.Reasoning}");
+            await ctx.HoldAsync("signal", "hold", signal.Reasoning, ct);
             return;
         }
 
@@ -869,6 +920,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             TradeLog.Rejected(symbol, "spot",
                 "SELL без открытой позиции = шорт, на споте Binance невозможен (Trading:AllowShort=false)");
+            await ctx.RejectAsync("spot", "short_disabled", "AllowShort=false", ct);
             return;
         }
 
@@ -879,6 +931,7 @@ public sealed class TradingEngine : IAsyncDisposable
             TradeLog.Rejected(symbol, "confidence",
                 $"final={signal.Confidence:P0} < порога {_config.AI.MinConfidence:P0} " +
                 $"(model={signal.ModelConfidence:P0}, engine={signal.EngineConfidence:P0}, {signal.ConfidenceSource})");
+            await ctx.RejectAsync("confidence", "below_min_confidence", $"{signal.Confidence}<{_config.AI.MinConfidence}", ct);
             return;
         }
 
@@ -892,6 +945,7 @@ public sealed class TradingEngine : IAsyncDisposable
         if (!_riskManager.ValidateSignal(signal, balance, out var reason))
         {
             TradeLog.Rejected(symbol, "risk", reason);
+            await ctx.RejectAsync("risk", "risk_manager_reject", reason, ct);
             return;
         }
 
@@ -899,6 +953,7 @@ public sealed class TradingEngine : IAsyncDisposable
             !signal.StopLoss.HasValue || !signal.TakeProfit.HasValue)
         {
             TradeLog.Rejected(symbol, "signal", "в сигнале нет корректных entry/SL/TP");
+            await ctx.RejectAsync("signal", "invalid_signal_prices", "entry/SL/TP missing", ct);
             return;
         }
 
@@ -927,6 +982,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             TradeLog.Rejected(symbol, "cash",
                 $"нет свободных средств: free cash {freeCash:F2}, equity {balance:F2} USDT");
+            await ctx.RejectAsync("cash", "no_free_cash", $"free={freeCash}", ct);
             return;
         }
 
@@ -952,17 +1008,24 @@ public sealed class TradingEngine : IAsyncDisposable
         if (quantity <= 0)
         {
             TradeLog.Rejected(symbol, "sizing", "рассчитанный объём <= 0");
+            await ctx.RejectAsync("sizing", "zero_quantity", "quantity<=0", ct);
             return;
         }
 
         // P1.7: полный портфельный гейт после сайзинга — экспозиция и BTC-корреляция.
         quantity = ApplyPortfolioRiskCap(symbol, quantity, signal.EntryPrice.Value, balance, "sizing");
         if (quantity <= 0)
+        {
+            await ctx.RejectAsync("portfolio", "portfolio_cap_zero", "sizing", ct);
             return;
+        }
 
         // P1.4: повторная проверка свежести перед отправкой ордера — пока шёл инференс, WS мог оборваться.
         if (!PassesMarketDataFreshness(symbol, "pre-exec"))
+        {
+            await ctx.RejectAsync("market-data", "market_data_freshness", "pre-exec freshness fail", ct);
             return;
+        }
 
         // P0.4: пока шёл инференс, user-data stream мог упасть, а реконсиляция — не пройти.
         if (!_reconciliation.IsExecutionStateTrusted)
@@ -970,6 +1033,7 @@ public sealed class TradingEngine : IAsyncDisposable
             _metrics.RecordExecutionStateBlock();
             TradeLog.Rejected(symbol, "execution-state",
                 $"[pre-exec] состояние исполнения недостоверно ({_reconciliation.ExecutionStateBlockReason})");
+            await ctx.RejectAsync("execution-state", "execution_state_untrusted", _reconciliation.ExecutionStateBlockReason, ct);
             return;
         }
 
@@ -978,12 +1042,18 @@ public sealed class TradingEngine : IAsyncDisposable
         // 7b. P1.5: ликвидность перед входом — спред / глубина стороны входа / объём свечей.
         //     Раньше широкий спред только логировался, вход не блокировался.
         if (!PassesLiquidityFilter(symbol, side, quantity, signal.EntryPrice.Value, currentOrderBook, currentCandle.Close))
+        {
+            await ctx.RejectAsync("liquidity", "liquidity_filter", "spread/depth/volume gate", ct);
             return;
+        }
 
         // P1.7: повторный портфельный гейт перед отправкой — позиции/цены могли измениться во время проверок.
         quantity = ApplyPortfolioRiskCap(symbol, quantity, signal.EntryPrice.Value, balance, "pre-exec");
         if (quantity <= 0)
+        {
+            await ctx.RejectAsync("portfolio", "portfolio_cap_zero", "pre-exec", ct);
             return;
+        }
 
         // 7c. Минимум биржи (NOTIONAL + лоты) учитываем ДО отправки: иначе риск-сайзинг даёт
         //     объём на 2 USDT при минимуме 5, и ордер отклоняется уже после инференса и проверок.
@@ -1011,6 +1081,7 @@ public sealed class TradingEngine : IAsyncDisposable
             if (entryPlan.Route == EntryFilterRoute.Reject)
             {
                 TradeLog.Rejected(symbol, "min-notional", entryPlan.Reason ?? "объём ниже фильтров биржи");
+                await ctx.RejectAsync("min-notional", "entry_filter_reject", entryPlan.Reason ?? string.Empty, ct);
                 return;
             }
 
@@ -1023,6 +1094,7 @@ public sealed class TradingEngine : IAsyncDisposable
                 {
                     TradeLog.Rejected(symbol, "min-notional",
                         $"минимум биржи требует {entryPlan.Quantity}, портфельный лимит разрешает {allowed} — вход пропущен");
+                    await ctx.RejectAsync("min-notional", "bump_exceeds_portfolio_cap", $"{entryPlan.Quantity}>{allowed}", ct);
                     return;
                 }
 
@@ -1033,7 +1105,10 @@ public sealed class TradingEngine : IAsyncDisposable
         }
 
         // 8. Исполнение. Ордер возвращается только после реального исполнения.
-        var order = await _orderExecutor.ExecuteSignalAsync(signal, quantity, currentOrderBook, ct);
+        await ctx.AllowAsync("execution", "entry_allowed", $"qty={quantity}", ct);
+        var entryIntent = await _e1.PrepareEntryAsync(ctx.DecisionId, signal, quantity, side, ct);
+        var order = await _orderExecutor.ExecuteSignalAsync(signal, quantity, currentOrderBook, ct, entryIntent);
+        await _e1.RecordEntryResultAsync(entryIntent, order, currentOrderBook, ct);
         if (order == null)
             return;
 
@@ -1076,6 +1151,9 @@ public sealed class TradingEngine : IAsyncDisposable
 
         var position = new Position
         {
+            Id = entryIntent.EntryIntentId!,
+            E1DecisionId = ctx.DecisionId,
+            E1EntryIntentId = entryIntent.EntryIntentId!,
             Symbol = symbol,
             Side = side,
             Quantity = sellableQuantity,
@@ -1106,6 +1184,7 @@ public sealed class TradingEngine : IAsyncDisposable
         using (await _positionMonitor.LockSymbolAsync(symbol, ct))
         {
             await _positionManager.AddPositionAsync(position, ct);
+            await _e1.AttachPositionAsync(position, ct);
 
             // P0.1: биржевая защита ставится СРАЗУ после филла входа.
             if (await _orderExecutor.EnsureProtectionAsync(position, ct))
@@ -1136,6 +1215,7 @@ public sealed class TradingEngine : IAsyncDisposable
                 TradeLog.Rejected(symbol, "protection",
                     "OCO не поставлена: закрываем позицию, чтобы капитал не зависел от живого процесса");
                 await ClosePositionAsync(position, "NoExchangeProtection", ct);
+                await _e1.RefreshOutcomeAsync(position.Id, "NoExchangeProtection", position.DustExchangeQuantity, ct);
                 return;
             }
         }
@@ -1704,6 +1784,7 @@ public sealed class TradingEngine : IAsyncDisposable
             position.ReduceQuantity(closedQuantity);
             position.EntryCommission = Math.Max(0m, position.EntryCommission - entryCommissionPart);
             await _positionManager.SavePositionsAsync(ct);
+            await _e1.RefreshOutcomeAsync(position.Id, reason + "-partial", position.DustExchangeQuantity, ct);
 
             // P1.2: остаток после частичного выхода не должен остаться без биржевой защиты.
             if (await _orderExecutor.EnsureProtectionAsync(position, ct))
@@ -1715,6 +1796,7 @@ public sealed class TradingEngine : IAsyncDisposable
         else
         {
             await _positionManager.RemovePositionAsync(position.Id, ct);
+            await _e1.RefreshOutcomeAsync(position.Id, reason, position.DustExchangeQuantity, ct);
 
             lock (_reviewLock)
             {
@@ -1872,6 +1954,14 @@ public sealed class TradingEngine : IAsyncDisposable
             var unapplied = live.GetUnappliedExchangeFill(report.ClientOrderId, report.CumulativeQuantity);
             if (unapplied <= 0) return false;
 
+            var e1Role = reason is "ExchangeStopLoss" or "ExchangeTakeProfit" ? FillRole.ProtectiveExit : FillRole.Exit;
+            var protIdentity = live.Protection != null
+                ? (live.Protection.OrderListId > 0 ? $"oco:{live.Protection.OrderListId}" : $"oco-client:{live.Protection.ListClientOrderId}")
+                : null;
+            await _e1.RecordReportAsync(live, report, e1Role, protIdentity, ct);
+            if (e1Role == FillRole.ProtectiveExit)
+                await _e1.RecordProtectionAsync(live, reason, true, ct);
+
             closedQuantity = Math.Min(unapplied, live.Quantity);
             if (closedQuantity <= 0) return false;
 
@@ -1928,12 +2018,14 @@ public sealed class TradingEngine : IAsyncDisposable
             if (fullyClosed)
             {
                 await _positionManager.RemovePositionAsync(live.Id, ct);
+                await _e1.RefreshOutcomeAsync(live.Id, reason, live.DustExchangeQuantity, ct);
                 lock (_reviewLock) _lastPositionReview.Remove(live.Symbol);
             }
             else
             {
                 live.ReduceQuantity(closedQuantity);
                 await _positionManager.SavePositionsAsync(ct);
+                await _e1.RefreshOutcomeAsync(live.Id, reason + "-partial", live.DustExchangeQuantity, ct);
             }
         }
 
@@ -2651,7 +2743,7 @@ public sealed class TradingEngine : IAsyncDisposable
     }
 
     /// <summary>P1.4: fail-closed гейт свежести рыночных данных перед входом.</summary>
-    private bool PassesMarketDataFreshness(string symbol, string stage)
+    private bool PassesMarketDataFreshness(string symbol, string stage, E1DecisionContext? ctx = null)
     {
         if (!_wsClient.IsConnected)
         {

@@ -219,7 +219,8 @@ public sealed class ExecutionQueue : IAsyncDisposable
         ExecutionPriority priority,
         string? idempotencyKey,
         Func<CancellationToken, Task<T>> work,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ExecutionIntent? intent = null)
     {
         if (work is null) throw new ArgumentNullException(nameof(work));
         ct.ThrowIfCancellationRequested();
@@ -227,7 +228,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
         var result = await SubmitCoreAsync(
             symbol, priority, idempotencyKey,
             async token => (object?)await work(token).ConfigureAwait(false),
-            ct).ConfigureAwait(false);
+            ct, intent).ConfigureAwait(false);
 
         return result is T typed ? typed : default!;
     }
@@ -237,7 +238,8 @@ public sealed class ExecutionQueue : IAsyncDisposable
         ExecutionPriority priority,
         string? key,
         Func<CancellationToken, Task<object?>> work,
-        CancellationToken ct)
+        CancellationToken ct,
+        ExecutionIntent? intent = null)
     {
         EnsureStarted();
         PurgeExpired();
@@ -306,7 +308,8 @@ public sealed class ExecutionQueue : IAsyncDisposable
                 DateTime.UtcNow,
                 new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously))
             {
-                CallerToken = ct
+                CallerToken = ct,
+                Intent = intent
             };
 
             if (!hasReplay && joined is null)
@@ -522,7 +525,22 @@ public sealed class ExecutionQueue : IAsyncDisposable
             intent.Attempts = item.Attempts;
             intent.Status = ExecutionIntentStatus.Pending;
             if (item.Priority == ExecutionPriority.Entry && item.Key != null) ActiveEntries.Update(item.Key, intent.Status);
-            await TryJournalAsync(intent).ConfigureAwait(false);
+            try
+            {
+                await TryJournalAsync(intent, required: intent != null).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                lock (_lock)
+                {
+                    _busySymbols.Remove(item.Symbol);
+                    _running--;
+                    if (item.Key != null) _inFlightByKey.Remove(item.Key);
+                }
+                item.Completion.TrySetException(ex);
+                _signal.Release();
+                return;
+            }
         }
 
         object? result = null;
@@ -608,9 +626,13 @@ public sealed class ExecutionQueue : IAsyncDisposable
             item.Completion.TrySetResult(result);
     }
 
-    private async Task TryJournalAsync(ExecutionIntent intent)
+    private async Task TryJournalAsync(ExecutionIntent intent, bool required = false)
     {
-        if (_journal is null) return;
+        if (_journal is null)
+        {
+            if (required) throw new InvalidOperationException("E1/P0.3 write-ahead journal is not configured");
+            return;
+        }
 
         try
         {
@@ -619,6 +641,7 @@ public sealed class ExecutionQueue : IAsyncDisposable
         catch (Exception ex)
         {
             TradeLog.Error("EXEC-JOURNAL-WRITE-FAIL", intent.Symbol, $"не удалось зафиксировать {intent.ClientOrderId}", ex);
+            if (required) throw;
         }
     }
 

@@ -17,6 +17,9 @@ public sealed class ExecutionReport
     /// <summary>Id OCO-связки, если ордер — её нога; -1 для одиночного ордера.</summary>
     public long OrderListId { get; init; } = -1;
 
+    /// <summary>Exchange trade id (t) when present; never fabricate from cumulative quantity.</summary>
+    public long TradeId { get; init; }
+
     /// <summary>NEW / TRADE / CANCELED / EXPIRED / REJECTED …</summary>
     public string ExecutionType { get; init; } = string.Empty;
 

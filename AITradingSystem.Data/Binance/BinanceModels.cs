@@ -223,11 +223,17 @@ public sealed class BinanceFill
 /// </summary>
 public sealed class BinanceMyTrade
 {
-    [JsonPropertyName("commission")]
-    public string Commission { get; set; } = "0";
-
-    [JsonPropertyName("commissionAsset")]
-    public string CommissionAsset { get; set; } = string.Empty;
+    [JsonPropertyName("symbol")] public string Symbol { get; set; } = string.Empty;
+    [JsonPropertyName("id")] public long Id { get; set; }
+    [JsonPropertyName("orderId")] public long OrderId { get; set; }
+    [JsonPropertyName("price")] public string Price { get; set; } = "0";
+    [JsonPropertyName("qty")] public string Quantity { get; set; } = "0";
+    [JsonPropertyName("quoteQty")] public string QuoteQuantity { get; set; } = "0";
+    [JsonPropertyName("commission")] public string Commission { get; set; } = "0";
+    [JsonPropertyName("commissionAsset")] public string CommissionAsset { get; set; } = string.Empty;
+    [JsonPropertyName("time")] public long Time { get; set; }
+    [JsonPropertyName("isBuyer")] public bool IsBuyer { get; set; }
+    [JsonPropertyName("isMaker")] public bool IsMaker { get; set; }
 }
 
 public sealed class BinanceTickerPrice
@@ -421,6 +427,7 @@ public sealed class BinanceExecutionReportStream
     [JsonPropertyName("i")] public long OrderId { get; set; }
     [JsonPropertyName("c")] public string ClientOrderId { get; set; } = string.Empty;
     [JsonPropertyName("g")] public long OrderListId { get; set; } = -1;
+    [JsonPropertyName("t")] public long TradeId { get; set; } = -1;
     [JsonPropertyName("x")] public string ExecutionType { get; set; } = string.Empty;
     [JsonPropertyName("X")] public string OrderStatus { get; set; } = string.Empty;
     [JsonPropertyName("l")] public string LastQuantity { get; set; } = "0";
@@ -442,6 +449,7 @@ public sealed class BinanceExecutionReportStream
         OrderId = OrderId,
         ClientOrderId = ClientOrderId,
         OrderListId = OrderListId,
+        TradeId = TradeId,
         ExecutionType = ExecutionType,
         OrderStatus = OrderStatus,
         LastQuantity = ParseDecimal(LastQuantity),

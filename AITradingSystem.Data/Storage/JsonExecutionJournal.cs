@@ -55,8 +55,9 @@ public sealed class JsonExecutionJournal : IExecutionJournal
         }
         catch (Exception ex)
         {
-            // Журнал — не повод ронять торговлю, но потеря записи означает риск дубля: пишем ERROR.
+            // E1/P0.3: write-ahead identity must be durable before submission; fail closed.
             _logger.LogError(ex, "Не удалось записать намерение исполнения {ClientOrderId}", intent.ClientOrderId);
+            throw;
         }
         finally
         {

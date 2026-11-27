@@ -1,6 +1,6 @@
-# E1 ledger — storage contract (step 1)
+# E1 ledger — storage contract + runtime wiring
 
-**Status:** contracts, storage and unexecuted regression tests added. Runtime decision/execution/close paths are **not yet wired**. No builds, compilations or tests were run. This does not close E1 or establish any trading results.
+**Status:** contracts, storage, runtime producers and unexecuted regression tests added. Decision/entry/protection/exit/outcome paths are wired through `E1Runtime`; restart/polling recovery is code-only. No builds, compilations or tests were run. Demo acceptance is still open; this does not establish any trading results.
 
 ## Partition and files
 
@@ -34,4 +34,4 @@ This is a **single-writer** store (the application process). The async gate seri
 
 For `Closed`, gross is calculated from actual average entry/exit prices and **exit quantity**; net is gross minus valued round-trip fees; net R is net divided by the original quote risk. Slippage is diagnostic against an arrival benchmark and is not deducted again from actual-fill gross. Dust is not counted as realized exit quantity. Missing fees, risk, fills, protection resolution or an unresolved reason excludes the outcome from `IsStatisticallyUsable`.
 
-The storage layer checks linked fill ids, roles, evidence, fee totals and arithmetic. Runtime producers must still obtain real exchange trades/fees and persist lifecycle identity before sending orders. Those producers, restart/polling integration and Demo acceptance are subsequent E1 steps.
+The storage layer checks linked fill ids, roles, evidence, fee totals and arithmetic. `E1Runtime` obtains exchange trades/fees from `myTrades` or executionReport trade ids, persists entry identity before submission, records protection identity/resolution, and reconciles restart/polling without creating a second lifecycle outcome. Base-asset fees are valued at the same fill price with conversion evidence; BNB/other non-quote fees remain `Unvalued` until separate conversion evidence exists. Demo acceptance remains open.

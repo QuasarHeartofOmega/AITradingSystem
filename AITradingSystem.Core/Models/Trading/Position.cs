@@ -41,6 +41,14 @@ public sealed class Position : INotifyPropertyChanged
     public string OpeningOrderId { get; set; } = string.Empty;
     public string SignalId { get; set; } = string.Empty;
 
+    /// <summary>E1 lifecycle linkage. Persisted so restart/polling cannot create a second outcome.</summary>
+    public string E1DecisionId { get; set; } = string.Empty;
+    public string E1EntryIntentId { get; set; } = string.Empty;
+    public decimal E1InitialRiskQuote { get; set; }
+    public bool E1ProtectionConfirmed { get; set; }
+    public string E1ProtectionResolution { get; set; } = string.Empty;
+    public List<ProtectiveOrderList> E1ProtectionHistory { get; set; } = new();
+
     /// <summary>
     /// Комиссия входа (уже списана из баланса в момент открытия).
     /// Нужна, чтобы в истории сделок показать полную комиссию round-trip.
@@ -105,6 +113,10 @@ public sealed class Position : INotifyPropertyChanged
     /// <summary>Зафиксировать поставленную/заменённую защитную связку.</summary>
     public void SetProtection(ProtectiveOrderList? protection)
     {
+        if (Protection != null && !ReferenceEquals(Protection, protection)
+            && !E1ProtectionHistory.Any(x => x.ListClientOrderId == Protection.ListClientOrderId
+                && x.OrderListId == Protection.OrderListId))
+            E1ProtectionHistory.Add(Protection);
         Protection = protection;
         UpdatedAt = DateTime.UtcNow;
         OnPropertyChanged(nameof(Protection));

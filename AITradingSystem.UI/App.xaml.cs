@@ -92,6 +92,23 @@ public partial class App : Application
                     services.AddSingleton<IExecutionJournal>(sp =>
                         new JsonExecutionJournal(System.IO.Path.Combine(configPath, "data", "state"), sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<JsonExecutionJournal>>()));
 
+                    // E1: machine-readable decision/fill/outcome ledger, partitioned by environment/source/account.
+                    services.AddSingleton<AITradingSystem.Data.Storage.IE1Ledger>(sp =>
+                    {
+                        var rest = sp.GetRequiredService<IBinanceRestClient>();
+                        var source = config.Trading.PaperTradingMode
+                            ? AITradingSystem.Core.Models.Trading.LedgerSource.Paper
+                            : string.Equals(rest.EnvironmentName, "Live", StringComparison.OrdinalIgnoreCase)
+                                ? AITradingSystem.Core.Models.Trading.LedgerSource.Live
+                                : AITradingSystem.Core.Models.Trading.LedgerSource.Demo;
+                        return new AITradingSystem.Data.Storage.JsonE1Ledger(
+                            System.IO.Path.Combine(configPath, "data"),
+                            rest.EnvironmentName,
+                            AITradingSystem.Services.Trading.E1Runtime.Fingerprint(rest.EnvironmentName, rest.AccountId),
+                            source);
+                    });
+                    services.AddSingleton<AITradingSystem.Services.Trading.E1Runtime>();
+
                     services.AddSingleton<PromptBuilder>();
                     services.AddSingleton<IAIModel, QwenModel>();
                     // P2.6: веса direction-скоринга из AI:ScoringWeights (дефолты = прежние константы);

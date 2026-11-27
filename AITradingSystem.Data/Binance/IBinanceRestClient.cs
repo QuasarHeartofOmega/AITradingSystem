@@ -66,6 +66,9 @@ public interface IBinanceRestClient
     /// </summary>
     Task<List<Order>> GetOpenOrdersAsync(string? symbol = null, CancellationToken ct = default);
 
+    /// <summary>E1: authoritative exchange trade ids and per-trade fees for an order.</summary>
+    Task<List<BinanceMyTrade>> GetMyTradesAsync(string symbol, long? orderId = null, CancellationToken ct = default);
+
     /// <summary>
     /// Разместить MARKET-ордер (гарантированное исполнение, для закрытия позиций).
     /// </summary>

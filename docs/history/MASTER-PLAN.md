@@ -45,7 +45,7 @@
 | `docs/history/LOGGING-PLAN.md` | Аудит и реформа логирования | Часть I, блок I; runtime-приёмка логов в Phase 10 |
 | `docs/history/PLAN-PROFIT-ENGINE.md` | Полный план проверяемого торгового движка E0–E9 | Части II–III, Phases 1–11 |
 | `docs/history/PLAN-PROFIT-ENGINE-ext.md` | Активная редакция по логам 2026-11-26: P0.9/P0.3a/E1 | Часть II; Phases 1–3 |
-| `docs/E1-LEDGER.md` | Контракт E1 ledger, шаг 1 | Phase 2 |
+| `docs/E1-LEDGER.md` | Контракт E1 ledger + runtime wiring | Phase 2 |
 | `docs/LOGGING.md` | Операционная карта каналов/формата/настроек логов | Phase 10, операционные правила |
 | `docs/SETUP-WINDOWS.md` | Сборка/запуск/ключи/GPU/native | Phase 10, операционные правила |
 | `docs/README.md` | Индекс документации | Обновлён: мастер-план указан как основной сводный документ |
@@ -217,7 +217,7 @@
 | `DecisionLedgerRecord` / `FillLedgerRecord` / `OutcomeLedgerRecord` | `[code]` | Machine-readable контракты, source/environment/account, fee valuation, point-in-time features |
 | `IE1Ledger` / `JsonE1Ledger` | `[code]` | JSONL, durable flush, idempotency, immutable final outcomes, fail-closed corruption |
 | `E1LedgerTests` | `[code]` | Регрессионные контракты добавлены, не запускались |
-| Runtime producers | `[todo]` | Decision/entry/protection/exit/outcome ещё не подключены |
+| Runtime producers | `[code]` | Decision/entry/protection/exit/outcome подключены к `E1Runtime`; рестарт/polling recovery добавлен |
 | Demo acceptance | `[accept]` | Restart/polling/fees/net R не подтверждены |
 
 ---
@@ -333,30 +333,30 @@ decision_id → entry_intent_id → entry_fill(s)
 
 ### 2.2 Шаг 2 — runtime decision/entry wiring
 
-- `[todo]` Подключить `IE1Ledger` в DI/runtime.
-- `[todo]` Каждый финальный gate decision получает `decision_id`, `run_id`, stage, reason_code, features, gate versions.
-- `[todo]` Все ранние return пишут причину: cooldown, max positions, no-book, warmup, market-data, risk, confidence, liquidity, kill-switch.
-- `[todo]` HOLD/NO_FILL не считаются сделками.
-- `[todo]` Entry intent создаётся до отправки и связан с decision.
-- `[todo]` Demo/Paper/Shadow/Live source не смешивается.
+- `[code]` `IE1Ledger` подключён в DI/runtime через `E1Runtime`.
+- `[code]` Каждый финальный gate decision получает `decision_id`, `run_id`, stage, reason_code, features, gate versions.
+- `[code]` Ранние return пишут причину: cooldown, max positions, no-book, warmup, market-data, risk, confidence, liquidity, kill-switch.
+- `[code]` HOLD/NO_FILL не считаются сделками.
+- `[code]` Entry intent создаётся до отправки и связан с decision; write-ahead journal fail-closed.
+- `[code]` Demo/Paper/Live source не смешивается; Shadow не создаёт fills.
 
 ### 2.3 Шаг 3 — fills/protection wiring
 
-- `[todo]` Entry/exit/protective fills пишутся как deltas, не cumulative duplicates.
-- `[todo]` ExchangeTrade evidence требует реальный exchange trade id и fee.
-- `[todo]` OrderCumulativeDelta не выдаётся за myTrades.
-- `[todo]` Fee в base/BNB конвертируется с evidence или остаётся Unvalued.
-- `[todo]` Protection identity/resolution связан с fills и outcome.
-- `[todo]` Balance delta не заменяет fee ledger.
+- `[code]` Entry/exit/protective fills пишутся как deltas, не cumulative duplicates.
+- `[code]` ExchangeTrade evidence требует реальный exchange trade id и fee (`myTrades` / executionReport trade id).
+- `[code]` OrderCumulativeDelta не выдаётся за myTrades.
+- `[code]` Fee в base конвертируется по цене того же филла с evidence; BNB/прочее остаётся Unvalued до отдельного conversion evidence.
+- `[code]` Protection identity/resolution связан с fills и outcome.
+- `[code]` Balance delta не заменяет fee ledger.
 
 ### 2.4 Шаг 4 — outcomes/restart/polling
 
-- `[todo]` Один финальный outcome на position lifecycle.
-- `[todo]` NoFill outcome на entry intent без fills.
-- `[todo]` Unresolved outcome может финализироваться один раз.
-- `[todo]` Restart/polling не создаёт второй outcome и не применяет fee дважды.
-- `[todo]` Dust отделён от realized exit quantity.
-- `[todo]` Net R считается от initial quote risk и actual fills/fees.
+- `[code]` Один финальный outcome на position lifecycle.
+- `[code]` NoFill outcome на entry intent без fills.
+- `[code]` Unresolved outcome может финализироваться один раз.
+- `[code]` Restart/polling recovery переиспользует lifecycle/intent ids и дедуплицирует fills/fees.
+- `[code]` Dust отделён от realized exit quantity.
+- `[code]` Net R считается от initial quote risk и actual fills/fees.
 
 ### 2.5 Шаг 5 — E1 acceptance
 
@@ -730,7 +730,7 @@ LLM вне критического пути; её польза измерена
 1. **Phase 1 / P0.9 runtime:** восстановить фактический DOGE exit через Demo order/trade history; не отправлять новые ордера в рамках аудита.
 2. **Phase 1 / P0.9 acceptance:** проверить resolver и регрессию гонки на Demo SL/TP/partial/restart.
 3. **Phase 1 / P0.3a acceptance:** собрать per-stream диагностику ENJ/DASH и подтвердить isolation/backoff.
-4. **Phase 2 / E1 step 2:** подключить runtime decision/entry-intent wiring к `IE1Ledger`.
-5. **Phase 2 / E1 steps 3–5:** fills/protection/outcomes/restart/polling acceptance.
+4. **Phase 2 / E1 acceptance:** Demo-приёмка decision/fill/protection/outcome цепочки, restart/polling, fees/net R.
+5. **Phase 3 / E0:** повторить Demo infrastructure acceptance.
 6. **Phase 3 / E0:** повторить Demo infrastructure acceptance.
 7. **Phase 4–11:** статистика, EdgeGate, события, LLM-роли, исполнение, капитал, надёжность, Live ramp-up.
