@@ -113,6 +113,15 @@ yyyy-MM-dd HH:mm:ss.fff zzz [LVL] [канал] Источник: EVENT-CODE key=
 | `RECON-SKIP-ACTIVE-ENTRY`, `RECON-EXPIRE-ENTRY` | Защита активного входа от преждевременной отмены. |
 | `EXECUTION-MODE`, `EXECUTION-STATE-BLOCKED`, `USER-DATA-*` | Режим исполнения и user-data stream. |
 | `PROTECTION-FILL-APPLIED`, `EXCHANGE-FILL-APPLIED` | Применение филла без повторного MARKET. |
+| `EXTERNAL-POSITION-DETECTED` | Phase 1.7: найден external/ручной остаток по символу реестра. Пишется объём, notional, предложенный вход, `basis` и режим (`Off` — только алерт, `Confirm` — ждёт согласия, `Auto` — подхватывается). Троттлинг 5 мин на символ. |
+| `EXTERNAL-DUST` | Phase 1.7: external-остаток ниже `minQty`/`minNotional`/`stepSize` или без цены — виден как остаток, но подхват/ордер запрещены. |
+| `EXTERNAL-ADOPTED` | Phase 1.7: остаток подхвачен (оператором в `Confirm` или автоматически в `Auto`); указаны `lifecycle`, `source`, объём, цена входа и `basis`. |
+| `EXTERNAL-BALANCE-DELTA` | Phase 1.7: биржевой total изменился сверх изменения доли бота — ручная докупка/продажа; `observed`/`exchange`/`delta`. |
+| `EXTERNAL-MANUAL-EXIT` | Phase 1.7: ручная продажа применена к позиции (`ExternalManualExit`), без повторного sell-order; partial пишет остаток и разделение external/bot. |
+| `EXTERNAL-PROTECTION-FAILED` | Phase 1.7: OCO для external/Mixed-позиции не встала, политика `AlertNotSell` — автоматической продажи чужого актива нет, нужен оператор. |
+| `EXTERNAL-RELEASED` | Phase 1.7: оператор забрал остаток себе (Release) — защита бота снята, продажи не было, kill-switch остаток не закроет. |
+| `EXTERNAL-KILLSWITCH` | Phase 1.7: при взведении kill-switch — сколько external-долей закрывается вместе с ботом (`adopted_external`) и сколько остаётся у оператора (`unadopted`). |
+| `EXTERNAL-RECON-FAIL` | Phase 1.7: круг external-реконсиляции упал; входы по символу это не разблокирует, остаток остаётся непареным. |
 
 ### Exchange
 

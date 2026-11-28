@@ -32,6 +32,14 @@ public partial class TradingViewModel : ObservableObject
 	[ObservableProperty]
 	private string _lastSignalText = "Ожидание сигнала...";
 
+	/// <summary>Phase 1.7: ручные/external остатки по символам реестра, ещё не подхваченные ботом.</summary>
+	[ObservableProperty]
+	private ObservableCollection<ExternalCandidateRow> _externalCandidates = new();
+
+	/// <summary>Phase 1.7: сводка по external-остаткам и режиму подхвата.</summary>
+	[ObservableProperty]
+	private string _externalStatusText = "External-позиции: режим ещё не опрошен";
+
 	/// <summary>P0.6: статус панического закрытия под кнопкой.</summary>
 	[ObservableProperty]
 	private string _panicStatusText = string.Empty;
@@ -49,6 +57,7 @@ public partial class TradingViewModel : ObservableObject
 		_logger = logger;
 		_account = account;
 		UpdateAccount();
+		RefreshExternalCandidates();
 
 		// Загрузка начальных данных
 		foreach (var pos in _positionManager.GetOpenPositions())
@@ -120,12 +129,96 @@ public partial class TradingViewModel : ObservableObject
 			(string.IsNullOrEmpty(_account.LastError) ? string.Empty : " · " + _account.LastError);
 	}
 
+	/// <summary>Phase 1.7: перечитать кандидатов из движка (событие или обновление аккаунта).</summary>
+	public void RefreshExternalCandidates()
+	{
+		var manual = ExternalCandidates.ToDictionary(r => r.Symbol, r => r.ManualEntryPrice, StringComparer.OrdinalIgnoreCase);
+		ExternalCandidates.Clear();
+		foreach (var candidate in _engine.ExternalCandidates.OrderBy(c => c.Symbol, StringComparer.OrdinalIgnoreCase))
+		{
+			var row = new ExternalCandidateRow(candidate);
+			if (manual.TryGetValue(candidate.Symbol, out var typed)) row.ManualEntryPrice = typed;
+			ExternalCandidates.Add(row);
+		}
+		var unadopted = _engine.UnadoptedExternalCount;
+		ExternalStatusText = $"Режим подхвата: {_engine.ExternalAdoptionMode}. Не подхвачено остатков: {unadopted}." +
+			(unadopted > 0
+				? " Они уже учтены в exposure/MaxOpenPositions, но бот их не сопровождает и kill-switch их НЕ закроет."
+				: " Неподхваченных external-остатков нет.") +
+			" Подхват = согласие сопровождать и защищать объём; kill-switch закроет и подхваченную external-долю.";
+	}
+
+	/// <summary>Phase 1.7: согласие оператора на подхват (Confirm) с необязательной ручной ценой входа.</summary>
+	[RelayCommand]
+	private async Task AdoptExternalAsync(ExternalCandidateRow? row)
+	{
+		if (row == null) return;
+		if (!row.TryGetEntryOverride(out var entryOverride))
+		{
+			MessageBox.Show("Цена входа должна быть положительным числом (или пустое поле — использовать предложенную).",
+				"Некорректный ввод", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+
+		var confirm = MessageBox.Show(
+			$"Подхватить {row.Symbol}: {row.ExternalQuantity:0.########} (≈{row.NotionalQuote:0.##} USDT)?\n\n" +
+			$"Предлагаемый вход: {row.ProposedEntryPrice:0.##########} ({row.EntryBasis})\n" +
+			(entryOverride.HasValue ? $"Ручной вход оператора: {entryOverride.Value:0.##########}\n" : string.Empty) +
+			$"SL/TP будут рассчитаны движком от ATR; OCO ставится только на свободный объём.\n" +
+			$"{row.EntryWarning}\n\n" +
+			"После подхвата позиция входит в риск-учёт, и kill-switch/ПАНИКА закроет и её.\n" +
+			"Внешние ордера по символу не отменяются.",
+			"Подхват external-позиции", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+		if (confirm != MessageBoxResult.Yes) return;
+
+		try
+		{
+			var ok = await _engine.AdoptExternalPositionAsync(row.Symbol, entryOverride);
+			ExternalStatusText = ok
+				? $"{row.Symbol}: external-остаток подхвачен, защита ставится."
+				: $"{row.Symbol}: подхват не выполнен (кандидат устарел, kill-switch или отказ защиты — см. лог).";
+			RefreshExternalCandidates();
+		}
+		catch (Exception ex)
+		{
+			_logger.LogError(ex, "Ошибка подхвата external-позиции {Symbol}", row.Symbol);
+			MessageBox.Show($"Не удалось подхватить позицию: {ex.Message}", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+		}
+	}
+
+	/// <summary>Phase 1.7: Release — оператор забирает остаток себе; бот снимает свою защиту и не продаёт.</summary>
+	[RelayCommand]
+	private async Task ReleaseExternalAsync(string? symbol)
+	{
+		if (string.IsNullOrWhiteSpace(symbol)) return;
+		var confirm = MessageBox.Show(
+			$"Отпустить {symbol}?\n\nБот снимет свою OCO-защиту (если стоит) и уберёт позицию из учёта БЕЗ продажи.\n" +
+			"Остаток останется на бирже без сопровождения; kill-switch его не закроет.\n" +
+			"Новые покупки сверх отпущенного объёма снова станут кандидатами.",
+			"Release external-позиции", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+		if (confirm != MessageBoxResult.Yes) return;
+
+		try
+		{
+			var ok = await _engine.ReleaseExternalPositionAsync(symbol);
+			ExternalStatusText = ok
+				? $"{symbol}: остаток отпущен оператору, защита бота снята, продажи не было."
+				: $"{symbol}: Release не выполнен (не удалось снять защиту — позиция осталась под сопровождением).";
+			RefreshExternalCandidates();
+		}
+		catch (Exception ex)
+		{
+			_logger.LogError(ex, "Ошибка Release external-позиции {Symbol}", symbol);
+			MessageBox.Show($"Не удалось отпустить позицию: {ex.Message}", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+		}
+	}
+
 	private bool CanRefreshAccount() => !IsRefreshingAccount;
 	[RelayCommand(CanExecute = nameof(CanRefreshAccount))]
 	private async Task RefreshAccountAsync()
 	{
 		IsRefreshingAccount = true;
-		try { await _account.RefreshAsync(); UpdateAccount(); }
+		try { await _account.RefreshAsync(); UpdateAccount(); RefreshExternalCandidates(); }
 		catch (Exception ex) { AccountStatusText = "Ошибка обновления: " + ex.Message; }
 		finally { IsRefreshingAccount = false; }
 	}
@@ -171,7 +264,9 @@ public partial class TradingViewModel : ObservableObject
 	{
 		var confirm = MessageBox.Show(
 			"ЗАКРЫТЬ ВСЕ ПОЗИЦИИ по рынку и заблокировать новые входы?\n\n" +
-			"Действие отправит реальные MARKET-ордера в выбранном окружении.",
+			"Действие отправит реальные MARKET-ордера в выбранном окружении.\n\n" +
+			"Подхваченные external/Mixed-позиции (Source=External/Mixed) будут закрыты тоже.\n" +
+			"Неподхваченные остатки и отпущенные через Release — НЕ закрываются.",
 			"ПАНИКА — закрытие всех позиций", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 		if (confirm != MessageBoxResult.Yes) return;
 

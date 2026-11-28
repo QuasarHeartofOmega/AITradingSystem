@@ -109,6 +109,14 @@ public partial class App : Application
                     });
                     services.AddSingleton<AITradingSystem.Services.Trading.E1Runtime>();
 
+                    // Phase 1.7 (Blocker 7): durable-леджер external-решений (Release/базовые объёмы)
+                    // и сервис детекта/подхвата ручных позиций. Тот же каталог data, что и остальные журналы.
+                    services.AddSingleton<JsonExternalPositionLedger>(sp =>
+                        new JsonExternalPositionLedger(
+                            System.IO.Path.Combine(configPath, "data", "state"),
+                            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<JsonExternalPositionLedger>>()));
+                    services.AddSingleton<ExternalPositionService>();
+
                     services.AddSingleton<PromptBuilder>();
                     services.AddSingleton<IAIModel, QwenModel>();
                     // P2.6: веса direction-скоринга из AI:ScoringWeights (дефолты = прежние константы);

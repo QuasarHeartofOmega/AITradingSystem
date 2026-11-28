@@ -23,15 +23,46 @@
         <DataGrid ItemsSource="{Binding OpenPositions}" AutoGenerateColumns="False" IsReadOnly="True" MaxHeight="230" Margin="0,0,0,15">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Символ" Binding="{Binding Symbol}" Width="100"/>
+                <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="80"/>
+                <DataGridTextColumn Header="Entry basis" Binding="{Binding EntryBasis}" Width="140"/>
                 <DataGridTextColumn Header="Сторона" Binding="{Binding Side}" Width="70"/>
                 <DataGridTextColumn Header="Количество" Binding="{Binding Quantity, StringFormat={}{0:0.########}}" Width="130"/>
+                <DataGridTextColumn Header="External доля" Binding="{Binding ExternalQuantity, StringFormat={}{0:0.########}}" Width="120"/>
                 <DataGridTextColumn Header="Вход" Binding="{Binding EntryPrice, StringFormat={}{0:0.##########}}" Width="130"/>
                 <DataGridTextColumn Header="Текущая" Binding="{Binding CurrentPrice, StringFormat={}{0:0.##########}}" Width="130"/>
                 <DataGridTextColumn Header="PnL" Binding="{Binding UnrealizedPnL, StringFormat={}{0:0.##}}" Width="90"/>
                 <DataGridTextColumn Header="Обновлено UTC" Binding="{Binding UpdatedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="150"/>
                 <DataGridTextColumn Header="Статус" Binding="{Binding DustReviewReason}" Width="220"/>
-                <DataGridTemplateColumn Header="Действие" Width="100"><DataGridTemplateColumn.CellTemplate><DataTemplate>
-                    <Button Content="Закрыть" Command="{Binding DataContext.ClosePositionCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}"/>
+                <DataGridTemplateColumn Header="Действие" Width="190"><DataGridTemplateColumn.CellTemplate><DataTemplate>
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="Закрыть" Margin="0,0,6,0" Command="{Binding DataContext.ClosePositionCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}"/>
+                        <Button Content="Release" ToolTip="Phase 1.7: забрать остаток себе — снять защиту бота без продажи"
+                                Command="{Binding DataContext.ReleaseExternalCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding Symbol}"/>
+                    </StackPanel>
+                </DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
+            </DataGrid.Columns>
+        </DataGrid>
+        <TextBlock Text="External / ручные позиции (Phase 1.7)" FontSize="18" FontWeight="Bold" Margin="0,0,0,6"/>
+        <TextBlock Text="{Binding ExternalStatusText}" Foreground="#FFC107" TextWrapping="Wrap" Margin="0,0,0,8"/>
+        <DataGrid ItemsSource="{Binding ExternalCandidates}" AutoGenerateColumns="False" IsReadOnly="False" MaxHeight="220" Margin="0,0,0,15">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Символ" Binding="{Binding Symbol}" Width="100" IsReadOnly="True"/>
+                <DataGridTextColumn Header="External объём" Binding="{Binding ExternalQuantity, StringFormat={}{0:0.########}}" Width="130" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Объём бота" Binding="{Binding BotQuantity, StringFormat={}{0:0.########}}" Width="120" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Оценка USDT" Binding="{Binding NotionalQuote, StringFormat={}{0:0.##}}" Width="120" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Предлож. вход" Binding="{Binding ProposedEntryPrice, StringFormat={}{0:0.##########}}" Width="130" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Предлож. SL" Binding="{Binding ProposedStopLoss, StringFormat={}{0:0.##########}}" Width="130" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Предлож. TP" Binding="{Binding ProposedTakeProfit, StringFormat={}{0:0.##########}}" Width="130" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Основа входа" Binding="{Binding EntryBasis}" Width="150" IsReadOnly="True"/>
+                <DataGridTextColumn Header="Ручной вход" Binding="{Binding ManualEntryPrice, UpdateSourceTrigger=PropertyChanged}" Width="120"/>
+                <DataGridTextColumn Header="Статус" Binding="{Binding Status}" Width="170" IsReadOnly="True"/>
+                <DataGridTemplateColumn Header="Действие" Width="140"><DataGridTemplateColumn.CellTemplate><DataTemplate>
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="Подхватить" Margin="0,0,6,0" ToolTip="Согласие оператора: сопровождать и защищать объём; kill-switch закроет и его"
+                                Command="{Binding DataContext.AdoptExternalCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}"/>
+                        <Button Content="Release" ToolTip="Оставить себе: бот не сопровождает и не продаёт"
+                                Command="{Binding DataContext.ReleaseExternalCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding Symbol}"/>
+                    </StackPanel>
                 </DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
             </DataGrid.Columns>
         </DataGrid>

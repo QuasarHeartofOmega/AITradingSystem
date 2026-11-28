@@ -35,6 +35,9 @@ public sealed class ExternalPositionService
     private readonly JsonExternalPositionLedger _ledger;
     private readonly ILogger<ExternalPositionService> _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    // Отдельный шлюз инициализации: ObserveAsync вызывается в том числе изнутри ReconcileAsync,
+    // который уже держит _gate — повторный вход в тот же семафор дал бы дедлок.
+    private readonly SemaphoreSlim _initGate = new(1, 1);
     private readonly ConcurrentDictionary<string, ExternalPositionCandidate> _candidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _lastAlertUtc = new(StringComparer.OrdinalIgnoreCase);
     private ExternalPositionLedgerState _state = new();
@@ -79,13 +82,15 @@ public sealed class ExternalPositionService
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
-        await _gate.WaitAsync(ct);
+        if (_initialized) return;
+        await _initGate.WaitAsync(ct);
         try
         {
+            if (_initialized) return;
             _state = await _ledger.LoadAsync(ct);
             _initialized = true;
         }
-        finally { _gate.Release(); }
+        finally { _initGate.Release(); }
     }
 
     /// <summary>
@@ -138,7 +143,7 @@ public sealed class ExternalPositionService
             if (externalQty < minQty || externalQty <= 0m || price <= 0m || externalQty * price < minNotional)
             {
                 // Ниже фильтров/dust или без цены — видно как остаток, но не кандидат на ордер.
-                if (externalQty > 0m && !IsAlertSuppressed(symbol))
+                if (externalQty > 0m && !IsAlertSuppressed("dust:" + symbol))
                     TradeLog.Warn("EXTERNAL-DUST", symbol,
                         $"external_qty={LogOptions.N(externalQty)} price={LogOptions.N(price)} minQty={LogOptions.N(minQty)} minNotional={LogOptions.N(minNotional)} — ниже порогов, подхват/ордер запрещены");
                 _candidates.TryRemove(symbol, out _);
@@ -191,6 +196,7 @@ public sealed class ExternalPositionService
     public async Task ReconcileAsync(AccountBalance balance, IReadOnlyDictionary<string, decimal> prices, CancellationToken ct = default)
     {
         if (_config.PaperTradingMode || !_rest.HasApiKeys) return;
+        if (!_initialized) await InitializeAsync(ct);
         await _gate.WaitAsync(ct);
         try
         {
@@ -203,22 +209,39 @@ public sealed class ExternalPositionService
                 if (!SymbolNaming.TrySplit(position.Symbol, _config.QuoteAssets, out var baseAsset, out _)) continue;
                 if (!balance.Assets.TryGetValue(baseAsset, out var asset)) continue;
                 var price = prices.TryGetValue(position.Symbol, out var p) && p > 0m ? p : position.CurrentPrice;
-                if (position.ExternalObservedTotal <= 0m)
+                var botQty = position.BotQuantity;
+                if (position.ExternalObservedTotal <= 0m || position.ExternalObservedBotQuantity < 0m)
                 {
                     // Legacy/бот-позиция без baseline: первый снимок фиксируем без delta, иначе фантомная докупка.
                     position.ExternalObservedTotal = asset.Total;
+                    position.ExternalObservedBotQuantity = botQty;
                     await _positions.SavePositionsAsync(ct);
                     continue;
                 }
-                var delta = asset.Total - position.ExternalObservedTotal;
+                // Собственные филлы бота меняют total так же, как ручные. Вычитаем изменение доли бота:
+                // остаток — то, что сделал оператор (или другой бот) на бирже.
+                var totalDelta = asset.Total - position.ExternalObservedTotal;
+                var botDelta = botQty - position.ExternalObservedBotQuantity;
+                var delta = totalDelta - botDelta;
                 var info = await _rest.GetSymbolInfoAsync(position.Symbol, ct);
                 var step = info?.StepSize ?? 0m;
-                if (Math.Abs(delta) <= step || Math.Abs(delta) < 0.00000001m) continue;
+                if (Math.Abs(delta) <= step || Math.Abs(delta) < 0.00000001m)
+                {
+                    // Нечего применять, но baseline обязан следовать за филлами бота.
+                    if (botDelta != 0m || totalDelta != 0m)
+                    {
+                        position.ExternalObservedTotal = asset.Total;
+                        position.ExternalObservedBotQuantity = botQty;
+                        await _positions.SavePositionsAsync(ct);
+                    }
+                    continue;
+                }
                 if (_applyDelta != null)
                 {
                     TradeLog.Info("EXTERNAL-BALANCE-DELTA", position.Symbol,
                         $"lifecycle={position.Id} observed={LogOptions.N(position.ExternalObservedTotal)} exchange={LogOptions.N(asset.Total)} delta={LogOptions.N(delta)}");
                     await _applyDelta(position, delta, price, ct);
+                    // Baseline обновляет движок под посимвольным шлюзом (applyDelta).
                 }
             }
 
@@ -230,7 +253,7 @@ public sealed class ExternalPositionService
                     await _adopt(candidate, null, ct);
                     _candidates.TryRemove(candidate.Symbol, out _);
                 }
-                else if (!IsAlertSuppressed(candidate.Symbol))
+                else if (!IsAlertSuppressed("detect:" + candidate.Symbol))
                 {
                     TradeLog.Warn("EXTERNAL-POSITION-DETECTED", candidate.Symbol,
                         $"qty={LogOptions.N(candidate.ExternalQuantity)} notional={LogOptions.N(candidate.ExternalNotionalQuote)} " +
@@ -277,6 +300,8 @@ public sealed class ExternalPositionService
             {
                 if (_release == null) return false;
                 if (!await _release(position, ct)) return false;
+                // Отпускаем весь наблюдавшийся остаток символа (доля бота тоже переходит оператору):
+                // lifecycle снимается целиком, иначе хвост вернулся бы кандидатом на следующем круге.
                 releasedTotal = position.ExternalObservedTotal > 0m ? position.ExternalObservedTotal : position.Quantity;
             }
             else
@@ -336,11 +361,12 @@ public sealed class ExternalPositionService
         return (markPrice, "mark-price-estimate", $"mark-price fallback at {now:O}; myTrades unavailable/empty in {_config.ExternalAdoptionLookbackHours}h", null);
     }
 
-    private bool IsAlertSuppressed(string symbol)
+    /// <summary>Троттлинг алертов на ключ (символ+код). Побочный эффект — только при фактическом алерте.</summary>
+    private bool IsAlertSuppressed(string key)
     {
         var now = DateTime.UtcNow;
-        if (_lastAlertUtc.TryGetValue(symbol, out var last) && now - last < TimeSpan.FromMinutes(5)) return true;
-        _lastAlertUtc[symbol] = now;
+        if (_lastAlertUtc.TryGetValue(key, out var last) && now - last < TimeSpan.FromMinutes(5)) return true;
+        _lastAlertUtc[key] = now;
         return false;
     }
 

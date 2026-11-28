@@ -79,6 +79,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _engine.OnStatusChanged += OnStatusChanged;
         _engine.OnSignalGenerated += signal => RunOnUiThread(() => Trading.AddSignal(signal));
         _engine.OnPositionOpened += pos => RunOnUiThread(() => Trading.AddPosition(pos));
+        // Phase 1.7: Release убирает строку без записи о продаже; список кандидатов перечитывается по событию.
+        _engine.OnPositionReleased += symbol => RunOnUiThread(() =>
+        {
+            Trading.RemovePosition(symbol);
+            Trading.RefreshExternalCandidates();
+        });
+        _engine.OnExternalCandidatesChanged += () => RunOnUiThread(() => Trading.RefreshExternalCandidates());
         _engine.OnKillSwitchEngaged += reason => RunOnUiThread(() =>
         {
             Trading.PanicStatusText = $"Kill-switch взведён ({reason}): новые входы заблокированы.";
@@ -127,6 +134,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             AccountBanner += $" KILL-SWITCH: новые входы заблокированы ({_engine.KillSwitchReason}; {_engine.KillSwitchCloseStatus}).";
         if (!_account.HasApiKeys) AccountBanner += " API-ключи не заданы: балансы недоступны.";
         if (_engine.UnavailableSymbols.Count > 0) AccountBanner += " Недоступные пары: " + string.Join(", ", _engine.UnavailableSymbols) + ".";
+        if (_engine.UnadoptedExternalCount > 0)
+            AccountBanner += $" External-остатки без сопровождения: {_engine.UnadoptedExternalCount} (вкладка «Торговля» → подхватить или Release).";
     }
     public void Dispose()
     {

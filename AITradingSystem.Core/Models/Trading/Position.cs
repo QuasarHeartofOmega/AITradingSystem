@@ -58,6 +58,11 @@ public sealed class Position : INotifyPropertyChanged
     /// Нужен для balance-delta recon: ручная докупка/продажа меняет total, а не только free.</summary>
     public decimal ExternalObservedTotal { get; set; }
 
+    /// <summary>Phase 1.7: доля бота на момент последнего наблюдения баланса.
+    /// Нужна, чтобы собственные филлы бота не выглядели как ручная докупка/продажа:
+    /// external-delta = Δtotal − Δbot. Отрицательное значение = baseline ещё не снят.</summary>
+    public decimal ExternalObservedBotQuantity { get; set; } = -1m;
+
     /// <summary>Phase 1.7: evidence реконструкции external entry (trade ids / окно / fallback).</summary>
     public string ExternalEntryEvidence { get; set; } = string.Empty;
 
@@ -180,6 +185,19 @@ public sealed class Position : INotifyPropertyChanged
         if (quantity <= 0m) return;
         EnsureLifetimeBaseline();
         LifetimeBoughtQuantity += quantity;
+        UpdatedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Phase 1.7: зарегистрировать продажу, которую оператор сделал на бирже мимо бота.
+    /// Lifetime-база должна увидеть этот расход, иначе следующий выход бота посчитает
+    /// уже проданный объём доступным (oversell).
+    /// </summary>
+    public void RegisterExitQuantity(decimal quantity)
+    {
+        if (quantity <= 0m) return;
+        EnsureLifetimeBaseline();
+        LifetimeSoldQuantity += quantity;
         UpdatedAt = DateTime.UtcNow;
     }
 

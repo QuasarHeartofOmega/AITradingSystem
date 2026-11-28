@@ -313,11 +313,18 @@ public sealed class PositionMonitor : IAsyncDisposable
                     {
                         await _positionManager.SavePositionsAsync(ct);
                     }
-                    else if (FailClosedWithoutProtection)
+                    else if (FailClosedWithoutProtection && !ExternalAlertNotSell(position))
                     {
                         TradeLog.Rejected(position.Symbol, "protection",
                             "OCO не поставлена: закрываем позицию, чтобы капитал не зависел от живого процесса");
                         closeReason = "NoExchangeProtection";
+                    }
+                    else if (ExternalAlertNotSell(position))
+                    {
+                        // Phase 1.7: чужой актив не продаётся автоматически при отказе OCO.
+                        TradeLog.Warn("EXTERNAL-PROTECTION-FAILED", position.Symbol,
+                            $"lifecycle={position.Id} OCO не поставлена; policy=AlertNotSell — автоматической продажи нет, нужен оператор",
+                            gateKey: "external-protection-failed:" + position.Symbol);
                     }
                     else
                     {
@@ -395,6 +402,11 @@ public sealed class PositionMonitor : IAsyncDisposable
         // Персистим сразу: подтянутый стоп и id ног должны пережить рестарт (NFR-2.2).
         await _positionManager.SavePositionsAsync(ct);
     }
+
+    /// <summary>Phase 1.7: у external/Mixed-доли действует отдельная политика отказа защиты.</summary>
+    private bool ExternalAlertNotSell(Position position) =>
+        position.HasExternalOwnership &&
+        _config.ExternalProtectionFailurePolicy == ExternalProtectionFailurePolicy.AlertNotSell;
 
     private bool FailClosedWithoutProtection =>
         _config.ClosePositionIfProtectionFails &&

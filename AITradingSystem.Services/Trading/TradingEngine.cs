@@ -248,8 +248,9 @@ public sealed class TradingEngine : IAsyncDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager, _externalPositions);
         _externalPositions.Configure(
-            AdoptExternalCandidateAsync, ApplyExternalBalanceDeltaAsync, ReleaseExternalPositionAsync,
+            AdoptExternalCandidateAsync, ApplyExternalBalanceDeltaAsync, ReleaseExternalPositionCoreAsync,
             symbol => GetAtrAbsolute(symbol));
+        _externalPositions.CandidatesChanged += () => OnExternalCandidatesChanged?.Invoke();
 
         if (!CandleSchedule.TryParseInterval(_config.Trading.CandleInterval, out _candleInterval))
             throw new InvalidOperationException($"Недопустимый интервал свечей: {_config.Trading.CandleInterval}");
@@ -2246,6 +2247,14 @@ public sealed class TradingEngine : IAsyncDisposable
     {
         using (await _positionMonitor.LockSymbolAsync(orphan.Symbol, ct))
         {
+            await AdoptOrphanPositionLockedAsync(orphan, ct);
+        }
+    }
+
+    /// <summary>Тело подхвата сиротской/external позиции. Вызывать ТОЛЬКО под посимвольным шлюзом.</summary>
+    private async Task AdoptOrphanPositionLockedAsync(Position orphan, CancellationToken ct)
+    {
+        {
             if (_positionManager.GetPositionBySymbol(orphan.Symbol) != null) return;
 
             var atr = GetAtrAbsolute(orphan.Symbol) ?? orphan.EntryPrice * 0.02m;
@@ -2296,9 +2305,16 @@ public sealed class TradingEngine : IAsyncDisposable
             var entry = entryOverride ?? candidate.ProposedEntryPrice;
             if (entry <= 0m) return false;
             var basis = entryOverride.HasValue ? "manual" : candidate.EntryBasis;
+            if (IsKillSwitchEngaged)
+            {
+                TradeLog.Rejected(candidate.Symbol, "external-adopt",
+                    "kill-switch взведён — подхват external-позиции запрещён до ручного сброса");
+                return false;
+            }
             var existing = _positionManager.GetPositionBySymbol(candidate.Symbol);
             if (existing != null)
             {
+                if (IsLifecycleClosed(existing.Id)) return false;
                 await MergeExternalIntoPositionAsync(existing, candidate.ExternalQuantity, entry, basis,
                     candidate.EntryEvidence, candidate.ExchangeTotalQuantity, ct);
                 return true;
@@ -2317,14 +2333,21 @@ public sealed class TradingEngine : IAsyncDisposable
                 ExternalQuantity = candidate.ExternalQuantity,
                 ExternalEntryPrice = entry,
                 ExternalObservedTotal = candidate.ExchangeTotalQuantity,
+                // Бот не владеет ничем в этом lifecycle: весь объём — external-доля.
+                ExternalObservedBotQuantity = 0m,
                 ExternalEntryEvidence = candidate.EntryEvidence,
                 LifetimeBoughtQuantity = candidate.ExternalQuantity,
                 ConfidenceSource = basis,
                 SignalId = "external-adoption"
             };
-            await AdoptOrphanPositionAsync(orphan, ct);
-            await RefreshAccountSnapshotAsync(ct, reconcileExternal: false);
-            return _positionManager.GetPositionById(orphan.Id) != null || IsLifecycleClosed(orphan.Id);
+            // Шлюз символа уже взят выше: AdoptOrphanPositionAsync берёт его сам → зовём его
+            // без повторного входа, иначе не-реентерабельный семафор заблокировал бы контур навсегда.
+            await AdoptOrphanPositionLockedAsync(orphan, ct);
+            var adopted = _positionManager.GetPositionById(orphan.Id) != null;
+            if (adopted)
+                TradeLog.Warn("EXTERNAL-ADOPTED", orphan.Symbol,
+                    $"lifecycle={orphan.Id} source={orphan.Source} qty={LogOptions.N(orphan.Quantity)} entry={LogOptions.N(entry)} basis={basis} mode={_config.Trading.AdoptExternalPositions}");
+            return adopted || IsLifecycleClosed(orphan.Id);
         }
     }
 
@@ -2348,6 +2371,7 @@ public sealed class TradingEngine : IAsyncDisposable
         position.EntryBasis = position.EntryBasis == basis ? basis : "mixed";
         position.ConfidenceSource = position.EntryBasis;
         position.ExternalObservedTotal = exchangeTotal;
+        position.ExternalObservedBotQuantity = position.BotQuantity;
         position.ExternalEntryEvidence = evidence;
         position.CurrentPrice = position.CurrentPrice > 0m ? position.CurrentPrice : entryPrice;
 
@@ -2377,8 +2401,9 @@ public sealed class TradingEngine : IAsyncDisposable
             var price = markPrice > 0m ? markPrice : live.CurrentPrice;
             if (delta > 0m)
             {
-                var basis = live.HasExternalOwnership ? "balance-delta-estimate" : "balance-delta-estimate";
-                await MergeExternalIntoPositionAsync(live, delta, price, basis,
+                // Ручная докупка не проходит через гейты входа: она уже состоялась на бирже.
+                // Подхват доли обязателен для учёта/защиты, но новых ордеров на покупку не отправляем.
+                await MergeExternalIntoPositionAsync(live, delta, price, "balance-delta-estimate",
                     $"balance-delta +{LogOptions.N(delta)} at {DateTime.UtcNow:O}", live.ExternalObservedTotal + delta, ct);
                 return;
             }
@@ -2387,6 +2412,7 @@ public sealed class TradingEngine : IAsyncDisposable
             if (sold <= 0m)
             {
                 live.ExternalObservedTotal = Math.Max(0m, live.ExternalObservedTotal + delta);
+                live.ExternalObservedBotQuantity = live.BotQuantity;
                 await _positionManager.SavePositionsAsync(ct);
                 return;
             }
@@ -2416,6 +2442,7 @@ public sealed class TradingEngine : IAsyncDisposable
             live.RegisterExitQuantity(sold);
             live.ReduceQuantity(sold);
             live.ExternalObservedTotal = Math.Max(0m, live.ExternalObservedTotal - sold);
+            live.ExternalObservedBotQuantity = live.BotQuantity;
             if (live.Source == PositionSource.Mixed && live.ExternalQuantity <= 0m)
                 live.Source = PositionSource.Bot;
 
@@ -2443,8 +2470,28 @@ public sealed class TradingEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>Phase 1.7: кандидаты на подхват (ручные/external остатки) для UI.</summary>
+    public IReadOnlyCollection<ExternalPositionCandidate> ExternalCandidates => _externalPositions.Candidates;
+
+    /// <summary>Phase 1.7: режим подхвата external-позиций (Off/Confirm/Auto).</summary>
+    public ExternalAdoptionMode ExternalAdoptionMode => _externalPositions.Mode;
+
+    /// <summary>Phase 1.7: число неподхваченных external-остатков (учитывается в MaxOpenPositions).</summary>
+    public int UnadoptedExternalCount => _externalPositions.UnadoptedCount;
+
+    /// <summary>Phase 1.7: список кандидатов изменился — UI перечитывает <see cref="ExternalCandidates"/>.</summary>
+    public event Action? OnExternalCandidatesChanged;
+
+    /// <summary>Phase 1.7: операторское согласие на подхват (Confirm). entryOverride — ручной ввод цены входа.</summary>
+    public Task<bool> AdoptExternalPositionAsync(string symbol, decimal? entryOverride = null, CancellationToken ct = default) =>
+        _externalPositions.AdoptAsync(symbol, entryOverride, ct);
+
+    /// <summary>Phase 1.7: оператор забирает остаток себе — защита бота снимается, продажи нет.</summary>
+    public Task<bool> ReleaseExternalPositionAsync(string symbol, string reason = "operator-release", CancellationToken ct = default) =>
+        _externalPositions.ReleaseAsync(symbol, reason, ct);
+
     /// <summary>Phase 1.7: Release — снять только защиту бота и убрать lifecycle без продажи.</summary>
-    private async Task<bool> ReleaseExternalPositionAsync(Position position, CancellationToken ct)
+    private async Task<bool> ReleaseExternalPositionCoreAsync(Position position, CancellationToken ct)
     {
         using (await _positionMonitor.LockSymbolAsync(position.Symbol, ct))
         {
@@ -2480,6 +2527,16 @@ public sealed class TradingEngine : IAsyncDisposable
             OnKillSwitchEngaged?.Invoke(reason);
             await PersistRiskStateAsync(ct);
         }
+
+        // Phase 1.7: подхваченные external/Mixed-позиции входят в kill-switch наравне с ботом
+        // (оператор явно принял это при согласии). Неподхваченные остатки бот НЕ продаёт —
+        // они не его собственность; о них сообщаем отдельно, чтобы не было «невидимых» активов.
+        var externalManaged = _positionManager.GetOpenPositions().Count(p => p.HasExternalOwnership);
+        var unadopted = _externalPositions.UnadoptedCount;
+        if (externalManaged > 0 || unadopted > 0)
+            TradeLog.Warn("EXTERNAL-KILLSWITCH", null,
+                $"reason={reason} adopted_external={externalManaged} (закрываются вместе с ботом) " +
+                $"unadopted={unadopted} (НЕ закрываются: собственность оператора)");
 
         var total = _positionManager.GetOpenPositions().Count;
         var closed = await CloseAllPositionsAsync($"KillSwitch:{reason}", ct);
