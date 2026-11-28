@@ -48,11 +48,19 @@ public sealed class ScoringWeightsConfig
 
     // --- Модификаторы силы сетапа (умножают direction, не меняют знак) ---
 
-    /// <summary>ADX &lt; 20 — слабый тренд (прежний штраф ×0.6).</summary>
+    /// <summary>ADX &lt; AdxWeakThreshold — слабый тренд (прежний штраф ×0.6).</summary>
     public decimal AdxWeakFactor { get; set; } = 0.6m;
 
-    /// <summary>ADX в [20; 25) — умеренный тренд (прежний ×0.85).</summary>
+    /// <summary>ADX в [AdxWeakThreshold; AdxStrongThreshold) — умеренный тренд (прежний ×0.85).</summary>
     public decimal AdxMidFactor { get; set; } = 0.85m;
+
+    /// <summary>1.6: порог слабого тренда ADX (прежде константа 20, зашитая в
+    /// SignalCalibrator.PreScore — P2.6 не мог её калибровать). Дефолт = прежняя константа.</summary>
+    public decimal AdxWeakThreshold { get; set; } = 20m;
+
+    /// <summary>1.6: порог подтверждённого тренда ADX (прежде зашитая константа 25).
+    /// ADX ≥ порога → без штрафа. Дефолт = прежняя константа.</summary>
+    public decimal AdxStrongThreshold { get; set; } = 25m;
 
     /// <summary>volume_ratio &lt; 0.6 — объём ниже среднего (прежний ×0.8).</summary>
     public decimal VolumeLowFactor { get; set; } = 0.8m;
@@ -110,6 +118,14 @@ public sealed class ScoringWeightsConfig
 
         CheckFactor(AdxWeakFactor, nameof(AdxWeakFactor));
         CheckFactor(AdxMidFactor, nameof(AdxMidFactor));
+
+        if (AdxWeakThreshold <= 0m || AdxWeakThreshold >= 100m)
+            throw new InvalidOperationException(
+                $"AI:ScoringWeights:AdxWeakThreshold должен быть в диапазоне (0; 100). Текущее: {AdxWeakThreshold}");
+
+        if (AdxStrongThreshold <= AdxWeakThreshold || AdxStrongThreshold > 100m)
+            throw new InvalidOperationException(
+                $"AI:ScoringWeights:AdxStrongThreshold должен быть в диапазоне (AdxWeakThreshold; 100]. Текущее: {AdxStrongThreshold}");
         CheckFactor(VolumeLowFactor, nameof(VolumeLowFactor));
         CheckFactor(VolumeMidFactor, nameof(VolumeMidFactor));
         CheckFactor(VolumeHighFactor, nameof(VolumeHighFactor));

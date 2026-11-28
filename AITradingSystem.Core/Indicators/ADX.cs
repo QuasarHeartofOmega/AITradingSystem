@@ -1,25 +1,36 @@
-﻿using AITradingSystem.Core.Models.MarketData;
+using AITradingSystem.Core.Models.MarketData;
 
 namespace AITradingSystem.Core.Indicators;
 
 /// <summary>
 /// Average Directional Index (FR-3.1).
 /// Измеряет силу тренда (не направление).
+///
+/// Phase 1.6 — формула Уайлдера:
+///  - сглаживание +DM/−DM/TR/DX через RMA (α=1/p, SMA-затравка), а не EMA;
+///  - при +DM == −DM (в т.ч. оба &gt; 0) обнуляются ОБА значения — прежний код
+///    мутировал plusDM до вычисления minusDM, из-за чего на равенстве оставался −DM;
+///  - первый ADX = SMA первых p значений DX (затравка RMA), как в TA-Lib.
 /// </summary>
 public sealed class ADX : BaseIndicator
 {
     private readonly int _period;
-    private readonly EMA _smoothedPlusDM;
-    private readonly EMA _smoothedMinusDM;
-    private readonly EMA _smoothedTR;
-    private readonly EMA _smoothedDX;
+    private readonly RMA _rmaPlusDM;
+    private readonly RMA _rmaMinusDM;
+    private readonly RMA _rmaTR;
+    private readonly RMA _rmaDX;
     private decimal _prevHigh;
     private decimal _prevLow;
     private decimal _prevClose;
     private bool _hasPrev;
 
     public override string Name => $"ADX_{_period}";
-    public override int WarmupPeriod => _period * 2 + 1; // prev + сглаживание DM/TR + сглаживание DX
+
+    /// <summary>
+    /// Свеча 1 — только prev; свечи 2..p+1 — SMA-затравка RMA(+DM/−DM/TR);
+    /// с свечи p+1 начинается DX, ещё p значений DX дают затравку RMA(DX) → 2·p.
+    /// </summary>
+    public override int WarmupPeriod => _period * 2;
 
     public decimal Value { get; private set; }
     public decimal PlusDI { get; private set; }
@@ -30,10 +41,10 @@ public sealed class ADX : BaseIndicator
         if (period < 1)
             throw new ArgumentOutOfRangeException(nameof(period));
         _period = period;
-        _smoothedPlusDM = new EMA(period);
-        _smoothedMinusDM = new EMA(period);
-        _smoothedTR = new EMA(period);
-        _smoothedDX = new EMA(period);
+        _rmaPlusDM = new RMA(period);
+        _rmaMinusDM = new RMA(period);
+        _rmaTR = new RMA(period);
+        _rmaDX = new RMA(period);
     }
 
     public override void Update(OHLCV candle)
@@ -50,38 +61,29 @@ public sealed class ADX : BaseIndicator
         }
 
         var tr = candle.TrueRange(_prevClose);
-        var plusDM = candle.High - _prevHigh;
-        var minusDM = _prevLow - candle.Low;
+        var upMove = candle.High - _prevHigh;
+        var downMove = _prevLow - candle.Low;
 
-        plusDM = (plusDM > minusDM && plusDM > 0) ? plusDM : 0;
-        minusDM = (minusDM > plusDM && minusDM > 0) ? minusDM : 0;
+        // Уайлдер: сравнение с НЕИЗМЕНЁННЫМИ upMove/downMove;
+        // равенство (в т.ч. оба > 0) → оба DM равны 0.
+        var plusDM = (upMove > downMove && upMove > 0) ? upMove : 0m;
+        var minusDM = (downMove > upMove && downMove > 0) ? downMove : 0m;
 
-        // Создаем свечи для EMA
-        var plusDMCandle = new OHLCV { Close = plusDM, OpenTime = candle.OpenTime, CloseTime = candle.CloseTime };
-        var minusDMCandle = new OHLCV { Close = minusDM, OpenTime = candle.OpenTime, CloseTime = candle.CloseTime };
-        var trCandle = new OHLCV { Close = tr, OpenTime = candle.OpenTime, CloseTime = candle.CloseTime };
+        _rmaPlusDM.Update(plusDM);
+        _rmaMinusDM.Update(minusDM);
+        _rmaTR.Update(tr);
 
-        _smoothedPlusDM.Update(plusDMCandle);
-        _smoothedMinusDM.Update(minusDMCandle);
-        _smoothedTR.Update(trCandle);
-
-        if (_smoothedPlusDM.IsReady && _smoothedTR.IsReady && _smoothedTR.GetValue() > 0)
+        if (_rmaTR.IsReady && _rmaTR.Value > 0m)
         {
-            var plusDI = _smoothedPlusDM.GetValue() / _smoothedTR.GetValue() * 100m;
-            var minusDI = _smoothedMinusDM.GetValue() / _smoothedTR.GetValue() * 100m;
+            PlusDI = _rmaPlusDM.Value / _rmaTR.Value * 100m;
+            MinusDI = _rmaMinusDM.Value / _rmaTR.Value * 100m;
 
-            var diSum = plusDI + minusDI;
-            var dx = diSum > 0 ? Math.Abs(plusDI - minusDI) / diSum * 100m : 0;
+            var diSum = PlusDI + MinusDI;
+            var dx = diSum > 0m ? Math.Abs(PlusDI - MinusDI) / diSum * 100m : 0m;
 
-            var dxCandle = new OHLCV { Close = dx, OpenTime = candle.OpenTime, CloseTime = candle.CloseTime };
-            _smoothedDX.Update(dxCandle);
-
-            if (_smoothedDX.IsReady)
-            {
-                Value = _smoothedDX.GetValue();
-                PlusDI = plusDI;
-                MinusDI = minusDI;
-            }
+            _rmaDX.Update(dx);
+            if (_rmaDX.IsReady)
+                Value = _rmaDX.Value;
         }
 
         _prevHigh = candle.High;
@@ -98,10 +100,10 @@ public sealed class ADX : BaseIndicator
 
     public override void Reset()
     {
-        _smoothedPlusDM.Reset();
-        _smoothedMinusDM.Reset();
-        _smoothedTR.Reset();
-        _smoothedDX.Reset();
+        _rmaPlusDM.Reset();
+        _rmaMinusDM.Reset();
+        _rmaTR.Reset();
+        _rmaDX.Reset();
         _prevHigh = 0;
         _prevLow = 0;
         _prevClose = 0;

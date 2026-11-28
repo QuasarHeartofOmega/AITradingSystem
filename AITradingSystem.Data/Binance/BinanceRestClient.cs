@@ -203,6 +203,13 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
             ExchangeLog.Warn("KLINES-SKIPPED", symbol,
                 $"пропущено {skipped} некорректных строк из {response.Count}");
 
+        // 1.6: REST-klines не несут флага "x" — закрытость определяем по серверному
+        // времени (локальные часы + offset TIME-SYNC; без синхронизации offset=0 —
+        // прежний fallback). Последняя свеча ответа может быть ещё живой: она не
+        // попадёт в историю как закрытая при спешащих локальных часах.
+        var serverNowUtc = DateTime.UtcNow.AddMilliseconds(_serverTimeOffsetMs);
+        foreach (var candle in result)
+            candle.ClosedByExchange = candle.CloseTime <= serverNowUtc;
 
         return result;
     }
@@ -547,10 +554,15 @@ public sealed class BinanceRestClient : IBinanceRestClient, IDisposable
         return order;
     }
 
-    public async Task<List<BinanceMyTrade>> GetMyTradesAsync(string symbol, long? orderId = null, CancellationToken ct = default)
+    public async Task<List<BinanceMyTrade>> GetMyTradesAsync(string symbol, long? orderId = null, CancellationToken ct = default,
+        long? startTime = null, long? endTime = null, int limit = 1000)
     {
         var query = $"symbol={symbol.ToUpperInvariant()}";
         if (orderId.HasValue) query += $"&orderId={orderId.Value}";
+        // Phase 1.7: реконструкция external entry за lookback-окно (без orderId).
+        if (startTime.HasValue) query += $"&startTime={startTime.Value}";
+        if (endTime.HasValue) query += $"&endTime={endTime.Value}";
+        if (!orderId.HasValue) query += $"&limit={Math.Clamp(limit, 1, 1000)}";
         return await SendRequestAsync<List<BinanceMyTrade>>(
             $"/api/v3/myTrades?{query}", HttpMethod.Get, signed: true, ct: ct);
     }

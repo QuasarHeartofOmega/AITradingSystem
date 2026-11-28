@@ -609,10 +609,11 @@ public sealed class BinanceWebSocketClient : IBinanceWebSocketClient
             return;
         }
 
-        // Флаг закрытия берём из payload ("x"), а не только из системных часов:
-        // при рассинхроне часов незакрытая свеча могла попасть в индикаторы.
-        if (kline.IsClosed && ohlcv.CloseTime > DateTime.UtcNow)
-            ohlcv.CloseTime = DateTime.UtcNow.AddMilliseconds(-1);
+        // 1.6: флаг закрытия берём из payload ("x") и пробрасываем в OHLCV —
+        // локальные часы участвуют только когда флага нет. CloseTime больше не
+        // переписывается: преждевременные свечи отсекает IsClosed в индикаторном
+        // контуре (UpdateIndicators/TryReloadHistory/OnKlineReceived).
+        ohlcv.ClosedByExchange = kline.IsClosed;
 
         _lastPrices[ohlcv.Symbol] = ohlcv.Close;
         OnKline?.Invoke(ohlcv);

@@ -78,7 +78,7 @@ public sealed class RSI : BaseIndicator
             avgLoss = (_avgLoss * (_period - 1) + loss) / _period;
         }
 
-        if (avgLoss == 0) return 100m;
+        if (avgLoss == 0) return avgGain == 0 ? 50m : 100m; // 1.6: плоский рынок → 50, а не 100
         var rs = avgGain / avgLoss;
         return 100m - (100m / (1m + rs));
     }
@@ -87,7 +87,7 @@ public sealed class RSI : BaseIndicator
 
     private decimal CalculateRSI()
     {
-        if (_avgLoss == 0) return 100m;
+        if (_avgLoss == 0) return _avgGain == 0 ? 50m : 100m; // 1.6: плоский рынок → 50, а не 100
         var rs = _avgGain / _avgLoss;
         return 100m - (100m / (1m + rs));
     }

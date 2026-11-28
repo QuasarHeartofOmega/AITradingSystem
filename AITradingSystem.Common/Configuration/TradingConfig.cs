@@ -1,6 +1,7 @@
 namespace AITradingSystem.Common.Configuration;
 
 using AITradingSystem.Core.Models.Config;
+using AITradingSystem.Core.Models.Enums;
 
 /// <summary>
 /// Параметры торговой стратегии и риск-менеджмента.
@@ -109,6 +110,16 @@ public sealed class TradingConfig
     /// Правило «нет защиты на бирже → нет позиции»: иначе капитал снова зависит от живого процесса.
     /// </summary>
     public bool ClosePositionIfProtectionFails { get; set; } = true;
+
+    /// <summary>Phase 1.7 (Blocker 7): подхват ручных/external спотовых остатков по символам реестра.
+    /// Off — только детект/алерт; Confirm — кандидат ждёт согласия оператора (дефолт); Auto — подхватывать сразу.</summary>
+    public ExternalAdoptionMode AdoptExternalPositions { get; set; } = ExternalAdoptionMode.Confirm;
+
+    /// <summary>Phase 1.7: окно реконструкции цены входа external-остатка по myTrades, часы.</summary>
+    public int ExternalAdoptionLookbackHours { get; set; } = 72;
+
+    /// <summary>Phase 1.7: отказ биржевой защиты у external-позиции. Дефолт — алерт без автоматической продажи чужого актива.</summary>
+    public ExternalProtectionFailurePolicy ExternalProtectionFailurePolicy { get; set; } = ExternalProtectionFailurePolicy.AlertNotSell;
 
     /// <summary>
     /// Минимальная пауза между cancel/replace защитной связки при трейлинге, секунд.
@@ -527,6 +538,12 @@ public sealed class TradingConfig
             throw new InvalidOperationException("AccountRefreshIntervalSeconds должен быть в диапазоне [5; 300].");
         if (MinExchangePositionNotional < 0)
             throw new InvalidOperationException("MinExchangePositionNotional должен быть >= 0.");
+        if (!Enum.IsDefined(typeof(ExternalAdoptionMode), AdoptExternalPositions))
+            throw new InvalidOperationException($"AdoptExternalPositions имеет недопустимое значение: {AdoptExternalPositions}");
+        if (ExternalAdoptionLookbackHours < 1 || ExternalAdoptionLookbackHours > 24 * 30)
+            throw new InvalidOperationException("ExternalAdoptionLookbackHours должен быть в диапазоне [1; 720].");
+        if (!Enum.IsDefined(typeof(ExternalProtectionFailurePolicy), ExternalProtectionFailurePolicy))
+            throw new InvalidOperationException($"ExternalProtectionFailurePolicy имеет недопустимое значение: {ExternalProtectionFailurePolicy}");
         if (MinNotionalBufferPercent < 0m || MinNotionalBufferPercent > 10m)
             throw new InvalidOperationException("MinNotionalBufferPercent должен быть в диапазоне [0; 10].");
         if (MinNotionalBumpMaxPercent < 0m || MinNotionalBumpMaxPercent > 100m)

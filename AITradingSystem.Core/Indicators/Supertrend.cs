@@ -18,9 +18,13 @@ public sealed class Supertrend : BaseIndicator
     private decimal _prevUpperBand;
     private decimal _prevLowerBand;
     private bool _prevIsUptrend = true;
+    private bool _initialized;
 
     public override string Name => $"Supertrend_{_atr.WarmupPeriod}_{_multiplier}";
-    public override int WarmupPeriod => _atr.WarmupPeriod + 1;
+
+    /// <summary>1.6: готовность совпадает с готовностью ATR — на этой же свече
+    /// вычисляется первая полоса (прежде была ещё одна свеча с транзиентным нулём).</summary>
+    public override int WarmupPeriod => _atr.WarmupPeriod;
 
     public decimal Value => _supertrend;
     public bool IsUptrend => _isUptrend;
@@ -45,9 +49,9 @@ public sealed class Supertrend : BaseIndicator
         var currentUpperBand = hl2 + _multiplier * atrValue;
         var currentLowerBand = hl2 - _multiplier * atrValue;
 
-        if (ProcessedCount == WarmupPeriod)
+        if (!_initialized)
         {
-            // Первая итерация после прогрева
+            // 1.6: инициализация на свече готовности ATR — без транзиентной нулевой полосы
             _upperBand = currentUpperBand;
             _lowerBand = currentLowerBand;
             _supertrend = _isUptrend ? _lowerBand : _upperBand;
@@ -55,6 +59,7 @@ public sealed class Supertrend : BaseIndicator
             _prevUpperBand = _upperBand;
             _prevLowerBand = _lowerBand;
             _prevIsUptrend = _isUptrend;
+            _initialized = true;
             return;
         }
 
@@ -107,6 +112,7 @@ public sealed class Supertrend : BaseIndicator
         _prevUpperBand = 0;
         _prevLowerBand = 0;
         _prevIsUptrend = true;
+        _initialized = false;
         ProcessedCount = 0;
     }
 }

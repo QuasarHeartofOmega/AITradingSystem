@@ -142,11 +142,14 @@ public sealed class SignalCalibrator
 
         // --- Модификаторы (штрафы/бонусы к силе сетапа, не к направлению) ---
         var adxRaw = indicators.TryGetValue("adx_raw", out var ar) ? ar : Get(indicators, "adx") * 100m;
-        var adxFactor = adxRaw >= 25m ? 1.0m : adxRaw >= 20m ? _weights.AdxMidFactor : _weights.AdxWeakFactor;
-        if (adxRaw < 20m)
-            reasons.Add(string.Format(CultureInfo.InvariantCulture, "слабый тренд: ADX {0:0.#} < 20 (штраф ×{1:0.##})", adxRaw, _weights.AdxWeakFactor));
-        else if (adxRaw >= 25m)
-            reasons.Add(string.Format(CultureInfo.InvariantCulture, "тренд подтверждён: ADX {0:0.#} >= 25", adxRaw));
+        // 1.6: пороги ADX — из версионируемого конфига (цель калибровки P2.6), не зашитые константы.
+        var adxWeak = _weights.AdxWeakThreshold;
+        var adxStrong = _weights.AdxStrongThreshold;
+        var adxFactor = adxRaw >= adxStrong ? 1.0m : adxRaw >= adxWeak ? _weights.AdxMidFactor : _weights.AdxWeakFactor;
+        if (adxRaw < adxWeak)
+            reasons.Add(string.Format(CultureInfo.InvariantCulture, "слабый тренд: ADX {0:0.#} < {1:0.#} (штраф ×{2:0.##})", adxRaw, adxWeak, _weights.AdxWeakFactor));
+        else if (adxRaw >= adxStrong)
+            reasons.Add(string.Format(CultureInfo.InvariantCulture, "тренд подтверждён: ADX {0:0.#} >= {1:0.#}", adxRaw, adxStrong));
 
         var volumeRatio = Get(indicators, "volume_ratio");
         var volumeFactor = volumeRatio <= 0m ? 1.0m

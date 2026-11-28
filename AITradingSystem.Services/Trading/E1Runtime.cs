@@ -797,7 +797,10 @@ public sealed class E1Runtime
 
     private static Dictionary<string, string> GateVersions() => new()
     {
-        ["e1"] = "1", ["risk"] = "1", ["liquidity"] = "1", ["portfolio"] = "1", ["symbol-policy"] = "1"
+        ["e1"] = "1", ["risk"] = "1", ["liquidity"] = "1", ["portfolio"] = "1", ["symbol-policy"] = "1",
+        // 1.6: версия формул индикаторов. В записях до фикса ключа нет (v1) —
+        // такие бакеты решений несравнимы с собранными на v2.
+        ["indicators"] = AITradingSystem.Core.Indicators.IndicatorFormulaVersion.Version
     };
 
     private string QuoteOf(string symbol) =>

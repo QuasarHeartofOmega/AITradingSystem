@@ -42,6 +42,33 @@ public sealed class Position : INotifyPropertyChanged
     public string OpeningOrderId { get; set; } = string.Empty;
     public string SignalId { get; set; } = string.Empty;
 
+    /// <summary>Phase 1.7: источник lifecycle (Bot / External / Mixed). Старые записи = Bot.</summary>
+    public PositionSource Source { get; set; } = PositionSource.Bot;
+
+    /// <summary>Phase 1.7: основа цены входа (engine / mytrades-vwap / mark-price-estimate / manual / mixed).</summary>
+    public string EntryBasis { get; set; } = "engine";
+
+    /// <summary>Phase 1.7: доля Quantity, принадлежащая external-леджеру (остальное — бот).</summary>
+    public decimal ExternalQuantity { get; set; }
+
+    /// <summary>Phase 1.7: средняя цена входа external-доли (для атрибуции PnL при ручной продаже).</summary>
+    public decimal ExternalEntryPrice { get; set; }
+
+    /// <summary>Phase 1.7: последний наблюдавшийся биржевой total базового актива, отнесённый к этому lifecycle.
+    /// Нужен для balance-delta recon: ручная докупка/продажа меняет total, а не только free.</summary>
+    public decimal ExternalObservedTotal { get; set; }
+
+    /// <summary>Phase 1.7: evidence реконструкции external entry (trade ids / окно / fallback).</summary>
+    public string ExternalEntryEvidence { get; set; } = string.Empty;
+
+    /// <summary>Есть external-доля: применяется политика ExternalProtectionFailurePolicy.</summary>
+    [JsonIgnore]
+    public bool HasExternalOwnership => Source is PositionSource.External or PositionSource.Mixed || ExternalQuantity > 0m;
+
+    /// <summary>Доля бота в Quantity (персистится через ExternalQuantity).</summary>
+    [JsonIgnore]
+    public decimal BotQuantity => Math.Max(0m, Quantity - ExternalQuantity);
+
     /// <summary>E1 lifecycle linkage. Persisted so restart/polling cannot create a second outcome.</summary>
     public string E1DecisionId { get; set; } = string.Empty;
     public string E1EntryIntentId { get; set; } = string.Empty;

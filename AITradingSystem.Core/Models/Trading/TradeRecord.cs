@@ -20,7 +20,11 @@ public sealed class TradeRecord
 
     /// <summary>P1.2: чистый PnL после комиссий входа и выхода.</summary>
     public decimal NetPnL => PnL - Commission;
-    public string ExitReason { get; set; } = string.Empty; // "TP", "SL", "TrailingStop", "Manual"
+    public string ExitReason { get; set; } = string.Empty; // "TP", "SL", "TrailingStop", "Manual", "ExternalManualExit"
+    /// <summary>Phase 1.7: источник позиции (Bot/External/Mixed) — атрибуция результата.</summary>
+    public string PositionSource { get; set; } = "Bot";
+    /// <summary>Phase 1.7: основа цены входа (engine/mytrades-vwap/mark-price-estimate/manual/mixed).</summary>
+    public string EntryBasis { get; set; } = "engine";
     public DateTime OpenedAt { get; set; }
     public DateTime ClosedAt { get; set; }
     public string SignalId { get; set; } = string.Empty;

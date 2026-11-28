@@ -1,4 +1,4 @@
-using AITradingSystem.Common.Configuration;
+﻿using AITradingSystem.Common.Configuration;
 using AITradingSystem.Core.Models.Enums;
 using AITradingSystem.Core.Models.Trading;
 using AITradingSystem.Data.Binance;
@@ -17,17 +17,20 @@ public sealed class AccountSnapshotService
     private readonly IBinanceRestClient _rest;
     private readonly IBinanceWebSocketClient _ws;
     private readonly PositionManager _positions;
+    private readonly ExternalPositionService? _external;
 
     public AccountSnapshotService(
         TradingConfig config,
         IBinanceRestClient rest,
         IBinanceWebSocketClient ws,
-        PositionManager positions)
+        PositionManager positions,
+        ExternalPositionService? external = null)
     {
         _config = config;
         _rest = rest;
         _ws = ws;
         _positions = positions;
+        _external = external;
     }
 
     public async Task<AccountSnapshot> CreateLiveAsync(CancellationToken ct = default)
@@ -54,19 +57,30 @@ public sealed class AccountSnapshotService
         var notional = open.Sum(MarkedNotional);
         var unrealized = open.Sum(p => p.UnrealizedPnL);
 
+        // Phase 1.7: external-остатки видны в снимке риска ещё до подхвата (exposure/алерт),
+        // но не становятся позициями бота без согласия оператора (Confirm) или режима Auto.
+        var externalCandidates = _external != null
+            ? await _external.ObserveAsync(balance, prices, ct: ct)
+            : Array.Empty<ExternalPositionCandidate>();
+        var externalNotional = externalCandidates.Where(c => c.IsEligible).Sum(c => c.ExternalNotionalQuote);
+
         return new AccountSnapshot
         {
             EquityQuote = equity,
             FreeCashQuote = free,
             LockedCashQuote = locked,
-            PositionNotionalQuote = notional,
+            PositionNotionalQuote = notional + externalNotional,
             UnrealizedPnlQuote = unrealized,
             AccountId = _rest.AccountId,
             Environment = _rest.EnvironmentName,
             QuoteAsset = QuoteAsset,
             AsOfUtc = DateTime.UtcNow,
             Source = "exchange-rest+ws",
-            IsValuationComplete = complete
+            IsValuationComplete = complete,
+            Balance = balance,
+            Prices = prices,
+            ExternalCandidates = externalCandidates,
+            UnattributedExternalNotionalQuote = externalNotional
         };
     }
 

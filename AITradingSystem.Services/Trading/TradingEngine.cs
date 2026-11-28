@@ -1,4 +1,4 @@
-using AITradingSystem.Common.Configuration;
+﻿using AITradingSystem.Common.Configuration;
 using AITradingSystem.Common.Logging;
 using AITradingSystem.Core.Models.Enums;
 using AITradingSystem.Core.Models.MarketData;
@@ -43,6 +43,7 @@ public sealed class TradingEngine : IAsyncDisposable
     private readonly AccountSnapshotService _accountSnapshots;
     private readonly LlmVetoService _llmVeto;
     private readonly E1Runtime _e1;
+    private readonly ExternalPositionService _externalPositions;
     private string _configHash = "unknown";
     private AccountSnapshot? _accountSnapshot;
     private decimal _paperFreeCash;
@@ -179,6 +180,8 @@ public sealed class TradingEngine : IAsyncDisposable
     public event Action<BotStatus>? OnStatusChanged;
     public event Action<TradingSignal>? OnSignalGenerated;
     public event Action<Position>? OnPositionOpened;
+    /// <summary>Phase 1.7: оператор отпустил external-позицию (Release) — UI убирает строку без записи о продаже.</summary>
+    public event Action<string>? OnPositionReleased;
     public event Action<TradeRecord>? OnPositionClosed;
     /// <summary>Частичное закрытие: история/UI обновляются, но позиция остаётся открытой.</summary>
     public event Action<TradeRecord>? OnPartialPositionClosed;
@@ -217,6 +220,7 @@ public sealed class TradingEngine : IAsyncDisposable
         MetricsCollector metrics,
         LlmVetoService llmVeto,
         E1Runtime e1,
+        ExternalPositionService externalPositions,
         ILogger<TradingEngine> logger)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
@@ -240,8 +244,12 @@ public sealed class TradingEngine : IAsyncDisposable
         _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
         _llmVeto = llmVeto ?? throw new ArgumentNullException(nameof(llmVeto));
         _e1 = e1 ?? throw new ArgumentNullException(nameof(e1));
+        _externalPositions = externalPositions ?? throw new ArgumentNullException(nameof(externalPositions));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager);
+        _accountSnapshots = new AccountSnapshotService(_config.Trading, _restClient, _wsClient, _positionManager, _externalPositions);
+        _externalPositions.Configure(
+            AdoptExternalCandidateAsync, ApplyExternalBalanceDeltaAsync, ReleaseExternalPositionAsync,
+            symbol => GetAtrAbsolute(symbol));
 
         if (!CandleSchedule.TryParseInterval(_config.Trading.CandleInterval, out _candleInterval))
             throw new InvalidOperationException($"Недопустимый интервал свечей: {_config.Trading.CandleInterval}");
@@ -294,6 +302,7 @@ public sealed class TradingEngine : IAsyncDisposable
 
             // Восстановление позиций
             await _positionManager.LoadPositionsAsync(ct);
+            await _externalPositions.InitializeAsync(ct);
             await _e1.InitializeAsync(_configHash, ct);
             foreach (var restored in _positionManager.GetOpenPositions())
             {
@@ -846,7 +855,7 @@ public sealed class TradingEngine : IAsyncDisposable
         }
 
         // 2. Лимит одновременно открытых позиций.
-        var openCount = _positionManager.GetOpenPositions().Count;
+        var openCount = _positionManager.GetOpenPositions().Count + _externalPositions.UnadoptedCount;
         if (openCount >= _config.Trading.MaxOpenPositions)
         {
             TradeLog.Rejected(symbol, "portfolio",
@@ -1328,10 +1337,19 @@ public sealed class TradingEngine : IAsyncDisposable
         if (quantity <= 0m || entryPrice <= 0m) return 0m;
 
         var open = _positionManager.GetOpenPositions();
+        // Phase 1.7: external-остатки участвуют в exposure/correlation cap ещё до подхвата.
+        var externalSynthetic = _externalPositions.Candidates
+            .Where(c => c.IsEligible && !c.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase))
+            .Select(c => new Position
+            {
+                Symbol = c.Symbol, Side = OrderSide.Buy, Quantity = c.ExternalQuantity,
+                EntryPrice = c.MarkPrice, CurrentPrice = c.MarkPrice, Source = PositionSource.External
+            }).ToList();
+        var riskPositions = open.Concat(externalSynthetic).ToList();
         var equity = balance + open.Sum(p => p.UnrealizedPnL);
         var proposed = quantity * entryPrice;
         var decision = _portfolioRisk.EvaluateEntry(
-            symbol, proposed, open, equity,
+            symbol, proposed, riskPositions, equity,
             _riskManager.DrawdownTracker.DayStartBalance,
             s => _marketAnalyzer.GetClosedCandles(s, _config.Trading.CorrelationLookbackCandles + 1));
 
@@ -1948,7 +1966,7 @@ public sealed class TradingEngine : IAsyncDisposable
         {
             _paperFreeCash += closedQuantity * position.CurrentPrice - order.Commission;
         }
-        await RefreshAccountSnapshotAsync(ct);
+        await RefreshAccountSnapshotAsync(ct, reconcileExternal: false);
 
         if (isPartial)
         {
@@ -2050,12 +2068,26 @@ public sealed class TradingEngine : IAsyncDisposable
             await EngageKillSwitchAsync(engageReason, ct);
     }
 
-    private async Task RefreshAccountSnapshotAsync(CancellationToken ct)
+    private async Task RefreshAccountSnapshotAsync(CancellationToken ct, bool reconcileExternal = true)
     {
         var snapshot = _config.Trading.PaperTradingMode
             ? _accountSnapshots.CreatePaper(_paperFreeCash)
             : await _accountSnapshots.CreateLiveAsync(ct);
         await UpdateRiskSnapshotAsync(snapshot, ct);
+
+        // Phase 1.7: balance-delta recon и Auto-подхват — только вне посимвольных шлюзов и не при kill-switch.
+        // Внутренние вызовы под шлюзом (close/apply-fill/adoption) передают reconcileExternal=false.
+        if (reconcileExternal && !_config.Trading.PaperTradingMode && !IsKillSwitchEngaged
+            && snapshot.Balance != null && snapshot.Prices.Count > 0)
+        {
+            try { await _externalPositions.ReconcileAsync(snapshot.Balance, snapshot.Prices, ct); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "External position reconciliation failed");
+                TradeLog.Warn("EXTERNAL-RECON-FAIL", null, ex.Message);
+            }
+        }
     }
 
     /// <summary>P0.1: явная регистрация депозита/вывода/трансфера корректирует baseline, не торговый PnL.</summary>
@@ -2188,7 +2220,7 @@ public sealed class TradingEngine : IAsyncDisposable
         TradeLog.Closed(position.Symbol, reason, closedQuantity, trade.EntryPrice, trade.ExitPrice,
             trade.NetPnL, trade.PnLPercent, trade.Commission, mode);
 
-        await RefreshAccountSnapshotAsync(ct);
+        await RefreshAccountSnapshotAsync(ct, reconcileExternal: false);
 
         _metrics.RecordReconciliationFill();
         if (fullyClosed)
@@ -2220,7 +2252,7 @@ public sealed class TradingEngine : IAsyncDisposable
             orphan.StopLoss = _riskManager.CalculateStopLoss(orphan.Side, orphan.EntryPrice, atr);
             orphan.TakeProfit = _riskManager.CalculateTakeProfit(orphan.Side, orphan.EntryPrice, orphan.StopLoss);
             orphan.InitialStopLoss = orphan.StopLoss;
-            orphan.SignalId = "reconciled";
+            orphan.SignalId = orphan.HasExternalOwnership ? "external-adoption" : "reconciled";
             if (orphan.LifetimeBoughtQuantity <= 0m)
                 orphan.LifetimeBoughtQuantity = orphan.Quantity;
 
@@ -2239,12 +2271,191 @@ public sealed class TradingEngine : IAsyncDisposable
                 orphan.StopLoss, orphan.TakeProfit,
                 _config.Trading.PaperTradingMode ? "PAPER" : _restClient.EnvironmentName, orphan.OpeningOrderId);
 
-            if (!protectedOk && _config.Trading.ClosePositionIfProtectionFails &&
+            if (!protectedOk && orphan.HasExternalOwnership &&
+                _config.Trading.ExternalProtectionFailurePolicy == ExternalProtectionFailurePolicy.AlertNotSell)
+            {
+                // Phase 1.7: чужой актив не продаём автоматически при отказе OCO — алерт оператору.
+                TradeLog.Error("EXTERNAL-PROTECTION-FAILED", orphan.Symbol,
+                    $"lifecycle={orphan.Id} OCO не поставлена; policy=AlertNotSell — позиция остаётся у оператора, автоматической продажи нет");
+            }
+            else if (!protectedOk && _config.Trading.ClosePositionIfProtectionFails &&
                 _config.Trading.ExchangeProtectionEnabled && !_config.Trading.PaperTradingMode)
             {
                 TradeLog.Error("RECON-ADOPT-UNPROTECTED", orphan.Symbol, "сиротская позиция без защиты — аварийное закрытие");
                 await ClosePositionCoreAsync(orphan, "NoExchangeProtection", ct, null);
             }
+        }
+    }
+
+    /// <summary>Phase 1.7: подхват external-кандидата. Если символ совпал с позицией бота —
+    /// доли объединяются в один lifecycle (Mixed) с раздельным учётом ExternalQuantity.</summary>
+    private async Task<bool> AdoptExternalCandidateAsync(ExternalPositionCandidate candidate, decimal? entryOverride, CancellationToken ct)
+    {
+        using (await _positionMonitor.LockSymbolAsync(candidate.Symbol, ct))
+        {
+            var entry = entryOverride ?? candidate.ProposedEntryPrice;
+            if (entry <= 0m) return false;
+            var basis = entryOverride.HasValue ? "manual" : candidate.EntryBasis;
+            var existing = _positionManager.GetPositionBySymbol(candidate.Symbol);
+            if (existing != null)
+            {
+                await MergeExternalIntoPositionAsync(existing, candidate.ExternalQuantity, entry, basis,
+                    candidate.EntryEvidence, candidate.ExchangeTotalQuantity, ct);
+                return true;
+            }
+
+            var orphan = new Position
+            {
+                Symbol = candidate.Symbol,
+                Side = OrderSide.Buy,
+                Quantity = candidate.ExternalQuantity,
+                EntryPrice = entry,
+                CurrentPrice = candidate.MarkPrice > 0m ? candidate.MarkPrice : entry,
+                OpenedAt = candidate.FirstExternalTradeUtc ?? DateTime.UtcNow,
+                Source = PositionSource.External,
+                EntryBasis = basis,
+                ExternalQuantity = candidate.ExternalQuantity,
+                ExternalEntryPrice = entry,
+                ExternalObservedTotal = candidate.ExchangeTotalQuantity,
+                ExternalEntryEvidence = candidate.EntryEvidence,
+                LifetimeBoughtQuantity = candidate.ExternalQuantity,
+                ConfidenceSource = basis,
+                SignalId = "external-adoption"
+            };
+            await AdoptOrphanPositionAsync(orphan, ct);
+            await RefreshAccountSnapshotAsync(ct, reconcileExternal: false);
+            return _positionManager.GetPositionById(orphan.Id) != null || IsLifecycleClosed(orphan.Id);
+        }
+    }
+
+    /// <summary>Phase 1.7: долив external-объёма в существующий lifecycle (бот/external один символ).</summary>
+    private async Task MergeExternalIntoPositionAsync(
+        Position position, decimal quantity, decimal entryPrice, string basis, string evidence,
+        decimal exchangeTotal, CancellationToken ct)
+    {
+        if (quantity <= 0m || entryPrice <= 0m) return;
+        var oldQty = position.Quantity;
+        var newQty = oldQty + quantity;
+        position.EntryPrice = newQty > 0m ? (position.EntryPrice * oldQty + entryPrice * quantity) / newQty : entryPrice;
+        position.Quantity = newQty;
+        position.RegisterEntryQuantity(quantity);
+        var oldExternal = position.ExternalQuantity;
+        position.ExternalQuantity = oldExternal + quantity;
+        position.ExternalEntryPrice = position.ExternalQuantity > 0m
+            ? (position.ExternalEntryPrice * oldExternal + entryPrice * quantity) / position.ExternalQuantity
+            : entryPrice;
+        position.Source = position.Source == PositionSource.Bot ? PositionSource.Mixed : position.Source;
+        position.EntryBasis = position.EntryBasis == basis ? basis : "mixed";
+        position.ConfidenceSource = position.EntryBasis;
+        position.ExternalObservedTotal = exchangeTotal;
+        position.ExternalEntryEvidence = evidence;
+        position.CurrentPrice = position.CurrentPrice > 0m ? position.CurrentPrice : entryPrice;
+
+        // Старая OCO покрывала прежний объём — снимаем только свою защиту и ставим на новый free-объём.
+        if (position.Protection != null)
+            await _orderExecutor.CancelProtectionAsync(position, ct);
+        await _positionManager.SavePositionsAsync(ct);
+        await _e1.AttachPositionAsync(position, ct);
+        var ok = await _orderExecutor.EnsureProtectionAsync(position, ct);
+        await _positionManager.SavePositionsAsync(ct);
+        if (!ok && _config.Trading.ExternalProtectionFailurePolicy == ExternalProtectionFailurePolicy.AlertNotSell)
+            TradeLog.Error("EXTERNAL-PROTECTION-FAILED", position.Symbol,
+                $"lifecycle={position.Id} merge qty={LogOptions.N(quantity)} OCO не поставлена; AlertNotSell");
+        TradeLog.Warn("EXTERNAL-ADOPTED", position.Symbol,
+            $"lifecycle={position.Id} source={position.Source} +qty={LogOptions.N(quantity)} entry={LogOptions.N(entryPrice)} basis={basis} total={LogOptions.N(newQty)}");
+        OnPositionOpened?.Invoke(position);
+    }
+
+    /// <summary>Phase 1.7: balance-delta recon. Ручная докупка увеличивает external-долю;
+    /// ручная продажа уменьшает сначала external-долю, затем долю бота (ExternalManualExit), без фантомов и oversell.</summary>
+    private async Task ApplyExternalBalanceDeltaAsync(Position position, decimal delta, decimal markPrice, CancellationToken ct)
+    {
+        using (await _positionMonitor.LockSymbolAsync(position.Symbol, ct))
+        {
+            var live = _positionManager.GetPositionById(position.Id);
+            if (live is null || IsLifecycleClosed(live.Id)) return;
+            var price = markPrice > 0m ? markPrice : live.CurrentPrice;
+            if (delta > 0m)
+            {
+                var basis = live.HasExternalOwnership ? "balance-delta-estimate" : "balance-delta-estimate";
+                await MergeExternalIntoPositionAsync(live, delta, price, basis,
+                    $"balance-delta +{LogOptions.N(delta)} at {DateTime.UtcNow:O}", live.ExternalObservedTotal + delta, ct);
+                return;
+            }
+
+            var sold = Math.Min(-delta, live.Quantity);
+            if (sold <= 0m)
+            {
+                live.ExternalObservedTotal = Math.Max(0m, live.ExternalObservedTotal + delta);
+                await _positionManager.SavePositionsAsync(ct);
+                return;
+            }
+
+            // Атрибуция: сначала external-доля, остаток — бот.
+            var externalPart = Math.Min(sold, live.ExternalQuantity);
+            var botPart = sold - externalPart;
+            var exitBasisPrice = externalPart > 0m && live.ExternalEntryPrice > 0m ? live.ExternalEntryPrice : live.EntryPrice;
+            var trade = new TradeRecord
+            {
+                Symbol = live.Symbol, Side = live.Side, Quantity = sold,
+                EntryPrice = exitBasisPrice, ExitPrice = price,
+                PnL = (live.Side == OrderSide.Buy ? price - exitBasisPrice : exitBasisPrice - price) * sold,
+                PnLPercent = exitBasisPrice > 0m ? (live.Side == OrderSide.Buy ? price - exitBasisPrice : exitBasisPrice - price) / exitBasisPrice * 100m : 0m,
+                Commission = 0m, ExitReason = "ExternalManualExit",
+                OpenedAt = live.OpenedAt, ClosedAt = DateTime.UtcNow, SignalId = live.SignalId,
+                InitialStopLoss = live.InitialStopLoss,
+                SignalConfidence = live.SignalConfidence, ModelConfidence = live.ModelConfidence,
+                EngineConfidence = live.EngineConfidence, ConfidenceSource = live.ConfidenceSource,
+                ScoreFeatures = live.ScoreFeatures, EngineDirection = live.EngineDirection,
+                PositionSource = live.Source.ToString(), EntryBasis = live.EntryBasis
+            };
+            await _tradeHistory.SaveTradeAsync(trade, ct);
+            _portfolioRisk.RecordClosedTrade(trade);
+
+            live.ExternalQuantity = Math.Max(0m, live.ExternalQuantity - externalPart);
+            live.RegisterExitQuantity(sold);
+            live.ReduceQuantity(sold);
+            live.ExternalObservedTotal = Math.Max(0m, live.ExternalObservedTotal - sold);
+            if (live.Source == PositionSource.Mixed && live.ExternalQuantity <= 0m)
+                live.Source = PositionSource.Bot;
+
+            if (live.Quantity <= 0m)
+            {
+                if (live.Protection != null) await _orderExecutor.CancelProtectionAsync(live, ct);
+                MarkLifecycleClosed(live.Id);
+                await _positionManager.RemovePositionAsync(live.Id, ct);
+                await _e1.RefreshOutcomeAsync(live.Id, "ExternalManualExit", live.DustExchangeQuantity, ct);
+                OnPositionClosed?.Invoke(trade);
+                TradeLog.Warn("EXTERNAL-MANUAL-EXIT", live.Symbol, $"lifecycle={live.Id} qty={LogOptions.N(sold)} — позиция закрыта вручную на бирже, без повторного sell-order");
+            }
+            else
+            {
+                if (live.Protection != null) await _orderExecutor.CancelProtectionAsync(live, ct);
+                await _positionManager.SavePositionsAsync(ct);
+                await _e1.RefreshOutcomeAsync(live.Id, "ExternalManualExit-partial", live.DustExchangeQuantity, ct);
+                var ok = await _orderExecutor.EnsureProtectionAsync(live, ct);
+                await _positionManager.SavePositionsAsync(ct);
+                if (!ok && live.HasExternalOwnership && _config.Trading.ExternalProtectionFailurePolicy == ExternalProtectionFailurePolicy.AlertNotSell)
+                    TradeLog.Error("EXTERNAL-PROTECTION-FAILED", live.Symbol, $"remaining={LogOptions.N(live.Quantity)} OCO не поставлена; AlertNotSell");
+                OnPartialPositionClosed?.Invoke(trade);
+                TradeLog.Warn("EXTERNAL-MANUAL-EXIT", live.Symbol, $"lifecycle={live.Id} qty={LogOptions.N(sold)} remaining={LogOptions.N(live.Quantity)} external={LogOptions.N(live.ExternalQuantity)} bot={LogOptions.N(botPart)}");
+            }
+        }
+    }
+
+    /// <summary>Phase 1.7: Release — снять только защиту бота и убрать lifecycle без продажи.</summary>
+    private async Task<bool> ReleaseExternalPositionAsync(Position position, CancellationToken ct)
+    {
+        using (await _positionMonitor.LockSymbolAsync(position.Symbol, ct))
+        {
+            var live = _positionManager.GetPositionById(position.Id);
+            if (live is null) return false;
+            if (live.Protection != null && !await _orderExecutor.CancelProtectionAsync(live, ct))
+                return false;
+            await _positionManager.RemovePositionAsync(live.Id, ct);
+            await _e1.RefreshOutcomeAsync(live.Id, "ExternalReleased", live.DustExchangeQuantity, ct);
+            OnPositionReleased?.Invoke(live.Symbol);
+            return true;
         }
     }
 
