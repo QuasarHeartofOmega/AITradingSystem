@@ -710,7 +710,7 @@ public sealed class TradingEngine : IAsyncDisposable
                 {
                     if (DateTime.UtcNow >= _nextAccountRefreshUtc)
                     {
-                        await RunGuardedPhaseAsync("account-refresh", RefreshAccountSnapshotAsync, ct);
+                        await RunGuardedPhaseAsync("account-refresh", token => RefreshAccountSnapshotAsync(token), ct);
                         _nextAccountRefreshUtc = DateTime.UtcNow.AddSeconds(_config.Trading.AccountRefreshIntervalSeconds);
                     }
                     await RunGuardedPhaseAsync("market-data-recovery", RecoverMarketDataAsync, ct);
