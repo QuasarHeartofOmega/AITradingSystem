@@ -1,3 +1,5 @@
+// Phase 1.7: физически лежит в Common (TradingConfig использует эти enum'ы),
+// namespace сохранён Core.Models.Enums — Core ссылается на Common, обратная ссылка создала бы цикл.
 namespace AITradingSystem.Core.Models.Enums;
 
 /// <summary>Phase 1.7: как бот относится к ручным/external спотовым остаткам.</summary>
