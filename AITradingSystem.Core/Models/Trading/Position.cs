@@ -54,6 +54,21 @@ public sealed class Position : INotifyPropertyChanged
     /// <summary>Phase 1.7: средняя цена входа external-доли (для атрибуции PnL при ручной продаже).</summary>
     public decimal ExternalEntryPrice { get; set; }
 
+    /// <summary>Phase 1.7: цена входа доли бота до смешивания с external (0 = legacy, fallback EntryPrice).
+    /// Нужна для раздельной атрибуции PnL при ручной продаже Mixed-позиции.</summary>
+    public decimal BotEntryPrice { get; set; }
+
+    /// <summary>Phase 1.7: средневзвешенная цена входа проданного объёма при ручной продаже:
+    /// external-часть по ExternalEntryPrice, bot-часть по BotEntryPrice (legacy → EntryPrice).</summary>
+    public decimal GetAttributedExitEntryPrice(decimal externalPart, decimal botPart)
+    {
+        var total = externalPart + botPart;
+        if (total <= 0m) return EntryPrice;
+        var extPrice = ExternalEntryPrice > 0m ? ExternalEntryPrice : EntryPrice;
+        var botPrice = BotEntryPrice > 0m ? BotEntryPrice : EntryPrice;
+        return (extPrice * externalPart + botPrice * botPart) / total;
+    }
+
     /// <summary>Phase 1.7: последний наблюдавшийся биржевой total базового актива, отнесённый к этому lifecycle.
     /// Нужен для balance-delta recon: ручная докупка/продажа меняет total, а не только free.</summary>
     public decimal ExternalObservedTotal { get; set; }

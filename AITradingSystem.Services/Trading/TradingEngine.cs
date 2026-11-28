@@ -1250,6 +1250,7 @@ public sealed class TradingEngine : IAsyncDisposable
             InitialStopLoss = stopLoss,
             OpenedAt = DateTime.UtcNow,
             OpeningOrderId = order.Id,
+            BotEntryPrice = actualEntry,
             EntryCommission = order.Commission,
             SignalId = signal.Timestamp.ToString("yyyyMMddHHmmss"),
             // P2.4: метка уверенности живёт в позиции и персистится — история сделок
@@ -1269,6 +1270,11 @@ public sealed class TradingEngine : IAsyncDisposable
         var protectionFailed = false;
         using (await _positionMonitor.LockSymbolAsync(symbol, ct))
         {
+            // Phase 1.7: orderId входа бота переживает закрытие позиции — реконструкция
+            // external entry не должна считать собственные филлы бота ручными покупками.
+            var botOrderId = order.BinanceOrderId > 0 ? order.BinanceOrderId
+                : long.TryParse(order.Id, out var parsedId) ? parsedId : 0L;
+            await _externalPositions.RememberBotOrderAsync(symbol, botOrderId, ct);
             await _positionManager.AddPositionAsync(position, ct);
             await _e1.AttachPositionAsync(position, ct);
 
@@ -2264,6 +2270,12 @@ public sealed class TradingEngine : IAsyncDisposable
             orphan.SignalId = orphan.HasExternalOwnership ? "external-adoption" : "reconciled";
             if (orphan.LifetimeBoughtQuantity <= 0m)
                 orphan.LifetimeBoughtQuantity = orphan.Quantity;
+            if (!orphan.HasExternalOwnership)
+            {
+                if (orphan.BotEntryPrice <= 0m) orphan.BotEntryPrice = orphan.EntryPrice;
+                if (long.TryParse(orphan.OpeningOrderId, out var orphanOrderId))
+                    await _externalPositions.RememberBotOrderAsync(orphan.Symbol, orphanOrderId, ct);
+            }
 
             // Phase 1.5: подхват без E1-идентичности не должен бросать «E1 identity is required»
             // и ронять reconcile. Восстанавливаем identity из журнала намерений, иначе external.
@@ -2357,6 +2369,7 @@ public sealed class TradingEngine : IAsyncDisposable
         decimal exchangeTotal, CancellationToken ct)
     {
         if (quantity <= 0m || entryPrice <= 0m) return;
+        if (position.BotEntryPrice <= 0m) position.BotEntryPrice = position.EntryPrice;
         var oldQty = position.Quantity;
         var newQty = oldQty + quantity;
         position.EntryPrice = newQty > 0m ? (position.EntryPrice * oldQty + entryPrice * quantity) / newQty : entryPrice;
@@ -2401,8 +2414,10 @@ public sealed class TradingEngine : IAsyncDisposable
             var price = markPrice > 0m ? markPrice : live.CurrentPrice;
             if (delta > 0m)
             {
-                // Ручная докупка не проходит через гейты входа: она уже состоялась на бирже.
-                // Подхват доли обязателен для учёта/защиты, но новых ордеров на покупку не отправляем.
+                // Ручная докупка уже состоялась на бирже и не проходит через гейты входа.
+                // Но в Confirm/Off она НЕ становится долей бота без согласия: для чисто бот-позиции
+                // сервис оставляет объём кандидатом (ExternalPositionService.ReconcileAsync).
+                // Здесь доля подхватывается только у уже Mixed/External lifecycle или в Auto.
                 await MergeExternalIntoPositionAsync(live, delta, price, "balance-delta-estimate",
                     $"balance-delta +{LogOptions.N(delta)} at {DateTime.UtcNow:O}", live.ExternalObservedTotal + delta, ct);
                 return;
@@ -2420,7 +2435,9 @@ public sealed class TradingEngine : IAsyncDisposable
             // Атрибуция: сначала external-доля, остаток — бот.
             var externalPart = Math.Min(sold, live.ExternalQuantity);
             var botPart = sold - externalPart;
-            var exitBasisPrice = externalPart > 0m && live.ExternalEntryPrice > 0m ? live.ExternalEntryPrice : live.EntryPrice;
+            // Атрибуция PnL раздельная: external-часть от цены external-входа, bot-часть от цены
+            // входа бота до смешивания; одна blended-цена исказила бы результат обеих долей.
+            var exitBasisPrice = live.GetAttributedExitEntryPrice(externalPart, botPart);
             var trade = new TradeRecord
             {
                 Symbol = live.Symbol, Side = live.Side, Quantity = sold,

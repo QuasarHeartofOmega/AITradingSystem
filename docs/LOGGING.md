@@ -122,6 +122,9 @@ yyyy-MM-dd HH:mm:ss.fff zzz [LVL] [канал] Источник: EVENT-CODE key=
 | `EXTERNAL-RELEASED` | Phase 1.7: оператор забрал остаток себе (Release) — защита бота снята, продажи не было, kill-switch остаток не закроет. |
 | `EXTERNAL-KILLSWITCH` | Phase 1.7: при взведении kill-switch — сколько external-долей закрывается вместе с ботом (`adopted_external`) и сколько остаётся у оператора (`unadopted`). |
 | `EXTERNAL-RECON-FAIL` | Phase 1.7: круг external-реконсиляции упал; входы по символу это не разблокирует, остаток остаётся непареным. |
+| `EXTERNAL-ADOPT-STALE` | Phase 1.7: согласие оператора относилось к устаревшему снимку баланса (объём изменился/кандидат исчез) — подхват отклонён, нужно новое согласие. |
+| `EXTERNAL-ADOPT-FAILED` | Phase 1.7: Auto-подхват не выполнен (kill-switch, отказ защиты, устаревший снимок); кандидат остаётся видимым. |
+| `EXTERNAL-RELEASE-CLAMP` | Phase 1.7: отпущенный через Release объём уменьшен вслед за биржевым total (оператор продал часть отпущенного). |
 
 ### Exchange
 

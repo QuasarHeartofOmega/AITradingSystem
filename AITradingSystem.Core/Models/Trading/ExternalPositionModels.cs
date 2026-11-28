@@ -46,6 +46,11 @@ public sealed class ExternalPositionCandidate
 public sealed class ExternalPositionLedgerState
 {
     public Dictionary<string, ExternalReleaseRecord> Released { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Phase 1.7: биржевые orderId входов бота по символу (переживают закрытие позиции).
+    /// Реконструкция external entry исключает их из myTrades, иначе VWAP ручного остатка
+    /// загрязнялся бы собственными сделками бота за lookback-окно.</summary>
+    public Dictionary<string, HashSet<long>> BotOrderIds { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class ExternalReleaseRecord

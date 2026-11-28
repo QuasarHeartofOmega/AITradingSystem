@@ -118,7 +118,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _dashboardTimer.Start();
     }
 
-    private void OnAccountUpdated() => RunOnUiThread(() => { Dashboard.UpdateAccount(); Trading.UpdateAccount(); UpdateAccountBanner(); });
+    private void OnAccountUpdated() => RunOnUiThread(() => { Dashboard.UpdateAccount(); Trading.UpdateAccount(); Trading.RefreshExternalCandidates(); UpdateAccountBanner(); });
     private void OnOrdersUpdated() => RunOnUiThread(() => Trading.UpdateAccount());
     private void UpdateAccountBanner()
     {

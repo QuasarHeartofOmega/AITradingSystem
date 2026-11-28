@@ -38,6 +38,9 @@ public sealed class ExternalPositionService
     // Отдельный шлюз инициализации: ObserveAsync вызывается в том числе изнутри ReconcileAsync,
     // который уже держит _gate — повторный вход в тот же семафор дал бы дедлок.
     private readonly SemaphoreSlim _initGate = new(1, 1);
+    // _state читается из ObserveAsync (контур снимка аккаунта) и пишется из Reconcile/Release/RememberBotOrder.
+    // Короткий lock защищает словари от гонки чтения во время удаления/добавления ключей.
+    private readonly object _stateLock = new();
     private readonly ConcurrentDictionary<string, ExternalPositionCandidate> _candidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _lastAlertUtc = new(StringComparer.OrdinalIgnoreCase);
     private ExternalPositionLedgerState _state = new();
@@ -53,6 +56,12 @@ public sealed class ExternalPositionService
     public int UnadoptedCount => _candidates.Values.Count(c => c.IsEligible && !c.IsReleased);
     public decimal UnadoptedNotionalQuote => _candidates.Values.Where(c => c.IsEligible && !c.IsReleased).Sum(c => c.ExternalNotionalQuote);
     public ExternalAdoptionMode Mode => _config.AdoptExternalPositions;
+
+    /// <summary>Phase 1.7: отпущенный объём не может превышать неучтённый ботом остаток на бирже.
+    /// Если оператор продал часть отпущенного, baseline уменьшается, иначе будущие покупки
+    /// ошибочно считались бы «уже отпущенными» и оставались невидимыми.</summary>
+    public static decimal ClampReleasedQuantity(decimal released, decimal exchangeTotal, decimal managed) =>
+        Math.Max(0m, Math.Min(released, Math.Max(0m, exchangeTotal - managed)));
 
     public ExternalPositionService(
         TradingConfig config,
@@ -87,8 +96,33 @@ public sealed class ExternalPositionService
         try
         {
             if (_initialized) return;
-            _state = await _ledger.LoadAsync(ct);
+            var loaded = await _ledger.LoadAsync(ct);
+            lock (_stateLock) { _state = loaded; }
             _initialized = true;
+        }
+        finally { _initGate.Release(); }
+    }
+
+    /// <summary>Phase 1.7: запомнить биржевой orderId входа бота (durable). Вызывается движком
+    /// под посимвольным шлюзом; берёт только шлюз леджера, чтобы не пересечься с _gate реконсиляции.</summary>
+    public async Task RememberBotOrderAsync(string symbol, long orderId, CancellationToken ct = default)
+    {
+        if (orderId <= 0 || string.IsNullOrWhiteSpace(symbol)) return;
+        if (!_initialized) await InitializeAsync(ct);
+        await _initGate.WaitAsync(ct);
+        try
+        {
+            bool added;
+            lock (_stateLock)
+            {
+                if (!_state.BotOrderIds.TryGetValue(symbol, out var set))
+                {
+                    set = new HashSet<long>();
+                    _state.BotOrderIds[symbol] = set;
+                }
+                added = set.Add(orderId);
+            }
+            if (added) await _ledger.SaveAsync(_state, ct);
         }
         finally { _initGate.Release(); }
     }
@@ -132,7 +166,8 @@ public sealed class ExternalPositionService
             var price = prices.TryGetValue(symbol, out var p) && p > 0m ? p : 0m;
 
             managedBySymbol.TryGetValue(symbol, out var managed);
-            _state.Released.TryGetValue(symbol, out var release);
+            ExternalReleaseRecord? release;
+            lock (_stateLock) { _state.Released.TryGetValue(symbol, out release); }
             var releasedQty = release?.ReleasedQuantity ?? 0m;
             var externalQty = asset.Total - managed - releasedQty;
             if (step > 0m) externalQty = Math.Floor(externalQty / step) * step;
@@ -200,6 +235,31 @@ public sealed class ExternalPositionService
         await _gate.WaitAsync(ct);
         try
         {
+            // 0. Release-baseline следует за биржей: оператор мог продать часть отпущенного.
+            // Иначе старый объём Release навсегда прятал бы новые покупки от детекта.
+            var ledgerChanged = false;
+            var managedBySymbol = _positions.GetOpenPositions()
+                .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.Sum(p => p.Quantity), StringComparer.OrdinalIgnoreCase);
+            List<KeyValuePair<string, ExternalReleaseRecord>> releases;
+            lock (_stateLock) { releases = _state.Released.ToList(); }
+            foreach (var (symbol, release) in releases)
+            {
+                if (!SymbolNaming.TrySplit(symbol, _config.QuoteAssets, out var baseAsset, out _)) continue;
+                var total = balance.Assets.TryGetValue(baseAsset, out var asset) ? asset.Total : 0m;
+                managedBySymbol.TryGetValue(symbol, out var managed);
+                var clamped = ClampReleasedQuantity(release.ReleasedQuantity, total, managed);
+                if (clamped != release.ReleasedQuantity)
+                {
+                    TradeLog.Info("EXTERNAL-RELEASE-CLAMP", symbol,
+                        $"released={LogOptions.N(release.ReleasedQuantity)} -> {LogOptions.N(clamped)} exchange_total={LogOptions.N(total)} — отпущенный объём уменьшен вслед за биржей");
+                    release.ReleasedQuantity = clamped;
+                    ledgerChanged = true;
+                }
+                if (clamped <= 0m) { lock (_stateLock) { _state.Released.Remove(symbol); } ledgerChanged = true; }
+            }
+            if (ledgerChanged) await _ledger.SaveAsync(_state, ct);
+
             var orders = await _rest.GetOpenOrdersAsync(ct: ct);
             var candidates = await ObserveAsync(balance, prices, orders, ct);
 
@@ -236,6 +296,16 @@ public sealed class ExternalPositionService
                     }
                     continue;
                 }
+                // Положительная delta на чисто бот-позиции в Confirm/Off — это НЕ согласие оператора:
+                // объём остаётся кандидатом до явного Adopt/Auto. Отрицательная delta (ручная продажа
+                // актива бота) применяется всегда, иначе локальная позиция стала бы фантомом.
+                if (delta > 0m && !position.HasExternalOwnership && _config.AdoptExternalPositions != ExternalAdoptionMode.Auto)
+                {
+                    position.ExternalObservedTotal = asset.Total;
+                    position.ExternalObservedBotQuantity = botQty;
+                    await _positions.SavePositionsAsync(ct);
+                    continue;
+                }
                 if (_applyDelta != null)
                 {
                     TradeLog.Info("EXTERNAL-BALANCE-DELTA", position.Symbol,
@@ -250,8 +320,11 @@ public sealed class ExternalPositionService
             {
                 if (_config.AdoptExternalPositions == ExternalAdoptionMode.Auto && _adopt != null)
                 {
-                    await _adopt(candidate, null, ct);
-                    _candidates.TryRemove(candidate.Symbol, out _);
+                    if (await _adopt(candidate, null, ct))
+                        _candidates.TryRemove(candidate.Symbol, out _);
+                    else if (!IsAlertSuppressed("adopt-fail:" + candidate.Symbol))
+                        TradeLog.Warn("EXTERNAL-ADOPT-FAILED", candidate.Symbol,
+                            "Auto-подхват не выполнен (kill-switch, отказ защиты или устаревший снимок) — кандидат остаётся видимым");
                 }
                 else if (!IsAlertSuppressed("detect:" + candidate.Symbol))
                 {
@@ -274,7 +347,34 @@ public sealed class ExternalPositionService
         if (!_candidates.TryGetValue(symbol, out var candidate) || !candidate.IsEligible)
             return false;
         if (entryOverride.HasValue && entryOverride.Value <= 0m) return false;
-        var ok = await _adopt(candidate, entryOverride, ct);
+
+        // Согласие оператора относится к конкретному объёму. Между показом кандидата и кликом
+        // баланс мог измениться (ручная продажа/докупка) — переспрашиваем биржу под общим шлюзом
+        // и принимаем только тот же объём; иначе Adopt отправил бы ордер по устаревшему снимку.
+        await _gate.WaitAsync(ct);
+        ExternalPositionCandidate? fresh = null;
+        try
+        {
+            var balance = await _rest.GetAccountBalanceAsync(ct);
+            var prices = await _rest.GetAllPricesAsync(ct);
+            var orders = await _rest.GetOpenOrdersAsync(ct: ct);
+            await ObserveAsync(balance, prices, orders, ct);
+            if (!_candidates.TryGetValue(symbol, out fresh) || !fresh.IsEligible
+                || fresh.ExternalQuantity != candidate.ExternalQuantity
+                || fresh.ExchangeTotalQuantity != candidate.ExchangeTotalQuantity)
+            {
+                TradeLog.Warn("EXTERNAL-ADOPT-STALE", symbol,
+                    $"consent_qty={LogOptions.N(candidate.ExternalQuantity)} — снимок изменился или кандидат исчез; требуется новое согласие оператора");
+                CandidatesChanged?.Invoke();
+                return false;
+            }
+            // Снимаем кандидата ДО выхода из шлюза: параллельный клик/круг не должен
+            // подхватить тот же объём второй раз. При неудаче детект вернёт его следующим кругом.
+            _candidates.TryRemove(symbol, out _);
+        }
+        finally { _gate.Release(); }
+
+        var ok = await _adopt(fresh!, entryOverride, ct);
         if (ok)
         {
             _candidates.TryRemove(symbol, out _);
@@ -310,13 +410,16 @@ public sealed class ExternalPositionService
                 if (releasedTotal <= 0m) return false;
             }
 
-            _state.Released[symbol] = new ExternalReleaseRecord
+            lock (_stateLock)
             {
-                Symbol = symbol,
-                ReleasedQuantity = releasedTotal,
-                ReleasedAtUtc = DateTime.UtcNow,
-                Reason = reason
-            };
+                _state.Released[symbol] = new ExternalReleaseRecord
+                {
+                    Symbol = symbol,
+                    ReleasedQuantity = releasedTotal,
+                    ReleasedAtUtc = DateTime.UtcNow,
+                    Reason = reason
+                };
+            }
             await _ledger.SaveAsync(_state, ct);
             _candidates.TryRemove(symbol, out _);
             TradeLog.Warn("EXTERNAL-RELEASED", symbol,
@@ -340,6 +443,13 @@ public sealed class ExternalPositionService
                 .Where(p => p.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase) && long.TryParse(p.OpeningOrderId, out _))
                 .Select(p => long.Parse(p.OpeningOrderId, CultureInfo.InvariantCulture))
                 .ToHashSet();
+            // Закрытые позиции бота тоже не должны загрязнять VWAP ручного остатка:
+            // их orderId хранятся в durable-леджере (RememberBotOrderAsync).
+            lock (_stateLock)
+            {
+                if (_state.BotOrderIds.TryGetValue(symbol, out var remembered))
+                    botOrderIds.UnionWith(remembered);
+            }
             var buys = trades.Where(t => t.IsBuyer && !botOrderIds.Contains(t.OrderId)).ToList();
             var qty = buys.Sum(t => Dec(t.Quantity));
             var quote = buys.Sum(t => Dec(t.Price) * Dec(t.Quantity));

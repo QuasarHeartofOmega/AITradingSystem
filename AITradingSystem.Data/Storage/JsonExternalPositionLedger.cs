@@ -31,7 +31,12 @@ public sealed class JsonExternalPositionLedger
         {
             if (!File.Exists(_path)) return new ExternalPositionLedgerState();
             var json = await File.ReadAllTextAsync(_path, ct);
-            return JsonSerializer.Deserialize<ExternalPositionLedgerState>(json, Json) ?? new ExternalPositionLedgerState();
+            var state = JsonSerializer.Deserialize<ExternalPositionLedgerState>(json, Json) ?? new ExternalPositionLedgerState();
+            // System.Text.Json не сохраняет comparer словарей — восстанавливаем case-insensitive
+            // ключи, иначе "DOGEUSDT" из файла не совпал бы с lookup по символу реестра.
+            state.Released = new Dictionary<string, ExternalReleaseRecord>(state.Released, StringComparer.OrdinalIgnoreCase);
+            state.BotOrderIds = new Dictionary<string, HashSet<long>>(state.BotOrderIds, StringComparer.OrdinalIgnoreCase);
+            return state;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)

@@ -1,6 +1,7 @@
 using AITradingSystem.Core.Models.Enums;
 using AITradingSystem.Core.Models.Trading;
 using AITradingSystem.Data.Storage;
+using AITradingSystem.Services.Trading;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AITradingSystem.Tests;
@@ -133,6 +134,61 @@ public class ExternalPositionTests
             var ledger = new JsonExternalPositionLedger(dir, NullLogger<JsonExternalPositionLedger>.Instance);
             var state = await ledger.LoadAsync();
             Assert.Empty(state.Released);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void ClampReleasedQuantity_FollowsExchangeSellOfReleasedVolume()
+    {
+        // Отпущено 10, бот не владеет ничем, на бирже осталось 6 → baseline 6.
+        Assert.Equal(6m, ExternalPositionService.ClampReleasedQuantity(10m, 6m, 0m));
+        // Бот купил 4 поверх отпущенных 10 (total 14) → отпущенное не меняется.
+        Assert.Equal(10m, ExternalPositionService.ClampReleasedQuantity(10m, 14m, 4m));
+        // Всё продано → запись Release удаляется.
+        Assert.Equal(0m, ExternalPositionService.ClampReleasedQuantity(10m, 0m, 0m));
+        // Отпущенное не может быть отрицательным.
+        Assert.Equal(0m, ExternalPositionService.ClampReleasedQuantity(-1m, 5m, 0m));
+    }
+
+    [Fact]
+    public void AttributedExitPrice_SplitsExternalAndBotBasis()
+    {
+        var p = BotPosition(10m);
+        p.BotEntryPrice = 0.10m;
+        p.Quantity = 15m;
+        p.EntryPrice = (0.10m * 10m + 0.20m * 5m) / 15m;
+        p.ExternalQuantity = 5m;
+        p.ExternalEntryPrice = 0.20m;
+        p.Source = PositionSource.Mixed;
+
+        // Продано 3 external + 2 bot → (0.20*3 + 0.10*2)/5 = 0.16, не blended 0.1333.
+        Assert.Equal(0.16m, p.GetAttributedExitEntryPrice(3m, 2m));
+        // Только bot-часть → цена входа бота.
+        Assert.Equal(0.10m, p.GetAttributedExitEntryPrice(0m, 4m));
+        // Legacy без BotEntryPrice → fallback blended EntryPrice.
+        p.BotEntryPrice = 0m;
+        Assert.Equal(p.EntryPrice, p.GetAttributedExitEntryPrice(0m, 4m));
+    }
+
+    [Fact]
+    public async Task BotOrderIds_PersistAcrossReload_AndExcludeFromExternalVwap()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ext-botids-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var ledger = new JsonExternalPositionLedger(dir, NullLogger<JsonExternalPositionLedger>.Instance);
+            var state = new ExternalPositionLedgerState();
+            state.BotOrderIds["DOGEUSDT"] = new HashSet<long> { 111, 222 };
+            await ledger.SaveAsync(state);
+
+            var reloaded = await new JsonExternalPositionLedger(dir, NullLogger<JsonExternalPositionLedger>.Instance).LoadAsync();
+            Assert.True(reloaded.BotOrderIds.ContainsKey("dogeusdt"));
+            Assert.Contains(111L, reloaded.BotOrderIds["DOGEUSDT"]);
+            Assert.Contains(222L, reloaded.BotOrderIds["DOGEUSDT"]);
         }
         finally
         {
